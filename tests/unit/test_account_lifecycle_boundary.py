@@ -17,6 +17,7 @@ _ALLOWED = {
     "main.py",
     "db/models.py",
     "db/alembic/versions/20261005_000000_add_account_lifecycle_preferences.py",
+    "db/alembic/versions/20261005_010000_merge_account_lifecycle_and_keyless_priority.py",
 }
 
 

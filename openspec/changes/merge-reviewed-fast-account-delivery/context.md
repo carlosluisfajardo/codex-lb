@@ -34,3 +34,7 @@ The delivery updates Rustls to the patched 0.23.45 and its required AWS-LC and
 WebPKI dependency versions. Official registry checksums and dependency edges
 were used because Cargo is unavailable locally; the existing locked Cargo CI
 is the resolution, compilation and advisory gate. No advisory exception is added.
+
+The combined-head unit CI also exposed the lifecycle boundary test's missing
+schema allowlist entry for the exact no-op merge migration. Its exact filename
+is added; routing, proxy and other runtime files gain no exemption.
