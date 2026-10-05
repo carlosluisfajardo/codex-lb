@@ -29,3 +29,8 @@ quota or renewal inference. Its PostgreSQL lock expression compiles to
 `FOR NO KEY UPDATE`; the older `FOR KEY SHARE` report wording is historical.
 PostgreSQL execution, actual installation and user acceptance require their own
 evidence. Requested priority is separate from served tier and billing.
+The combined-head CI independently exposed RUSTSEC-2026-0285 in Rustls 0.23.36.
+The delivery updates Rustls to the patched 0.23.45 and its required AWS-LC and
+WebPKI dependency versions. Official registry checksums and dependency edges
+were used because Cargo is unavailable locally; the existing locked Cargo CI
+is the resolution, compilation and advisory gate. No advisory exception is added.
