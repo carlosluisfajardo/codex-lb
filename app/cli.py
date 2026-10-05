@@ -106,6 +106,31 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Confirm the reset and allow a non-interactive run.",
     )
 
+    account_lifecycle = subparsers.add_parser(
+        "account-lifecycle",
+        help="Back up or restore the operator-entered account lifecycle preferences (no credentials).",
+        formatter_class=_CliHelpFormatter,
+    )
+    account_lifecycle_subparsers = account_lifecycle.add_subparsers(dest="account_lifecycle_command")
+    lifecycle_export = account_lifecycle_subparsers.add_parser(
+        "export",
+        help="Write every lifecycle record to a new owner-only file and print its snapshot token.",
+        formatter_class=_CliHelpFormatter,
+    )
+    lifecycle_export.add_argument("--output", type=Path, metavar="PATH", required=True, help="New file to create.")
+    lifecycle_restore = account_lifecycle_subparsers.add_parser(
+        "restore",
+        help="Make the stored lifecycle records equal an exported file.",
+        formatter_class=_CliHelpFormatter,
+    )
+    lifecycle_restore.add_argument("--input", type=Path, metavar="PATH", required=True, help="Exported file.")
+    lifecycle_restore.add_argument(
+        "--expected-snapshot",
+        metavar="TOKEN",
+        required=True,
+        help="Snapshot token of the current records, printed by a fresh export; restore refuses on mismatch.",
+    )
+
     parser.add_argument("--host", default=os.getenv("HOST", "127.0.0.1"))
     parser.add_argument("--port", default=os.getenv("PORT", "2455"))
     parser.add_argument("--ssl-certfile", default=os.getenv("SSL_CERTFILE"))
@@ -150,6 +175,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         _run_admin_command(args)
         return
 
+    if args.command == "account-lifecycle":
+        _run_account_lifecycle_command(args)
+        return
+
     if bool(args.ssl_certfile) ^ bool(args.ssl_keyfile):
         raise SystemExit("Both --ssl-certfile and --ssl-keyfile must be provided together.")
 
@@ -177,6 +206,14 @@ def _run_admin_command(args: argparse.Namespace) -> None:
     from app.admin_cli import run_admin_command
 
     run_admin_command(args)
+
+
+def _run_account_lifecycle_command(args: argparse.Namespace) -> None:
+    """Imported late: the server path must not pay for it."""
+
+    from app.modules.account_lifecycle.cli import run_account_lifecycle_command
+
+    run_account_lifecycle_command(args)
 
 
 def _load_uvicorn():
