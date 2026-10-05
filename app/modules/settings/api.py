@@ -204,6 +204,7 @@ def _dashboard_settings_response(settings, *, principal: DashboardPrincipal) -> 
         sticky_threads_enabled=settings.sticky_threads_enabled,
         upstream_stream_transport=settings.upstream_stream_transport,
         prohibit_fast_mode=settings.prohibit_fast_mode,
+        keyless_priority_service_tier=settings.keyless_priority_service_tier,
         http_downstream_transport_policy=settings.http_downstream_transport_policy,
         thread_cache_identity_mode=settings.thread_cache_identity_mode,
         thread_cache_identity_mode_override=settings.thread_cache_identity_mode_override,
@@ -1202,6 +1203,11 @@ async def update_settings(
                 prohibit_fast_mode=(
                     payload.prohibit_fast_mode if payload.prohibit_fast_mode is not None else current.prohibit_fast_mode
                 ),
+                keyless_priority_service_tier=(
+                    payload.keyless_priority_service_tier
+                    if payload.keyless_priority_service_tier is not None
+                    else current.keyless_priority_service_tier
+                ),
                 http_downstream_transport_policy=(
                     payload.http_downstream_transport_policy or current.http_downstream_transport_policy
                 ),
@@ -1577,6 +1583,7 @@ async def update_settings(
             "sticky_threads_enabled",
             "upstream_stream_transport",
             "prohibit_fast_mode",
+            "keyless_priority_service_tier",
             "http_downstream_transport_policy",
             "thread_cache_identity_mode",
             "proxy_account_response_create_limit",

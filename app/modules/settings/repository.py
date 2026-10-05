@@ -60,6 +60,7 @@ class SettingsRepository:
             sticky_threads_enabled=True,
             upstream_stream_transport="auto",
             prohibit_fast_mode=False,
+            keyless_priority_service_tier=False,
             # Account-capacity overrides are tri-state: NULL inherits the
             # process environment value at read time. The first-boot seed must
             # stay NULL — copying the env value here would freeze it as a
@@ -154,6 +155,7 @@ class SettingsRepository:
         sticky_threads_enabled: bool | None = None,
         upstream_stream_transport: str | None = None,
         prohibit_fast_mode: bool | None = None,
+        keyless_priority_service_tier: bool | None = None,
         http_downstream_transport_policy: str | None = None,
         thread_cache_identity_mode: str | None = None,
         clear_thread_cache_identity_mode: bool = False,
@@ -293,6 +295,8 @@ class SettingsRepository:
             settings.upstream_stream_transport = upstream_stream_transport
         if prohibit_fast_mode is not None:
             settings.prohibit_fast_mode = prohibit_fast_mode
+        if keyless_priority_service_tier is not None:
+            settings.keyless_priority_service_tier = keyless_priority_service_tier
         if http_downstream_transport_policy is not None:
             settings.http_downstream_transport_policy = http_downstream_transport_policy
         if clear_proxy_account_response_create_limit:

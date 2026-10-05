@@ -1252,6 +1252,12 @@ class DashboardSettings(Base):
         server_default=false(),
         nullable=False,
     )
+    keyless_priority_service_tier: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=false(),
+        nullable=False,
+    )
     http_downstream_transport_policy: Mapped[str] = mapped_column(
         String,
         default="smart",

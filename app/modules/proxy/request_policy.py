@@ -432,6 +432,41 @@ def apply_enforced_service_tier_model_fallback(
     return True
 
 
+def apply_keyless_priority_service_tier(
+    payload: ResponsesRequest | ResponsesCompactRequest,
+    api_key: ApiKeyData | None,
+    *,
+    enabled: bool,
+    prohibit_fast_mode: bool,
+) -> bool:
+    """Request ``priority`` for keyless traffic that left the tier to upstream.
+
+    Dashboard opt-in for deployments running without proxy API keys. Callers
+    invoke it once on the origin, after API-key enforcement and only on
+    subscription-account routes, so model sources and owner-forwarded requests
+    never see it. Keyed requests, explicit non-default tiers and the global
+    ``prohibit_fast_mode`` veto are left untouched. ``True`` marks the tier as
+    policy-supplied so :func:`apply_enforced_service_tier_model_fallback` can
+    still drop it for a model whose catalog lacks ``priority``.
+    """
+    if not enabled or prohibit_fast_mode or api_key is not None:
+        return False
+    requested_service_tier = payload.service_tier
+    if (
+        requested_service_tier is not None
+        and requested_service_tier.strip()
+        and requested_service_tier.strip().lower() not in _UPSTREAM_OMIT_SERVICE_TIERS
+    ):
+        return False
+    payload.service_tier = "priority"
+    logger.info(
+        "keyless_priority_service_tier_applied request_id=%s client_service_tier=%s substituted_service_tier=priority",
+        get_request_id(),
+        requested_service_tier,
+    )
+    return True
+
+
 def _model_responses_lite_capability(
     model: str,
     *,

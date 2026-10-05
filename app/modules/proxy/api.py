@@ -302,6 +302,7 @@ from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_api_key_enforcement_to_chat_payload,
     apply_enforced_service_tier_model_fallback,
+    apply_keyless_priority_service_tier,
     apply_prohibit_fast_mode,
     enforce_strict_function_tools_format,
     enforce_strict_text_format,
@@ -1178,6 +1179,7 @@ async def responses(
     raw_source_model = _effective_optional_model_for_api_key(api_key, responses_payload.model)
     (
         prohibit_fast_mode,
+        keyless_priority_service_tier,
         service_tier_was_enforced,
         pre_normalization_effort,
     ) = await _apply_api_key_enforcement_with_fast_mode_policy(responses_payload, api_key)
@@ -1225,6 +1227,13 @@ async def responses(
         if disabled_denial is not None:
             return disabled_denial
     if source is None:
+        if apply_keyless_priority_service_tier(
+            responses_payload,
+            api_key,
+            enabled=keyless_priority_service_tier,
+            prohibit_fast_mode=prohibit_fast_mode,
+        ):
+            service_tier_was_enforced = True
         apply_enforced_service_tier_model_fallback(
             responses_payload,
             service_tier_was_enforced=service_tier_was_enforced,
@@ -1419,6 +1428,7 @@ async def v1_responses(
     raw_source_model = _effective_optional_model_for_api_key(api_key, responses_payload.model)
     (
         prohibit_fast_mode,
+        keyless_priority_service_tier,
         service_tier_was_enforced,
         pre_normalization_effort,
     ) = await _apply_api_key_enforcement_with_fast_mode_policy(responses_payload, api_key)
@@ -1470,6 +1480,13 @@ async def v1_responses(
         if disabled_denial is not None:
             return disabled_denial
     if source is None:
+        if apply_keyless_priority_service_tier(
+            responses_payload,
+            api_key,
+            enabled=keyless_priority_service_tier,
+            prohibit_fast_mode=prohibit_fast_mode,
+        ):
+            service_tier_was_enforced = True
         apply_enforced_service_tier_model_fallback(
             responses_payload,
             service_tier_was_enforced=service_tier_was_enforced,
@@ -2310,8 +2327,12 @@ async def _hide_upstream_quota_for_api_key_clients(api_key: ApiKeyData | None) -
 async def _apply_api_key_enforcement_with_fast_mode_policy(
     payload: ResponsesRequest | ResponsesCompactRequest,
     api_key: ApiKeyData | None,
-) -> tuple[bool, bool, str | None]:
-    prohibit_fast_mode = await _prohibit_fast_mode_enabled()
+) -> tuple[bool, bool, bool, str | None]:
+    # Capture both flags before routing awaits; never mix settings rows when
+    # a concurrent update changes the opt-in and its global veto together.
+    settings = await get_settings_cache().get()
+    prohibit_fast_mode = settings.prohibit_fast_mode
+    keyless_priority_service_tier = settings.keyless_priority_service_tier
     enforcement = apply_api_key_enforcement(
         payload,
         api_key,
@@ -2319,6 +2340,7 @@ async def _apply_api_key_enforcement_with_fast_mode_policy(
     )
     return (
         prohibit_fast_mode,
+        keyless_priority_service_tier,
         enforcement.service_tier_was_enforced,
         enforcement.pre_normalization_reasoning_effort,
     )
@@ -4537,9 +4559,12 @@ async def v1_chat_completions(
     # here is only ever forwarded to a subscription. This endpoint does
     # source-route, but that branch forwards the untouched original chat
     # payload, so there is nothing for a restore to undo.
-    prohibit_fast_mode, service_tier_was_enforced, _ = await _apply_api_key_enforcement_with_fast_mode_policy(
-        responses_payload, api_key
-    )
+    (
+        prohibit_fast_mode,
+        keyless_priority_service_tier,
+        service_tier_was_enforced,
+        _,
+    ) = await _apply_api_key_enforcement_with_fast_mode_policy(responses_payload, api_key)
     if prohibit_fast_mode and _is_fast_mode_model_alias(effective_model):
         effective_model = responses_payload.model
     validate_model_access(api_key, responses_payload.model)
@@ -4570,6 +4595,13 @@ async def v1_chat_completions(
         if disabled_denial is not None:
             return disabled_denial
     if source is None:
+        if apply_keyless_priority_service_tier(
+            responses_payload,
+            api_key,
+            enabled=keyless_priority_service_tier,
+            prohibit_fast_mode=prohibit_fast_mode,
+        ):
+            service_tier_was_enforced = True
         apply_enforced_service_tier_model_fallback(
             responses_payload,
             service_tier_was_enforced=service_tier_was_enforced,
@@ -7153,7 +7185,6 @@ async def responses_compact(
         api_key,
         codex_session_affinity=True,
         openai_cache_affinity=True,
-        prohibit_fast_mode=await _prohibit_fast_mode_enabled(),
     )
 
 
@@ -7185,7 +7216,6 @@ async def v1_responses_compact(
         api_key,
         codex_session_affinity=False,
         openai_cache_affinity=True,
-        prohibit_fast_mode=await _prohibit_fast_mode_enabled(),
     )
 
 
@@ -7196,15 +7226,22 @@ async def _compact_responses(
     api_key: ApiKeyData | None,
     codex_session_affinity: bool = False,
     openai_cache_affinity: bool = False,
-    prohibit_fast_mode: bool = False,
 ) -> JSONResponse:
     # The replaced effort is discarded: this path is subscription-only, so the
     # rewrite that works around the backend hang must stick.
-    service_tier_was_enforced = apply_api_key_enforcement(
+    (
+        prohibit_fast_mode,
+        keyless_priority_service_tier,
+        service_tier_was_enforced,
+        _,
+    ) = await _apply_api_key_enforcement_with_fast_mode_policy(payload, api_key)
+    if apply_keyless_priority_service_tier(
         payload,
         api_key,
+        enabled=keyless_priority_service_tier,
         prohibit_fast_mode=prohibit_fast_mode,
-    ).service_tier_was_enforced
+    ):
+        service_tier_was_enforced = True
     apply_enforced_service_tier_model_fallback(
         payload,
         service_tier_was_enforced=service_tier_was_enforced,

@@ -506,6 +506,7 @@ from app.modules.proxy.load_balancer import AccountLease, effective_account_conc
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_enforced_service_tier_model_fallback,
+    apply_keyless_priority_service_tier,
     model_alias_requests_fast_mode,
     normalize_responses_request_payload,
     openai_client_payload_error,
@@ -1472,6 +1473,7 @@ class _WebSocketMixin:
         sticky_threads_enabled = settings.sticky_threads_enabled
         openai_cache_affinity_max_age_seconds = settings.openai_cache_affinity_max_age_seconds
         prohibit_fast_mode = bool(getattr(settings, "prohibit_fast_mode", False))
+        keyless_priority_service_tier = bool(getattr(settings, "keyless_priority_service_tier", False))
         routing_strategy = _facade()._routing_strategy(settings)
         pending_requests: deque[_WebSocketRequestState] = deque()
         pending_lock = anyio.Lock()
@@ -1813,6 +1815,7 @@ class _WebSocketMixin:
                                     sticky_threads_enabled=sticky_threads_enabled,
                                     openai_cache_affinity_max_age_seconds=openai_cache_affinity_max_age_seconds,
                                     prohibit_fast_mode=prohibit_fast_mode,
+                                    keyless_priority_service_tier=keyless_priority_service_tier,
                                     api_key=api_key,
                                     continuity_state=continuity_state,
                                     useragent=useragent,
@@ -1854,6 +1857,7 @@ class _WebSocketMixin:
                                         sticky_threads_enabled=sticky_threads_enabled,
                                         openai_cache_affinity_max_age_seconds=openai_cache_affinity_max_age_seconds,
                                         prohibit_fast_mode=prohibit_fast_mode,
+                                        keyless_priority_service_tier=keyless_priority_service_tier,
                                         api_key=api_key,
                                         continuity_state=continuity_state,
                                         useragent=useragent,
@@ -3159,6 +3163,7 @@ class _WebSocketMixin:
         openai_cache_affinity_max_age_seconds: int,
         api_key: ApiKeyData | None,
         prohibit_fast_mode: bool = False,
+        keyless_priority_service_tier: bool = False,
         continuity_state: "_WebSocketContinuityState | None" = None,
         useragent: str | None = None,
         useragent_group: str | None = None,
@@ -3202,6 +3207,13 @@ class _WebSocketMixin:
         ).service_tier_was_enforced
         if prohibit_fast_mode and model_alias_requests_fast_mode(raw_source_model):
             raw_source_model = responses_payload.model
+        if apply_keyless_priority_service_tier(
+            responses_payload,
+            refreshed_api_key,
+            enabled=keyless_priority_service_tier,
+            prohibit_fast_mode=prohibit_fast_mode,
+        ):
+            service_tier_was_enforced = True
         apply_enforced_service_tier_model_fallback(
             responses_payload,
             service_tier_was_enforced=service_tier_was_enforced,

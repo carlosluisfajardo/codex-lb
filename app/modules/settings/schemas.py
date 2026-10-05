@@ -58,6 +58,7 @@ class DashboardSettingsResponse(DashboardModel):
     sticky_threads_enabled: bool
     upstream_stream_transport: str = Field(pattern=r"^(auto|http|websocket)$")
     prohibit_fast_mode: bool
+    keyless_priority_service_tier: bool
     http_downstream_transport_policy: str = Field(pattern=_HTTP_DOWNSTREAM_TRANSPORT_POLICY_PATTERN)
     # Effective mode; ``provenance.thread_cache_identity_mode`` says whether it
     # came from the dashboard column, the environment or the code default.
@@ -242,6 +243,7 @@ class DashboardSettingsUpdateRequest(DashboardModel):
         pattern=r"^(auto|http|websocket)$",
     )
     prohibit_fast_mode: bool | None = None
+    keyless_priority_service_tier: bool | None = None
     http_downstream_transport_policy: str | None = Field(
         default=None,
         pattern=_HTTP_DOWNSTREAM_TRANSPORT_POLICY_PATTERN,
