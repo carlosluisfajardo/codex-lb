@@ -38,3 +38,9 @@ is the resolution, compilation and advisory gate. No advisory exception is added
 The combined-head unit CI also exposed the lifecycle boundary test's missing
 schema allowlist entry for the exact no-op merge migration. Its exact filename
 is added; routing, proxy and other runtime files gain no exemption.
+
+The patched Rust workspace passes its locked build, wire probes and advisory
+checks in combined-head CI. That run exposed two stale expectations in the
+native packaging test: Rustls 0.23.36 and AWS-LC 1.16.2. The test now pins the
+same patched 0.23.45 and 1.18.0 versions as the manifest and lockfile; its exact
+release checks remain in force.
