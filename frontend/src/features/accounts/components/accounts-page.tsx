@@ -14,6 +14,10 @@ import { ImportDialog } from "@/features/accounts/components/import-dialog";
 import { ResetCreditConfirmDialog } from "@/features/accounts/components/reset-credit-confirm-dialog";
 import { AuthExportDialog } from "@/features/accounts/components/auth-export-dialog";
 import {
+  useAccountLifecycle,
+  useAccountLifecycleMutation,
+} from "@/features/accounts/hooks/use-account-lifecycle";
+import {
   useAccounts,
   useAccountUsageResetCredits,
 } from "@/features/accounts/hooks/use-accounts";
@@ -118,6 +122,8 @@ export function AccountsPage() {
     [accounts, resolvedSelectedAccountId],
   );
   const resetCreditsQuery = useAccountUsageResetCredits(selectedAccount?.accountId ?? null);
+  const lifecycleQuery = useAccountLifecycle(selectedAccount?.accountId ?? null);
+  const lifecycleMutation = useAccountLifecycleMutation();
 
   const mutationBusy =
     importMutation.isPending ||
@@ -251,6 +257,12 @@ export function AccountsPage() {
             resetCredits={resetCreditsQuery.data?.rateLimitResetCredits ?? null}
             resetCreditsLoading={resetCreditsQuery.isFetching}
             resetCreditsUnavailable={!!resetCreditsQuery.error}
+            lifecycle={lifecycleQuery.data ?? null}
+            lifecycleLoading={lifecycleQuery.isPending}
+            lifecycleError={getErrorMessageOrNull(lifecycleQuery.error)}
+            onLifecycleSave={(accountId, payload) =>
+              lifecycleMutation.mutateAsync({ accountId, payload })
+            }
           />
         </div>
       )}

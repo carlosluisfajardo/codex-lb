@@ -51,7 +51,7 @@ WORKDIR /app
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade \
-        bsdutils libblkid1 libc-bin libc6 libcap2 libmount1 libsmartcols1 libssl3t64 \
+        bsdutils libblkid1 libc-bin libc6 libcap2 libmount1 libpcre2-8-0 libsmartcols1 libssl3t64 \
         libsystemd0 libudev1 libuuid1 openssl sed util-linux \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         openssl-provider-legacy \

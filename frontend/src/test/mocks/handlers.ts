@@ -11,10 +11,17 @@ import {
   TRAFFIC_CLASSES,
 } from "@/features/api-keys/schemas";
 import {
+  isCivilDate,
+  isLifecycleTimezone,
+  isLocalTime,
+} from "@/features/accounts/lifecycle";
+import {
+  type AccountLifecycle,
   type AccountSummary,
   type ApiKey,
   type ConversationDetails,
   type ConversationEntry,
+  createAccountLifecycle,
   createAccountSummary,
   createAccountTrends,
   createApiKey,
@@ -171,6 +178,49 @@ const AccountRoutingPolicyPayloadSchema = z.object({
   routingPolicy: z.enum(["normal", "burn_first", "preserve"]),
 });
 
+const LifecycleDatePayloadSchema = z.discriminatedUnion("precision", [
+  z.strictObject({
+    precision: z.literal("date"),
+    date: z.string().refine(isCivilDate),
+  }),
+  z.strictObject({
+    precision: z.literal("datetime"),
+    date: z.string().refine(isCivilDate),
+    time: z.string().refine(isLocalTime),
+    timezone: z.string().refine(isLifecycleTimezone),
+  }),
+]);
+
+const AccountLifecyclePayloadSchema = z.strictObject({
+  endsOn: LifecycleDatePayloadSchema.nullable(),
+  renewsOn: LifecycleDatePayloadSchema.nullable(),
+  cancellationStatus: z.enum(["not_cancelled", "cancelled"]).nullable(),
+  expectedRevision: z.number().int().nonnegative().max(2_147_483_646),
+  expectedConcurrencyToken: z.string().regex(/^[0-9a-f]{64}$/),
+});
+
+function lifecycleTokenFor(accountId: string): string {
+  const existing = state.accountLifecycleTokens[accountId];
+  if (existing) {
+    return existing;
+  }
+  state.accountLifecycleTokenSequence += 1;
+  const token = state.accountLifecycleTokenSequence.toString(16).padStart(64, "0");
+  state.accountLifecycleTokens = { ...state.accountLifecycleTokens, [accountId]: token };
+  return token;
+}
+
+function storedLifecycleDate(
+  value: z.infer<typeof LifecycleDatePayloadSchema> | null,
+): AccountLifecycle["endsOn"] {
+  if (!value) {
+    return null;
+  }
+  return value.precision === "date"
+    ? { precision: "date", date: value.date, time: null, timezone: null }
+    : value;
+}
+
 const SettingsPayloadSchema = z.looseObject({
   stickyThreadsEnabled: z.boolean().optional(),
   subscriptionOverflowSourceId: z.string().nullable().optional(),
@@ -323,6 +373,10 @@ function renumberMappings(ordered: readonly RoleMapping[]): RoleMapping[] {
 
 type MockState = {
   accounts: AccountSummary[];
+  accountLifecycles: Record<string, AccountLifecycle>;
+  // Like the API's incarnation-bound token: one per account row, new when a deleted id is reused.
+  accountLifecycleTokens: Record<string, string>;
+  accountLifecycleTokenSequence: number;
   requestLogs: RequestLogEntry[];
   conversations: ConversationEntry[];
   conversationDetails: ConversationDetails[];
@@ -416,6 +470,9 @@ type MockState = {
 function createInitialState(): MockState {
   return {
     accounts: createDefaultAccounts(),
+    accountLifecycles: {},
+    accountLifecycleTokens: {},
+    accountLifecycleTokenSequence: 0,
     requestLogs: createDefaultRequestLogs(),
     conversations: createDefaultConversations(),
     conversationDetails: [
@@ -1068,6 +1125,61 @@ export const handlers = [
     },
   ),
 
+  http.get("/api/accounts/:accountId/lifecycle", ({ params }) => {
+    const accountId = String(params.accountId);
+    if (!findAccount(accountId)) {
+      return HttpResponse.json(
+        { error: { code: "account_not_found", message: "Account not found" } },
+        { status: 404 },
+      );
+    }
+    return HttpResponse.json({
+      ...(state.accountLifecycles[accountId] ?? createAccountLifecycle({ accountId })),
+      concurrencyToken: lifecycleTokenFor(accountId),
+    });
+  }),
+
+  http.put("/api/accounts/:accountId/lifecycle", async ({ params, request }) => {
+    const accountId = String(params.accountId);
+    const payload = await parseJsonBody(request, AccountLifecyclePayloadSchema);
+    if (!payload) {
+      return HttpResponse.json(
+        { error: { code: "validation_error", message: "Invalid request payload" } },
+        { status: 422 },
+      );
+    }
+    if (!findAccount(accountId)) {
+      return HttpResponse.json(
+        { error: { code: "account_not_found", message: "Account not found" } },
+        { status: 404 },
+      );
+    }
+    const current = state.accountLifecycles[accountId] ?? createAccountLifecycle({ accountId });
+    const concurrencyToken = lifecycleTokenFor(accountId);
+    if (payload.expectedRevision !== current.revision || payload.expectedConcurrencyToken !== concurrencyToken) {
+      return HttpResponse.json(
+        {
+          error: {
+            code: "account_lifecycle_conflict",
+            message: "Lifecycle details changed since they were read",
+          },
+        },
+        { status: 409 },
+      );
+    }
+    const saved = createAccountLifecycle({
+      accountId,
+      endsOn: storedLifecycleDate(payload.endsOn),
+      renewsOn: storedLifecycleDate(payload.renewsOn),
+      cancellationStatus: payload.cancellationStatus,
+      revision: current.revision + 1,
+      concurrencyToken,
+      updatedAt: new Date().toISOString(),
+    });
+    state.accountLifecycles = { ...state.accountLifecycles, [accountId]: saved };
+    return HttpResponse.json(saved);
+  }),
+
   http.patch("/api/accounts/:accountId", async ({ params, request }) => {
     const accountId = String(params.accountId);
     const account = findAccount(accountId);
@@ -1218,6 +1330,13 @@ export const handlers = [
 		state.accounts = state.accounts.filter(
 			(account) => account.accountId !== accountId,
 		);
+		// Like the API, a later account given this id must not see these notes.
+		state.accountLifecycles = Object.fromEntries(
+			Object.entries(state.accountLifecycles).filter(([id]) => id !== accountId),
+		);
+		state.accountLifecycleTokens = Object.fromEntries(
+			Object.entries(state.accountLifecycleTokens).filter(([id]) => id !== accountId),
+		);
 		return HttpResponse.json({ status: "deleted" });
 	}),
 
@@ -1234,6 +1353,13 @@ export const handlers = [
     }
     state.accounts = state.accounts.filter(
       (account) => account.accountId !== accountId,
+    );
+    // Like the API, a later account given this id must not see these notes.
+    state.accountLifecycles = Object.fromEntries(
+      Object.entries(state.accountLifecycles).filter(([id]) => id !== accountId),
+    );
+    state.accountLifecycleTokens = Object.fromEntries(
+      Object.entries(state.accountLifecycleTokens).filter(([id]) => id !== accountId),
     );
     return HttpResponse.json({ status: "deleted" });
   }),

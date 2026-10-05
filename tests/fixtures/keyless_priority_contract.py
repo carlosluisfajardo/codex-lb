@@ -807,7 +807,9 @@ class KeylessPriorityMigrationTests(unittest.TestCase):
             ).fetchone()
             version = connection.execute("SELECT version_num FROM alembic_version").fetchone()[0]
         self.assertEqual(row, (1, 0))
-        self.assertEqual(version, self._REVISION)
+        from alembic.script import ScriptDirectory
+
+        self.assertEqual(version, ScriptDirectory.from_config(_build_alembic_config(url)).get_current_head())
         self.assertEqual(check_schema_drift(url), ())
         self.assertEqual(check_migration_policy(url), ())
 

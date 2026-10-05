@@ -8,10 +8,13 @@ import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { AccountActions } from "@/features/accounts/components/account-actions";
+import { AccountLifecyclePanel } from "@/features/accounts/components/account-lifecycle-panel";
 import { AccountProxyBinding } from "@/features/accounts/components/account-proxy-binding";
 import { AccountTokenInfo } from "@/features/accounts/components/account-token-info";
 import { AccountUsagePanel } from "@/features/accounts/components/account-usage-panel";
 import type {
+  AccountLifecycle,
+  AccountLifecycleUpdateRequest,
   AccountRoutingPolicy,
   AccountSummary,
   AccountUsageResetCredits,
@@ -52,6 +55,10 @@ export type AccountDetailProps = {
   resetCredits?: AccountUsageResetCredits | null;
   resetCreditsLoading?: boolean;
   resetCreditsUnavailable?: boolean;
+  lifecycle?: AccountLifecycle | null;
+  lifecycleLoading?: boolean;
+  lifecycleError?: string | null;
+  onLifecycleSave?: (accountId: string, payload: AccountLifecycleUpdateRequest) => Promise<unknown>;
 };
 
 export function AccountDetail({
@@ -78,6 +85,10 @@ export function AccountDetail({
   resetCredits = null,
   resetCreditsLoading = false,
   resetCreditsUnavailable = false,
+  lifecycle = null,
+  lifecycleLoading = false,
+  lifecycleError = null,
+  onLifecycleSave,
 }: AccountDetailProps) {
   const { t } = useTranslation();
   const { data: trends } = useAccountTrends(account?.accountId ?? null);
@@ -172,6 +183,17 @@ export function AccountDetail({
         onReset={onResetUsage}
       />
       <AccountTokenInfo account={account} />
+      {onLifecycleSave ? (
+        <AccountLifecyclePanel
+          account={account}
+          lifecycle={lifecycle}
+          loading={lifecycleLoading}
+          error={lifecycleError}
+          busy={busy}
+          readOnly={readOnly}
+          onSave={onLifecycleSave}
+        />
+      ) : null}
       <AccountActions
         account={account}
         busy={busy}

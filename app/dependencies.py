@@ -9,6 +9,8 @@ from fastapi import Depends, FastAPI, Request, WebSocket
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_background_session, get_session
+from app.modules.account_lifecycle.repository import AccountLifecycleRepository
+from app.modules.account_lifecycle.service import AccountLifecycleService
 from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.service import AccountsService
@@ -61,6 +63,13 @@ class AccountsContext:
     session: AsyncSession
     repository: AccountsRepository
     service: AccountsService
+
+
+@dataclass(slots=True)
+class AccountLifecycleContext:
+    session: AsyncSession
+    repository: AccountLifecycleRepository
+    service: AccountLifecycleService
 
 
 @dataclass(slots=True)
@@ -211,6 +220,14 @@ def get_accounts_context(
         repository=repository,
         service=service,
     )
+
+
+def get_account_lifecycle_context(
+    session: AsyncSession = Depends(get_session),
+) -> AccountLifecycleContext:
+    repository = AccountLifecycleRepository(session)
+    service = AccountLifecycleService(repository)
+    return AccountLifecycleContext(session=session, repository=repository, service=service)
 
 
 def get_audit_context(

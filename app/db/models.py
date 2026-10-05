@@ -2380,6 +2380,39 @@ class AccountPlanDowngradeObservation(Base):
     last_observed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class AccountLifecyclePreference(Base):
+    """Operator-entered subscription lifecycle notes for one account row.
+
+    Keyed by the exact account id plus ``account_incarnation``, the SHA-256 of
+    that row's ``codex_installation_id``: in-place re-auth/re-import keeps the
+    row and so the notes, while a later row that reuses the id (ids are
+    recycled, e.g. ``__copyN``) starts empty instead of inheriting them.
+
+    Dates are stored exactly as declared: a civil ``*_date`` alone (date
+    precision) or with ``*_time`` and ``*_timezone`` (a local time in an IANA
+    zone or fixed offset). No instant is derived. ``revision`` is the
+    compare-and-set token and only ever grows; clearing keeps the row.
+
+    There is deliberately no foreign key: deleting an account leaves its rows
+    in place as inert, exportable records. Routing never reads this table.
+    """
+
+    __tablename__ = "account_lifecycle_preferences"
+
+    account_id: Mapped[str] = mapped_column(String, primary_key=True)
+    account_incarnation: Mapped[str] = mapped_column(String(64), primary_key=True)
+    ends_on_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    ends_on_time: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    ends_on_timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    renews_on_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    renews_on_time: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    renews_on_timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cancellation_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
 class BridgeRingMember(Base):
     __tablename__ = "bridge_ring_members"
 

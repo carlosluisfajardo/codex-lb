@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { isCivilDate, isLifecycleTimezone, isLocalTime } from "@/features/accounts/lifecycle";
+
 const UsageTrendPointSchema = z.object({
   t: z.iso.datetime({ offset: true }),
   v: z.number(),
@@ -267,6 +269,68 @@ export const AccountUpdateRequestSchema = z.object({
   securityWorkAuthorized: z.boolean().optional(),
 });
 
+export const AccountCancellationStatusSchema = z.enum(["not_cancelled", "cancelled"]);
+
+// Stored values come back exactly as the server accepted them; the server is
+// the authority on their format, so the response side only checks the shape.
+const AccountLifecycleCivilDateSchema = z.object({
+  precision: z.literal("date"),
+  date: z.string(),
+  time: z.null().optional(),
+  timezone: z.null().optional(),
+});
+
+const AccountLifecycleLocalDateTimeSchema = z.object({
+  precision: z.literal("datetime"),
+  date: z.string(),
+  time: z.string(),
+  timezone: z.string(),
+});
+
+export const AccountLifecycleDateSchema = z.discriminatedUnion("precision", [
+  AccountLifecycleCivilDateSchema,
+  AccountLifecycleLocalDateTimeSchema,
+]);
+
+export const AccountLifecycleSchema = z.object({
+  accountId: z.string(),
+  endsOn: AccountLifecycleDateSchema.nullable(),
+  renewsOn: AccountLifecycleDateSchema.nullable(),
+  cancellationStatus: AccountCancellationStatusSchema.nullable(),
+  revision: z.number().int().nonnegative(),
+  // Opaque marker of the account row this read came from; a save must echo it.
+  concurrencyToken: z.string(),
+  updatedAt: z.iso.datetime({ offset: true }).nullable(),
+});
+
+const LifecycleCivilDateValueSchema = z.string().refine(isCivilDate, "Invalid calendar date");
+const LifecycleLocalTimeValueSchema = z.string().refine(isLocalTime, "Invalid time");
+const LifecycleTimezoneValueSchema = z.string().refine(isLifecycleTimezone, "Invalid timezone");
+
+export const AccountLifecycleDateInputSchema = z.discriminatedUnion("precision", [
+  z.strictObject({
+    precision: z.literal("date"),
+    date: LifecycleCivilDateValueSchema,
+  }),
+  z.strictObject({
+    precision: z.literal("datetime"),
+    date: LifecycleCivilDateValueSchema,
+    time: LifecycleLocalTimeValueSchema,
+    timezone: LifecycleTimezoneValueSchema,
+  }),
+]);
+
+// The stored revision is an int4; a based-on revision must leave room for the increment.
+export const MAX_LIFECYCLE_BASE_REVISION = 2_147_483_646;
+
+export const AccountLifecycleUpdateRequestSchema = z.strictObject({
+  endsOn: AccountLifecycleDateInputSchema.nullable(),
+  renewsOn: AccountLifecycleDateInputSchema.nullable(),
+  cancellationStatus: AccountCancellationStatusSchema.nullable(),
+  expectedRevision: z.number().int().nonnegative().max(MAX_LIFECYCLE_BASE_REVISION),
+  expectedConcurrencyToken: z.string().regex(/^[0-9a-f]{64}$/),
+});
+
 export const OauthStartRequestSchema = z.object({
   forceMethod: z.string().optional(),
   accountId: z.string().optional(),
@@ -367,6 +431,11 @@ export type AccountUsageResetConsumeResponse = z.infer<
   typeof AccountUsageResetConsumeResponseSchema
 >;
 export type AccountTrendsResponse = z.infer<typeof AccountTrendsResponseSchema>;
+export type AccountCancellationStatus = z.infer<typeof AccountCancellationStatusSchema>;
+export type AccountLifecycleDate = z.infer<typeof AccountLifecycleDateSchema>;
+export type AccountLifecycle = z.infer<typeof AccountLifecycleSchema>;
+export type AccountLifecycleDateInput = z.infer<typeof AccountLifecycleDateInputSchema>;
+export type AccountLifecycleUpdateRequest = z.infer<typeof AccountLifecycleUpdateRequestSchema>;
 export type OpenCodeAuthJson = z.infer<typeof OpenCodeAuthJsonSchema>;
 export type CodexAuthJson = z.infer<typeof CodexAuthJsonSchema>;
 export type AccountAuthExportTokens = z.infer<typeof AccountAuthExportTokensSchema>;

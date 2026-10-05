@@ -6,7 +6,7 @@ import { MemoryRouter } from "react-router-dom";
 import { AccountsPage } from "@/features/accounts/components/accounts-page";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
 import { useAccountQuotaDisplayStore } from "@/hooks/use-account-quota-display";
-import { ADMIN_PERMISSIONS, createUpstreamProxyAdmin } from "@/test/mocks/factories";
+import { ADMIN_PERMISSIONS, createAccountLifecycle, createUpstreamProxyAdmin } from "@/test/mocks/factories";
 import type { AccountSummary } from "@/features/accounts/schemas";
 
 vi.mock("@/features/accounts/hooks/use-accounts", () => ({
@@ -16,6 +16,15 @@ vi.mock("@/features/accounts/hooks/use-accounts", () => ({
     data: { rateLimitResetCredits: { availableCount: 3 } },
     isFetching: false,
     error: null,
+  })),
+}));
+
+vi.mock("@/features/accounts/hooks/use-account-lifecycle", () => ({
+  useAccountLifecycle: vi.fn(),
+  useAccountLifecycleMutation: vi.fn(() => ({
+    isPending: false,
+    error: null,
+    mutateAsync: vi.fn(),
   })),
 }));
 
@@ -68,6 +77,8 @@ vi.mock("@/features/settings/hooks/use-settings", () => ({
 const { useAccounts } = await import("@/features/accounts/hooks/use-accounts");
 const mockedUseAccounts = useAccounts as unknown as ReturnType<typeof vi.fn>;
 const { useUpstreamProxyAdmin } = await import("@/features/settings/hooks/use-settings");
+const { useAccountLifecycle } = await import("@/features/accounts/hooks/use-account-lifecycle");
+const mockedUseAccountLifecycle = useAccountLifecycle as unknown as ReturnType<typeof vi.fn>;
 const mockedUseUpstreamProxyAdmin = useUpstreamProxyAdmin as unknown as ReturnType<typeof vi.fn>;
 
 function mockAccountsQuery(accounts: AccountSummary[]) {
@@ -119,6 +130,7 @@ describe("AccountsPage", () => {
       canWrite: true,
     });
     useAccountQuotaDisplayStore.setState({ quotaDisplay: "weekly" });
+    mockedUseAccountLifecycle.mockReturnValue({ data: undefined, isPending: false, error: null });
     vi.spyOn(Date, "now").mockReturnValue(
       new Date("2026-01-01T12:00:00.000Z").getTime(),
     );
@@ -461,5 +473,56 @@ describe("AccountsPage", () => {
 
     expect(probe).toHaveBeenCalledWith({ accountId: "acc-probe" });
     expect(screen.queryByRole("alertdialog", { name: "Reset usage" })).not.toBeInTheDocument();
+  });
+
+  it("shows the selected account's lifecycle beside its routing policy inside the detail panel", () => {
+    mockedUseAccountLifecycle.mockReturnValue({
+      data: createAccountLifecycle({
+        accountId: "acc-lifecycle",
+        endsOn: { precision: "date", date: "2026-10-12", time: null, timezone: null },
+        revision: 1,
+        updatedAt: "2026-10-05T10:00:00Z",
+      }),
+      isPending: false,
+      error: null,
+    });
+    mockAccountsQuery([account({ accountId: "acc-lifecycle", routingPolicy: "burn_first" })]);
+
+    render(
+      <MemoryRouter>
+        <AccountsPage />
+      </MemoryRouter>,
+    );
+
+    expect(mockedUseAccountLifecycle).toHaveBeenCalledWith("acc-lifecycle");
+    const panel = screen.getByRole("region", { name: "Subscription lifecycle" });
+    expect(within(panel).getByText("Date only")).toBeInTheDocument();
+    expect(within(panel).getByText("Burn first")).toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: "Edit lifecycle" })).toBeEnabled();
+  });
+
+  it("shows read-only guests the lifecycle values without an edit control", () => {
+    useAuthStore.setState({ role: "guest", permissions: ["read"], canWrite: false, initialized: true });
+    mockedUseAccountLifecycle.mockReturnValue({
+      data: createAccountLifecycle({
+        accountId: "acc-guest-lifecycle",
+        endsOn: { precision: "date", date: "2026-10-12", time: null, timezone: null },
+        revision: 1,
+        updatedAt: "2026-10-05T10:00:00Z",
+      }),
+      isPending: false,
+      error: null,
+    });
+    mockAccountsQuery([account({ accountId: "acc-guest-lifecycle" })]);
+
+    render(
+      <MemoryRouter>
+        <AccountsPage />
+      </MemoryRouter>,
+    );
+
+    const panel = screen.getByRole("region", { name: "Subscription lifecycle" });
+    expect(within(panel).getByText("Date only")).toBeInTheDocument();
+    expect(within(panel).queryByRole("button", { name: "Edit lifecycle" })).not.toBeInTheDocument();
   });
 });

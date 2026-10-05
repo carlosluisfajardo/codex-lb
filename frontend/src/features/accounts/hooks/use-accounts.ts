@@ -25,6 +25,7 @@ import type {
   AccountRoutingPolicy,
   AccountUsageResetConsumeResponse,
 } from "@/features/accounts/schemas";
+import { forgetAccountLifecycle, resetAccountLifecycle } from "@/features/accounts/query-invalidation";
 
 async function invalidateAccountRelatedQueries(queryClient: ReturnType<typeof useQueryClient>, accountId?: string) {
   const invalidations = [
@@ -81,8 +82,9 @@ export function useAccountMutations() {
 
   const importMutation = useMutation({
     mutationFn: importAccount,
-    onSuccess: () => {
+    onSuccess: (data) => {
       toast.success(t("accounts.toasts.imported"));
+      void resetAccountLifecycle(queryClient, data.accountId);
       void invalidateAccountRelatedQueries(queryClient);
     },
     onError: (error: Error) => {
@@ -127,8 +129,9 @@ export function useAccountMutations() {
   const deleteMutation = useMutation({
     mutationFn: ({ accountId, deleteHistory }: { accountId: string; deleteHistory: boolean }) =>
       deleteAccount(accountId, deleteHistory),
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
       toast.success(t("accounts.toasts.deleted"));
+      void forgetAccountLifecycle(queryClient, variables.accountId);
       void invalidateAccountRelatedQueries(queryClient);
     },
     onError: (error: Error) => {
