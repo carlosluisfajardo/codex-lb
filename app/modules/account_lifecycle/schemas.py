@@ -81,11 +81,17 @@ class AccountLifecycleResponse(DashboardModel):
     renews_on: LifecycleDate | None
     cancellation_status: CancellationStatus | None
     revision: int = Field(ge=0)
+    # Opaque and non-secret; it changes when the id names a different account row, so a save must echo it.
+    concurrency_token: str
     updated_at: datetime | None
 
 
 class AccountLifecycleUpdateRequest(DashboardModel):
-    """Full replacement of the three fields, based on ``expected_revision`` (0 = never saved)."""
+    """Full replacement of the three fields, based on the revision and account row the draft was read from.
+
+    ``expected_revision`` is 0 when nothing was saved; ``expected_concurrency_token`` is the
+    ``concurrency_token`` of that same read.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -93,3 +99,4 @@ class AccountLifecycleUpdateRequest(DashboardModel):
     renews_on: LifecycleDate | None
     cancellation_status: CancellationStatus | None
     expected_revision: int = Field(ge=0, le=MAX_BASE_REVISION, strict=True)
+    expected_concurrency_token: str = Field(pattern=r"^[0-9a-f]{64}$")

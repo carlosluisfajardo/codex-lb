@@ -16,6 +16,7 @@ def _request(**overrides: Any) -> dict[str, Any]:
         "renewsOn": None,
         "cancellationStatus": None,
         "expectedRevision": 0,
+        "expectedConcurrencyToken": "0" * 64,
     }
     payload.update(overrides)
     return payload
@@ -135,7 +136,9 @@ def test_update_request_accepts_explicit_nulls_and_both_cancellation_values() ->
         assert request.ends_on is None and request.renews_on is None
 
 
-@pytest.mark.parametrize("missing", ["endsOn", "renewsOn", "cancellationStatus", "expectedRevision"])
+@pytest.mark.parametrize(
+    "missing", ["endsOn", "renewsOn", "cancellationStatus", "expectedRevision", "expectedConcurrencyToken"]
+)
 def test_update_request_requires_every_field(missing: str) -> None:
     payload = _request()
     payload.pop(missing)

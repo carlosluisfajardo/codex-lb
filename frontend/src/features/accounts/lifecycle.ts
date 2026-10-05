@@ -204,15 +204,17 @@ export function lifecycleDateDraftToInput(draft: LifecycleDateDraft): AccountLif
   return { precision: "datetime", date: draft.date, time: draft.time, timezone: draft.timezone.trim() };
 }
 
-/** A full replacement: every field is sent, unset ones as explicit nulls. */
+/** A full replacement based on one read: every field is sent, unset ones as explicit nulls. */
 export function lifecycleDraftToPayload(
   draft: LifecycleDraft,
   expectedRevision: number,
+  expectedConcurrencyToken: string,
 ): AccountLifecycleUpdateRequest {
   return {
     endsOn: lifecycleDateDraftToInput(draft.endsOn),
     renewsOn: lifecycleDateDraftToInput(draft.renewsOn),
     cancellationStatus: draft.cancellationStatus === "unset" ? null : draft.cancellationStatus,
     expectedRevision,
+    expectedConcurrencyToken,
   };
 }

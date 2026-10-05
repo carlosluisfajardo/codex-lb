@@ -60,9 +60,10 @@ const VALIDATION_MESSAGE_KEYS: Record<LifecycleDateDraftError, string> = {
 
 type EditSession = {
   draft: LifecycleDraft;
-  /** The values and revision the draft was based on, captured when editing started. */
+  /** The values, revision and account row the draft was based on, captured when editing started. */
   initial: LifecycleDraft;
   expectedRevision: number;
+  expectedConcurrencyToken: string;
 };
 
 export function AccountLifecyclePanel({
@@ -80,6 +81,17 @@ export function AccountLifecyclePanel({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [conflictNotice, setConflictNotice] = useState(false);
+  const [sessionReadOnly, setSessionReadOnly] = useState(readOnly);
+
+  // Losing write access discards an open draft at once, during render, so no save control or
+  // submission survives the change, and regaining access does not bring the old draft back.
+  if (readOnly !== sessionReadOnly) {
+    setSessionReadOnly(readOnly);
+    if (readOnly) {
+      setSession(null);
+      setSaveError(null);
+    }
+  }
 
   // Values read for another id are never shown or edited here.
   const loaded = lifecycle && lifecycle.accountId === account.accountId ? lifecycle : null;
@@ -92,7 +104,12 @@ export function AccountLifecyclePanel({
       return;
     }
     const draft = lifecycleToDraft(loaded);
-    setSession({ draft, initial: draft, expectedRevision: loaded.revision });
+    setSession({
+      draft,
+      initial: draft,
+      expectedRevision: loaded.revision,
+      expectedConcurrencyToken: loaded.concurrencyToken,
+    });
     setSaveError(null);
     setConflictNotice(false);
   };
@@ -107,13 +124,16 @@ export function AccountLifecyclePanel({
   };
 
   const save = async () => {
-    if (!session || invalid || saving || busy) {
+    if (!session || readOnly || invalid || saving || busy) {
       return;
     }
     setSaving(true);
     setSaveError(null);
     try {
-      await onSave(account.accountId, lifecycleDraftToPayload(session.draft, session.expectedRevision));
+      await onSave(
+        account.accountId,
+        lifecycleDraftToPayload(session.draft, session.expectedRevision, session.expectedConcurrencyToken),
+      );
       setSession(null);
     } catch (caught) {
       if (isAccountLifecycleConflict(caught)) {
@@ -163,7 +183,7 @@ export function AccountLifecyclePanel({
         <p className="text-xs text-muted-foreground">{t("accounts.lifecycle.loadFailed", { message: error })}</p>
       ) : null}
 
-      {session && errors ? (
+      {session && errors && !readOnly ? (
         <form
           className="space-y-3"
           noValidate

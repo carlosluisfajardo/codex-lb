@@ -45,9 +45,17 @@ are notes: nothing in the proxy reads them.
   `2026-10-12` to midnight UTC would invent a cutoff the owner never stated.
   Local times keep their declared timezone (an IANA name or a fixed offset) and
   their declared precision (`HH:MM` or `HH:MM:SS`).
-- **Revision compare-and-set per record.** Clearing keeps the row with every
-  field unset and a higher revision, so a stale form can never succeed because
-  the revision happened to come round again.
+- **Revision compare-and-set per record, bound to the account row.** Clearing
+  keeps the row with every field unset and a higher revision, so a stale form
+  can never succeed because the revision happened to come round again.
+  - A revision alone cannot tell a draft read for a removed row from one read for
+    a new row given the same id: both start at revision 0 and may both reach
+    revision 1. Every read therefore also returns a `concurrencyToken`, a
+    domain-separated SHA-256 of the row's incarnation digest. It is opaque and
+    non-secret, and it never exposes the installation id.
+  - A save must echo the token. The account row is then re-checked inside the
+    write transaction, under the SQLite write lock or a PostgreSQL key-share lock,
+    so a removal or replacement that lands after the token check is refused too.
 - **Account permissions.** Reading requires `accounts:read`, the permission
   that already gates the dashboard overview. Viewer and guest presets hold it;
   the own-scoped member preset does not. Writing requires `accounts:write`,
@@ -69,9 +77,24 @@ are notes: nothing in the proxy reads them.
 
 ## Failure modes
 
-- **Stale form.** The write is based on an old revision. The API returns 409
-  `account_lifecycle_conflict` and changes nothing. The dashboard reloads the
-  stored values so the operator can reapply the edit.
+- **Stale form.** The write is based on an old revision, or on a read of an
+  account row that has since been removed or replaced under the same id (the
+  token differs). The API returns 409 `account_lifecycle_conflict` and changes
+  nothing. The dashboard reloads the stored values so the operator can reapply
+  the edit.
+- **Dashboard cache across a recycled id.**
+  - Deleting an account drops its cached lifecycle notes and cancels reads still
+    in flight.
+  - Importing an account, or completing a sign-in, resets cached notes for the
+    id it may reuse. Open views reload instead of showing the removed row.
+  - A save response is cached only over notes from the same account row.
+  - A deletion made in another browser session is still only noticed at the next
+    refetch or selection change. A save from that view is refused by the token.
+  - The section adds no polling of its own. The page's existing account-list and
+    trends polls are unchanged.
+- **Write access lost mid-edit.** The open draft is discarded at once and no
+  save is sent. Server-side authorization is unchanged and remains the
+  authority.
 - **Account pending deletion or removed.** The lifecycle routes return 404. The
   row stays and is listed in exports with `accountPresent: false`. If the
   deletion is superseded in place, the row is still the same and the notes are
@@ -84,9 +107,14 @@ are notes: nothing in the proxy reads them.
 - **Restore against a changed store.** The snapshot token differs, the command
   exits non-zero and nothing is written. Take a fresh export and retry with its
   token.
-- **Restore racing a dashboard write.** Every row write in a restore is
-  conditional on the revision read in the same transaction, so a concurrent
-  write makes the whole restore roll back.
+- **Restore racing another writer.** From before the snapshot read until commit
+  or rollback, the restore holds the SQLite database write lock (`BEGIN
+  IMMEDIATE`, the repository convention) or the PostgreSQL table lock.
+  - Another connection or process can neither first-insert a record nor change a
+    record the restore would leave unchanged inside that window. It waits for the
+    busy timeout or fails.
+  - The per-record conditional writes stay as defense in depth. A conflict still
+    rolls back the whole restore.
 - **Older build on a migrated database.** An older build refuses a database
   whose revision it does not know ("schema ahead") and fails startup on drift
   if the table is left behind. Use the rollback procedure below rather than
@@ -103,7 +131,8 @@ cancelled renewal:
   "endsOn": {"precision": "date", "date": "2026-10-12", "time": null, "timezone": null},
   "renewsOn": null,
   "cancellationStatus": "cancelled",
-  "expectedRevision": 0
+  "expectedRevision": 0,
+  "expectedConcurrencyToken": "<the concurrencyToken of the read this edit started from>"
 }
 ```
 

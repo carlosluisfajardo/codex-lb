@@ -165,6 +165,8 @@ describe("lifecycle validators", () => {
   });
 });
 
+const TOKEN = "c".repeat(64);
+
 describe("lifecycle drafts", () => {
   const saved: AccountLifecycle = {
     accountId: "acc_primary",
@@ -172,6 +174,7 @@ describe("lifecycle drafts", () => {
     renewsOn: { precision: "datetime", date: "2026-11-03", time: "09:30:15", timezone: "America/New_York" },
     cancellationStatus: "cancelled",
     revision: 2,
+    concurrencyToken: TOKEN,
     updatedAt: "2026-10-05T10:00:00Z",
   };
 
@@ -184,13 +187,14 @@ describe("lifecycle drafts", () => {
   });
 
   it("round-trips saved values into the exact replacement payload", () => {
-    const payload = lifecycleDraftToPayload(lifecycleToDraft(saved), 2);
+    const payload = lifecycleDraftToPayload(lifecycleToDraft(saved), 2, TOKEN);
 
     expect(payload).toStrictEqual({
       endsOn: { precision: "date", date: "2026-10-12" },
       renewsOn: { precision: "datetime", date: "2026-11-03", time: "09:30:15", timezone: "America/New_York" },
       cancellationStatus: "cancelled",
       expectedRevision: 2,
+      expectedConcurrencyToken: TOKEN,
     });
   });
 
@@ -203,6 +207,7 @@ describe("lifecycle drafts", () => {
         cancellationStatus: "unset",
       },
       7,
+      TOKEN,
     );
 
     expect(payload).toStrictEqual({
@@ -210,8 +215,15 @@ describe("lifecycle drafts", () => {
       renewsOn: { precision: "date", date: "2026-11-03" },
       cancellationStatus: null,
       expectedRevision: 7,
+      expectedConcurrencyToken: TOKEN,
     });
-    expect(Object.keys(payload).sort()).toEqual(["cancellationStatus", "endsOn", "expectedRevision", "renewsOn"]);
+    expect(Object.keys(payload).sort()).toEqual([
+      "cancellationStatus",
+      "endsOn",
+      "expectedConcurrencyToken",
+      "expectedRevision",
+      "renewsOn",
+    ]);
   });
 
   it("trims the timezone of a datetime value", () => {
@@ -222,6 +234,7 @@ describe("lifecycle drafts", () => {
         cancellationStatus: "not_cancelled",
       },
       0,
+      TOKEN,
     );
 
     expect(payload.endsOn).toStrictEqual({ precision: "datetime", date: "2026-11-03", time: "09:30", timezone: "+02:00" });

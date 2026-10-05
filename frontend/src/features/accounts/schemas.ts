@@ -298,6 +298,8 @@ export const AccountLifecycleSchema = z.object({
   renewsOn: AccountLifecycleDateSchema.nullable(),
   cancellationStatus: AccountCancellationStatusSchema.nullable(),
   revision: z.number().int().nonnegative(),
+  // Opaque marker of the account row this read came from; a save must echo it.
+  concurrencyToken: z.string(),
   updatedAt: z.iso.datetime({ offset: true }).nullable(),
 });
 
@@ -326,6 +328,7 @@ export const AccountLifecycleUpdateRequestSchema = z.strictObject({
   renewsOn: AccountLifecycleDateInputSchema.nullable(),
   cancellationStatus: AccountCancellationStatusSchema.nullable(),
   expectedRevision: z.number().int().nonnegative().max(MAX_LIFECYCLE_BASE_REVISION),
+  expectedConcurrencyToken: z.string().regex(/^[0-9a-f]{64}$/),
 });
 
 export const OauthStartRequestSchema = z.object({

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+
 from app.db.models import AccountLifecyclePreference
 from app.modules.account_lifecycle.repository import AccountLifecycleRepository, LifecycleColumns, LifecycleKey
 from app.modules.account_lifecycle.schemas import (
@@ -50,14 +53,25 @@ def stored_cancellation_status(value: str | None) -> CancellationStatus | None:
     raise ValueError(f"unexpected stored cancellation status {value!r}")
 
 
-def lifecycle_response(account_id: str, row: AccountLifecyclePreference | None) -> AccountLifecycleResponse:
+_CONCURRENCY_TOKEN_DOMAIN = b"codex-lb/account-lifecycle/v1\0"
+
+
+def lifecycle_concurrency_token(account_incarnation: str) -> str:
+    """Opaque, non-secret marker of the account row a read came from; never the installation id itself."""
+
+    return hashlib.sha256(_CONCURRENCY_TOKEN_DOMAIN + account_incarnation.encode()).hexdigest()
+
+
+def lifecycle_response(key: LifecycleKey, row: AccountLifecyclePreference | None) -> AccountLifecycleResponse:
+    token = lifecycle_concurrency_token(key.account_incarnation)
     if row is None:
         return AccountLifecycleResponse(
-            account_id=account_id,
+            account_id=key.account_id,
             ends_on=None,
             renews_on=None,
             cancellation_status=None,
             revision=0,
+            concurrency_token=token,
             updated_at=None,
         )
     return AccountLifecycleResponse(
@@ -66,6 +80,7 @@ def lifecycle_response(account_id: str, row: AccountLifecyclePreference | None) 
         renews_on=stored_lifecycle_date(row.renews_on_date, row.renews_on_time, row.renews_on_timezone),
         cancellation_status=stored_cancellation_status(row.cancellation_status),
         revision=row.revision,
+        concurrency_token=token,
         updated_at=row.updated_at,
     )
 
@@ -80,12 +95,20 @@ class AccountLifecycleService:
         key = await self._current_key(account_id)
         if key is None:
             return None
-        return lifecycle_response(account_id, await self._repo.get(key))
+        return lifecycle_response(key, await self._repo.get(key))
 
     async def update(self, account_id: str, request: AccountLifecycleUpdateRequest) -> AccountLifecycleResponse | None:
         key = await self._current_key(account_id)
         if key is None:
             return None
+        if not hmac.compare_digest(
+            request.expected_concurrency_token, lifecycle_concurrency_token(key.account_incarnation)
+        ):
+            raise AccountLifecycleConflictError(
+                "This account id now names a different account than the one these lifecycle details were loaded "
+                "for; reload before editing"
+            )
+        # ``save`` re-checks the row under a write fence, so a replacement after this point is refused too.
         saved = await self._repo.save(
             key,
             lifecycle_columns(request.ends_on, request.renews_on, request.cancellation_status),
@@ -95,7 +118,7 @@ class AccountLifecycleService:
             raise AccountLifecycleConflictError(
                 "Lifecycle details were changed since they were loaded; reload and apply the edit again"
             )
-        return lifecycle_response(account_id, await self._repo.get(key))
+        return lifecycle_response(key, await self._repo.get(key))
 
     async def _current_key(self, account_id: str) -> LifecycleKey | None:
         incarnation = (await self._repo.visible_account_incarnations({account_id})).get(account_id)

@@ -162,8 +162,8 @@ describe("AccountLifecyclePanel editing", () => {
     const { rerender } = renderPanel({ onSave });
 
     await user.click(within(panel()).getByRole("button", { name: "Edit lifecycle" }));
-    // A background refetch delivers a newer revision while the draft is open.
-    rerender(panelElement({ onSave, lifecycle: savedLifecycle({ revision: 5 }) }));
+    // A background refetch delivers a newer revision (and another row's token) while the draft is open.
+    rerender(panelElement({ onSave, lifecycle: savedLifecycle({ revision: 5, concurrencyToken: "d".repeat(64) }) }));
 
     fireEvent.change(within(panel()).getByLabelText("Ends on date"), { target: { value: "2026-10-20" } });
     await user.click(within(panel()).getByRole("button", { name: "Save" }));
@@ -174,6 +174,7 @@ describe("AccountLifecyclePanel editing", () => {
       renewsOn: { precision: "datetime", date: "2026-11-03", time: "09:30", timezone: "America/New_York" },
       cancellationStatus: "not_cancelled",
       expectedRevision: 2,
+      expectedConcurrencyToken: "c".repeat(64),
     });
     expect(await within(panel()).findByRole("button", { name: "Edit lifecycle" })).toBeInTheDocument();
     expect(within(panel()).queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
@@ -211,6 +212,7 @@ describe("AccountLifecyclePanel editing", () => {
       renewsOn: { precision: "datetime", date: "2026-11-03", time: "09:30", timezone: "America/New_York" },
       cancellationStatus: "cancelled",
       expectedRevision: 0,
+      expectedConcurrencyToken: "c".repeat(64),
     });
   });
 

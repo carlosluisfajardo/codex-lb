@@ -196,7 +196,19 @@ const AccountLifecyclePayloadSchema = z.strictObject({
   renewsOn: LifecycleDatePayloadSchema.nullable(),
   cancellationStatus: z.enum(["not_cancelled", "cancelled"]).nullable(),
   expectedRevision: z.number().int().nonnegative().max(2_147_483_646),
+  expectedConcurrencyToken: z.string().regex(/^[0-9a-f]{64}$/),
 });
+
+function lifecycleTokenFor(accountId: string): string {
+  const existing = state.accountLifecycleTokens[accountId];
+  if (existing) {
+    return existing;
+  }
+  state.accountLifecycleTokenSequence += 1;
+  const token = state.accountLifecycleTokenSequence.toString(16).padStart(64, "0");
+  state.accountLifecycleTokens = { ...state.accountLifecycleTokens, [accountId]: token };
+  return token;
+}
 
 function storedLifecycleDate(
   value: z.infer<typeof LifecycleDatePayloadSchema> | null,
@@ -362,6 +374,9 @@ function renumberMappings(ordered: readonly RoleMapping[]): RoleMapping[] {
 type MockState = {
   accounts: AccountSummary[];
   accountLifecycles: Record<string, AccountLifecycle>;
+  // Like the API's incarnation-bound token: one per account row, new when a deleted id is reused.
+  accountLifecycleTokens: Record<string, string>;
+  accountLifecycleTokenSequence: number;
   requestLogs: RequestLogEntry[];
   conversations: ConversationEntry[];
   conversationDetails: ConversationDetails[];
@@ -456,6 +471,8 @@ function createInitialState(): MockState {
   return {
     accounts: createDefaultAccounts(),
     accountLifecycles: {},
+    accountLifecycleTokens: {},
+    accountLifecycleTokenSequence: 0,
     requestLogs: createDefaultRequestLogs(),
     conversations: createDefaultConversations(),
     conversationDetails: [
@@ -1116,9 +1133,10 @@ export const handlers = [
         { status: 404 },
       );
     }
-    return HttpResponse.json(
-      state.accountLifecycles[accountId] ?? createAccountLifecycle({ accountId }),
-    );
+    return HttpResponse.json({
+      ...(state.accountLifecycles[accountId] ?? createAccountLifecycle({ accountId })),
+      concurrencyToken: lifecycleTokenFor(accountId),
+    });
   }),
 
   http.put("/api/accounts/:accountId/lifecycle", async ({ params, request }) => {
@@ -1137,7 +1155,8 @@ export const handlers = [
       );
     }
     const current = state.accountLifecycles[accountId] ?? createAccountLifecycle({ accountId });
-    if (payload.expectedRevision !== current.revision) {
+    const concurrencyToken = lifecycleTokenFor(accountId);
+    if (payload.expectedRevision !== current.revision || payload.expectedConcurrencyToken !== concurrencyToken) {
       return HttpResponse.json(
         {
           error: {
@@ -1154,6 +1173,7 @@ export const handlers = [
       renewsOn: storedLifecycleDate(payload.renewsOn),
       cancellationStatus: payload.cancellationStatus,
       revision: current.revision + 1,
+      concurrencyToken,
       updatedAt: new Date().toISOString(),
     });
     state.accountLifecycles = { ...state.accountLifecycles, [accountId]: saved };
@@ -1314,6 +1334,9 @@ export const handlers = [
 		state.accountLifecycles = Object.fromEntries(
 			Object.entries(state.accountLifecycles).filter(([id]) => id !== accountId),
 		);
+		state.accountLifecycleTokens = Object.fromEntries(
+			Object.entries(state.accountLifecycleTokens).filter(([id]) => id !== accountId),
+		);
 		return HttpResponse.json({ status: "deleted" });
 	}),
 
@@ -1334,6 +1357,9 @@ export const handlers = [
     // Like the API, a later account given this id must not see these notes.
     state.accountLifecycles = Object.fromEntries(
       Object.entries(state.accountLifecycles).filter(([id]) => id !== accountId),
+    );
+    state.accountLifecycleTokens = Object.fromEntries(
+      Object.entries(state.accountLifecycleTokens).filter(([id]) => id !== accountId),
     );
     return HttpResponse.json({ status: "deleted" });
   }),

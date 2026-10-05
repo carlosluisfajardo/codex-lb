@@ -45,6 +45,7 @@ afterEach(() => {
 });
 
 const LIFECYCLE_KEY = ["accounts", "lifecycle", "acc_primary"];
+const TOKEN = "c".repeat(64);
 
 describe("useAccountLifecycle", () => {
   it("reads an account's lifecycle by its exact id without polling", async () => {
@@ -77,6 +78,7 @@ describe("useAccountLifecycle", () => {
       renewsOn: null,
       cancellationStatus: "cancelled",
       revision: 1,
+      concurrencyToken: TOKEN,
       updatedAt: "2026-10-05T10:00:00Z",
     });
 
@@ -137,6 +139,8 @@ describe("useAccountLifecycleMutation", () => {
       }),
     );
 
+    // The draft was based on this read; the save then replaces exactly these notes in the cache.
+    queryClient.setQueryData(LIFECYCLE_KEY, createAccountLifecycle({ accountId: "acc_primary" }));
     const { result } = renderHook(() => useAccountLifecycleMutation(), {
       wrapper: createWrapper(queryClient),
     });
@@ -148,6 +152,7 @@ describe("useAccountLifecycleMutation", () => {
         renewsOn: null,
         cancellationStatus: "cancelled",
         expectedRevision: 0,
+        expectedConcurrencyToken: TOKEN,
       },
     });
 
@@ -157,6 +162,7 @@ describe("useAccountLifecycleMutation", () => {
         renewsOn: null,
         cancellationStatus: "cancelled",
         expectedRevision: 0,
+        expectedConcurrencyToken: TOKEN,
       },
     ]);
     expect(saved.revision).toBe(1);
@@ -171,11 +177,13 @@ describe("useAccountLifecycleMutation", () => {
     const { result } = renderHook(() => useAccountLifecycleMutation(), {
       wrapper: createWrapper(queryClient),
     });
+    const { concurrencyToken } = await getAccountLifecycle("acc_primary");
     const payload = {
       endsOn: { precision: "date" as const, date: "2026-10-12" },
       renewsOn: null,
       cancellationStatus: null,
       expectedRevision: 0,
+      expectedConcurrencyToken: concurrencyToken,
     };
 
     const first = await result.current.mutateAsync({ accountId: "acc_primary", payload });
@@ -203,7 +211,13 @@ describe("useAccountLifecycleMutation", () => {
     await expect(
       result.current.mutateAsync({
         accountId: "acc_missing",
-        payload: { endsOn: null, renewsOn: null, cancellationStatus: null, expectedRevision: 0 },
+        payload: {
+          endsOn: null,
+          renewsOn: null,
+          cancellationStatus: null,
+          expectedRevision: 0,
+          expectedConcurrencyToken: TOKEN,
+        },
       }),
     ).rejects.toMatchObject({ status: 404, code: "account_not_found" });
 
@@ -221,7 +235,13 @@ describe("useAccountLifecycleMutation", () => {
     await expect(
       result.current.mutateAsync({
         accountId: "acc_primary",
-        payload: { endsOn: null, renewsOn: null, cancellationStatus: null, expectedRevision: 2147483647 },
+        payload: {
+          endsOn: null,
+          renewsOn: null,
+          cancellationStatus: null,
+          expectedRevision: 2147483647,
+          expectedConcurrencyToken: TOKEN,
+        },
       }),
     ).rejects.toThrow();
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -230,11 +250,13 @@ describe("useAccountLifecycleMutation", () => {
 
   it("gives a re-created account id of the mock server empty notes, like the API", async () => {
     const imported = await importAccount(new File(["{}"], "auth.json"));
+    const before = await getAccountLifecycle(imported.accountId);
     await updateAccountLifecycle(imported.accountId, {
       endsOn: { precision: "date", date: "2026-10-12" },
       renewsOn: null,
       cancellationStatus: null,
       expectedRevision: 0,
+      expectedConcurrencyToken: before.concurrencyToken,
     });
     await deleteAccount(imported.accountId);
 
@@ -244,6 +266,7 @@ describe("useAccountLifecycleMutation", () => {
     const lifecycle = await getAccountLifecycle(reimported.accountId);
     expect(lifecycle.revision).toBe(0);
     expect(lifecycle.endsOn).toBeNull();
+    expect(lifecycle.concurrencyToken).not.toBe(before.concurrencyToken);
   });
 
   it("rejects an invalid payload before it reaches the server", async () => {
@@ -261,6 +284,7 @@ describe("useAccountLifecycleMutation", () => {
           renewsOn: null,
           cancellationStatus: null,
           expectedRevision: 0,
+          expectedConcurrencyToken: TOKEN,
         },
       }),
     ).rejects.toThrow();

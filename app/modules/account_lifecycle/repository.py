@@ -8,6 +8,7 @@ from enum import Enum
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.utils.time import utcnow
@@ -133,14 +134,24 @@ class AccountLifecycleRepository:
         return result.scalars().all()
 
     async def save(self, key: LifecycleKey, columns: LifecycleColumns, *, expected_revision: int) -> bool:
-        """Apply one compare-and-set write; ``False`` means the revision was stale and nothing changed."""
+        """Apply one compare-and-set write to the account row ``key`` names; ``False`` changes nothing.
+
+        The account row is re-read inside the write transaction, under a fence a concurrent removal must
+        wait for (SQLite: the database write lock; PostgreSQL: a key-share lock on the row, which the
+        finalizing DELETE needs). A row that was removed, marked for deletion, or replaced by a new row
+        given the same id after the caller resolved ``key`` is refused, as is a stale revision.
+        """
 
         write = LifecycleWrite(key, columns, expected_revision, expected_revision + 1)
         async with sqlite_writer_section():
-            if not await self._write(write):
+            try:
+                if not await self._account_row_is_current(key) or not await self._write(write):
+                    await self._session.rollback()
+                    return False
+                await self._session.commit()
+            except BaseException:
                 await self._session.rollback()
-                return False
-            await self._session.commit()
+                raise
             return True
 
     async def replace_all(
@@ -158,12 +169,16 @@ class AccountLifecycleRepository:
 
         async with sqlite_writer_section():
             try:
-                if self._session.get_bind().dialect.name == "postgresql":
-                    # Keep concurrent dashboard writes (including first writes of new records)
-                    # out until this transaction ends, so the snapshot stays exact.
+                # Keep every other writer, in this process or another, out from the snapshot read until
+                # this transaction ends: first writes of new records and changes to records the restore
+                # would leave untouched included. ``sqlite_writer_section`` alone only covers this process.
+                dialect = self._session.get_bind().dialect.name
+                if dialect == "postgresql":
                     await self._session.execute(
                         text("LOCK TABLE account_lifecycle_preferences IN SHARE ROW EXCLUSIVE MODE")
                     )
+                elif dialect == "sqlite":
+                    await self._acquire_sqlite_write_fence()
                 rows = await self.list_all()
                 if snapshot_token((_key(row), row.revision) for row in rows) != expected_snapshot:
                     await self._session.rollback()
@@ -178,6 +193,35 @@ class AccountLifecycleRepository:
                 await self._session.rollback()
                 raise
         return ReplaceOutcome.APPLIED, len(writes)
+
+    async def _acquire_sqlite_write_fence(self) -> None:
+        """Take the SQLite database write lock now and hold it to commit/rollback (repo convention).
+
+        ``BEGIN IMMEDIATE`` cannot run inside an open transaction; a row-less UPDATE then escalates the
+        open transaction to a write transaction instead, taking the same lock before any later read.
+        """
+
+        try:
+            await self._session.execute(text("BEGIN IMMEDIATE"))
+        except OperationalError as exc:
+            if "within a transaction" not in str(exc).lower():
+                raise
+            await self._session.execute(
+                text("UPDATE account_lifecycle_preferences SET account_id = account_id WHERE 1 = 0")
+            )
+
+    async def _account_row_is_current(self, key: LifecycleKey) -> bool:
+        statement = (
+            select(Account.codex_installation_id)
+            .where(Account.id == key.account_id)
+            .where(Account.delete_requested_at.is_(None))
+        )
+        if self._session.get_bind().dialect.name == "sqlite":
+            await self._acquire_sqlite_write_fence()
+        else:
+            statement = statement.with_for_update(key_share=True)
+        installation_id = (await self._session.execute(statement)).scalar_one_or_none()
+        return installation_id is not None and account_incarnation(installation_id) == key.account_incarnation
 
     async def _write(self, write: LifecycleWrite) -> bool:
         now = utcnow()

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import delete, update
+from sqlalchemy import delete
 
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
@@ -82,7 +82,7 @@ async def _seed(async_client) -> None:
             },
         ),
     ):
-        response = await async_client.put(f"/api/accounts/{account_id}/lifecycle", json=_body(0, **body))
+        response = await _put(async_client, account_id, _body(0, **body))
         assert response.status_code == 200, response.text
 
 
@@ -93,6 +93,16 @@ def _body(expected_revision: int, **fields: Any) -> dict[str, Any]:
         "cancellationStatus": fields.get("cancellationStatus"),
         "expectedRevision": expected_revision,
     }
+
+
+async def _put(async_client, account_id: str, payload: dict[str, Any]):
+    """PUT the way a dashboard draft read just before would: with the account's current concurrency token."""
+    read = await async_client.get(f"/api/accounts/{account_id}/lifecycle")
+    assert read.status_code == 200, read.text
+    return await async_client.put(
+        f"/api/accounts/{account_id}/lifecycle",
+        json={**payload, "expectedConcurrencyToken": read.json()["concurrencyToken"]},
+    )
 
 
 def _cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -197,14 +207,14 @@ async def test_restore_round_trips_a_backup_without_lowering_revisions(async_cli
     assert _cli("export", "--output", str(backup)).returncode == 0
     exported = json.loads(backup.read_text())
 
-    assert (await async_client.put("/api/accounts/acc_fixture_a/lifecycle", json=_body(1))).status_code == 200
+    assert (await _put(async_client, "acc_fixture_a", _body(1))).status_code == 200
     changed_b = _body(1, renewsOn={"precision": "date", "date": "2027-11-03"}, cancellationStatus="not_cancelled")
-    assert (await async_client.put("/api/accounts/acc_fixture_b/lifecycle", json=changed_b)).status_code == 200
+    assert (await _put(async_client, "acc_fixture_b", changed_b)).status_code == 200
     async with SessionLocal() as session:
         session.add(_account("acc_fixture_c"))
         await session.commit()
     added_c = _body(0, endsOn={"precision": "date", "date": "2026-12-31"})
-    assert (await async_client.put("/api/accounts/acc_fixture_c/lifecycle", json=added_c)).status_code == 200
+    assert (await _put(async_client, "acc_fixture_c", added_c)).status_code == 200
     current = await _current_document()
 
     completed = _cli("restore", "--input", str(backup), "--expected-snapshot", current["snapshot"])
@@ -230,7 +240,7 @@ async def test_restore_with_a_stale_snapshot_changes_nothing(async_client, tmp_p
     backup = tmp_path / "before.json"
     assert _cli("export", "--output", str(backup)).returncode == 0
     stale_snapshot = json.loads(backup.read_text())["snapshot"]
-    assert (await async_client.put("/api/accounts/acc_fixture_a/lifecycle", json=_body(1))).status_code == 200
+    assert (await _put(async_client, "acc_fixture_a", _body(1))).status_code == 200
     current = await _current_document()
 
     completed = _cli("restore", "--input", str(backup), "--expected-snapshot", stale_snapshot)
@@ -276,7 +286,7 @@ async def test_restore_after_a_schema_rollback_never_reuses_a_revision(async_cli
         await session.commit()
     for revision, day in ((0, "01"), (1, "02"), (2, "03")):
         body = _body(revision, endsOn={"precision": "date", "date": f"2026-10-{day}"})
-        assert (await async_client.put("/api/accounts/acc_fixture_reuse/lifecycle", json=body)).status_code == 200
+        assert (await _put(async_client, "acc_fixture_reuse", body)).status_code == 200
     backup = tmp_path / "before-downgrade.json"
     assert _cli("export", "--output", str(backup)).returncode == 0
     assert _entries(json.loads(backup.read_text()))["acc_fixture_reuse"]["revision"] == 3
@@ -293,9 +303,9 @@ async def test_restore_after_a_schema_rollback_never_reuses_a_revision(async_cli
     assert restored["endsOn"]["date"] == "2026-10-03"
     assert restored["revision"] > 3
     for stale in (1, 2, 3):
-        stale_write = await async_client.put("/api/accounts/acc_fixture_reuse/lifecycle", json=_body(stale))
+        stale_write = await _put(async_client, "acc_fixture_reuse", _body(stale))
         assert stale_write.status_code == 409
-    fresh_write = await async_client.put("/api/accounts/acc_fixture_reuse/lifecycle", json=_body(restored["revision"]))
+    fresh_write = await _put(async_client, "acc_fixture_reuse", _body(restored["revision"]))
     assert fresh_write.status_code == 200
 
 
@@ -358,40 +368,34 @@ async def test_export_succeeds_where_directories_cannot_be_opened(db_setup, tmp_
 
 
 @pytest.mark.asyncio
-async def test_a_concurrent_write_to_a_record_being_restored_aborts_the_whole_restore(
+async def test_a_record_write_that_misses_its_revision_rolls_back_the_whole_restore(
     async_client, tmp_path, monkeypatch
 ):
+    # The SQLite write fence keeps other writers out of the restore window (see
+    # test_account_lifecycle_restore_fence.py); a revision miss can still happen on PostgreSQL paths,
+    # so the restore must stay all-or-nothing when one record's conditional write matches nothing.
     await _seed(async_client)
     backup = tmp_path / "before.json"
     assert _cli("export", "--output", str(backup)).returncode == 0
-    assert (await async_client.put("/api/accounts/acc_fixture_a/lifecycle", json=_body(1))).status_code == 200
-    assert (await async_client.put("/api/accounts/acc_fixture_b/lifecycle", json=_body(1))).status_code == 200
+    assert (await _put(async_client, "acc_fixture_a", _body(1))).status_code == 200
+    assert (await _put(async_client, "acc_fixture_b", _body(1))).status_code == 200
     current = await _current_document()
     document = backup_module.read_document(backup)
-    original_list_all = AccountLifecycleRepository.list_all
+    original_write = AccountLifecycleRepository._write
 
-    async def _list_then_concurrent_write(self):
-        rows = await original_list_all(self)
-        # acc_fixture_a is written first by the restore; acc_fixture_b changes underneath it.
-        async with SessionLocal() as other:
-            await other.execute(
-                update(AccountLifecyclePreference)
-                .where(AccountLifecyclePreference.account_id == "acc_fixture_b")
-                .values(revision=AccountLifecyclePreference.revision + 1, cancellation_status="cancelled")
-            )
-            await other.commit()
-        return rows
+    async def _miss_on_acc_fixture_b(self, write):
+        # acc_fixture_a is written first by the restore; acc_fixture_b's write then matches nothing.
+        if write.key.account_id == "acc_fixture_b":
+            return False
+        return await original_write(self, write)
 
-    monkeypatch.setattr(AccountLifecycleRepository, "list_all", _list_then_concurrent_write)
+    monkeypatch.setattr(AccountLifecycleRepository, "_write", _miss_on_acc_fixture_b)
 
     async with SessionLocal() as session:
         with pytest.raises(AccountLifecycleConflictError):
             await backup_module.restore_lifecycle_document(session, document, expected_snapshot=current["snapshot"])
 
-    monkeypatch.setattr(AccountLifecycleRepository, "list_all", original_list_all)
-    after = _entries(await _current_document())
-    before = _entries(current)
-    assert _fields(after["acc_fixture_a"]) == _fields(before["acc_fixture_a"]) == (None, None, None)
-    assert after["acc_fixture_a"]["revision"] == before["acc_fixture_a"]["revision"]
-    assert after["acc_fixture_b"]["cancellationStatus"] == "cancelled"
-    assert after["acc_fixture_b"]["revision"] == before["acc_fixture_b"]["revision"] + 1
+    monkeypatch.setattr(AccountLifecycleRepository, "_write", original_write)
+    after = await _current_document()
+    assert after["entries"] == current["entries"]
+    assert after["snapshot"] == current["snapshot"]

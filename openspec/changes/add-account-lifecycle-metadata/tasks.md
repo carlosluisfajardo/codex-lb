@@ -53,3 +53,15 @@
 - [x] 6.2 Frontend lint, typecheck, focused tests and build.
 - [x] 6.3 `openspec validate add-account-lifecycle-metadata --strict` and
   `openspec validate --specs`.
+
+## 7. Review corrections (r1)
+
+- [x] 7.1 Return an incarnation-bound `concurrencyToken` on every read, require it
+  on every save, and re-check the account row inside the write transaction.
+- [x] 7.2 Hold a SQLite database write fence from the restore's snapshot read to
+  commit or rollback.
+- [x] 7.3 Discard cached lifecycle notes and in-flight reads on delete and on
+  import or sign-in, and never cache a save response for a removed row.
+- [x] 7.4 Discard an open draft and refuse saving when write access is lost.
+- [x] 7.5 Regression tests seen failing on the preimage, or a mutation check on the
+  final code, for each correction.

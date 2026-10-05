@@ -194,6 +194,7 @@ export function createAccountLifecycle(
 		renewsOn: null,
 		cancellationStatus: null,
 		revision: 0,
+		concurrencyToken: "c".repeat(64),
 		updatedAt: null,
 		...overrides,
 	});

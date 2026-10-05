@@ -4,15 +4,12 @@ import { toast } from "sonner";
 
 import { getAccountLifecycle, updateAccountLifecycle } from "@/features/accounts/api";
 import { isAccountLifecycleConflict } from "@/features/accounts/lifecycle";
-import type { AccountLifecycleUpdateRequest } from "@/features/accounts/schemas";
-
-function accountLifecycleQueryKey(accountId: string | null) {
-  return ["accounts", "lifecycle", accountId];
-}
+import { accountLifecycleQueryKey } from "@/features/accounts/query-invalidation";
+import type { AccountLifecycle, AccountLifecycleUpdateRequest } from "@/features/accounts/schemas";
 
 /**
- * Lifecycle notes change only when an operator saves them, so this query does
- * not poll: the accounts list stays the only polling owner on the page.
+ * Lifecycle notes change only when an operator saves them, so this query adds no
+ * polling of its own; the page's existing account-list and trends polls are unchanged.
  */
 export function useAccountLifecycle(accountId: string | null) {
   return useQuery({
@@ -31,7 +28,11 @@ export function useAccountLifecycleMutation() {
     mutationFn: ({ accountId, payload }: { accountId: string; payload: AccountLifecycleUpdateRequest }) =>
       updateAccountLifecycle(accountId, payload),
     onSuccess: (data, variables) => {
-      queryClient.setQueryData(accountLifecycleQueryKey(variables.accountId), data);
+      // Only replace notes read from the same account row: a response arriving after that row was
+      // removed (cache evicted) or replaced (different token) must not repopulate the cache.
+      queryClient.setQueryData<AccountLifecycle>(accountLifecycleQueryKey(variables.accountId), (current) =>
+        current?.concurrencyToken === data.concurrencyToken ? data : current,
+      );
       toast.success(t("accounts.lifecycle.toasts.saved"));
     },
     onError: (error: Error, variables) => {

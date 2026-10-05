@@ -23,7 +23,7 @@ only as a date must not be displayed as an exact instant.
   Each date is either unset, a civil date, or a local date and time with an
   explicitly supplied timezone, and is kept exactly as declared.
 - Add `GET` and `PUT /api/accounts/{account_id}/lifecycle` with a per-record
-  revision for compare-and-set writes.
+  revision and an account-row concurrency token for compare-and-set writes.
 - Keep the metadata in its own table with no foreign key, so deleting an account
   leaves an inert, exportable record that no later account sees, even one that is
   given the same id.

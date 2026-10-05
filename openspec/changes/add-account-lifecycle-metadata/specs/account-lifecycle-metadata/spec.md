@@ -100,17 +100,28 @@ receive HTTP 403 and the stored metadata SHALL be unchanged.
 - **WHEN** they read an account's lifecycle metadata and then try to save it
 - **THEN** the read succeeds and the write is rejected with HTTP 403
 
-### Requirement: Lifecycle writes are compare-and-set on a revision
+### Requirement: Lifecycle writes are compare-and-set on a revision and an account row
 
 Reading an account's lifecycle metadata SHALL return a revision, which is `0`
-when nothing was ever saved for that account row. A write SHALL replace all three fields
-at once and MUST carry the revision it was based on, an integer from `0` to
-`2147483646`; a value outside that range SHALL be rejected with HTTP 422. When
-that revision differs from the stored revision the system SHALL reject the write with HTTP 409 and
-error code `account_lifecycle_conflict` and SHALL change nothing. Every accepted
-write SHALL increase the revision by one. Clearing every field SHALL keep the
-record with all fields unset and an increased revision, so a revision is never
-reused for the same record.
+when nothing was ever saved for that account row, and a `concurrencyToken`: an
+opaque, non-secret value derived from the account row's incarnation that is the
+same for every read of that row, including the revision-`0` read, and different
+for any later row given the same id. A write MUST carry both the revision and
+the token of the read it was based on. A missing or malformed token SHALL be
+rejected with HTTP 422. A token that differs from the current row's SHALL be
+rejected with HTTP 409 `account_lifecycle_conflict` and SHALL change nothing,
+even when the revisions are equal. The system SHALL re-check, inside the write
+transaction and under a lock a concurrent removal must wait for, that the
+account row the write resolved still exists, is not pending deletion and has the
+same incarnation; otherwise it SHALL reject the write with HTTP 409 and change
+nothing. A write SHALL replace all three fields at once and MUST carry the
+revision it was based on, an integer from `0` to `2147483646`; a value outside
+that range SHALL be rejected with HTTP 422. When that revision differs from the
+stored revision the system SHALL reject the write with HTTP 409 and error code
+`account_lifecycle_conflict` and SHALL change nothing. Every accepted write
+SHALL increase the revision by one. Clearing every field SHALL keep the record
+with all fields unset and an increased revision, so a revision is never reused
+for the same record.
 
 #### Scenario: Save, clear and reload
 
@@ -120,6 +131,25 @@ reused for the same record.
 - **WHEN** the operator then saves every field unset with expected revision `1`
 - **THEN** the response carries revision `2` and every field unset
 - **AND** a later read from a separate process returns the same fields and revision `2`
+
+#### Scenario: A draft read before the id was recycled conflicts
+
+- **GIVEN** an operator read account `acc_a` at revision `r` (`0` or `1`) with token `T`
+- **AND** `acc_a` was deleted and a new row was given the id `acc_a`, also at revision `r`
+- **WHEN** the operator saves the draft with expected revision `r` and token `T`
+- **THEN** the write is rejected with HTTP 409 `account_lifecycle_conflict`
+- **AND** neither the new row's nor the removed row's metadata changes
+
+#### Scenario: A row replaced after the token check is still refused
+
+- **GIVEN** a write whose token matched the row resolved for `acc_a`
+- **WHEN** that row is removed or replaced before the write is applied
+- **THEN** nothing is written and the write is rejected with HTTP 409
+
+#### Scenario: Re-authentication keeps the token
+
+- **WHEN** `acc_a`'s credentials are replaced in place
+- **THEN** later reads return the same `concurrencyToken` and a draft based on an earlier read still saves
 
 #### Scenario: Two writers based on the same revision
 
@@ -185,7 +215,11 @@ its fields, stored records absent from the document are cleared, and every
 written record's revision becomes greater than both its stored revision and the
 revision the document records for it. A restore that would need a revision above
 `2147483647` SHALL change nothing. A mismatched token, an unknown format or
-format version, or an invalid field SHALL change nothing.
+format version, or an invalid field SHALL change nothing. From before it reads
+the snapshot until it commits or rolls back, a restore SHALL keep every other
+writer out of the lifecycle records, including writers in other processes and
+first writes of new records: on SQLite by holding the database write lock, on
+PostgreSQL by holding a table lock that excludes concurrent writers.
 
 #### Scenario: Export creates a private file and never overwrites
 
@@ -209,6 +243,13 @@ format version, or an invalid field SHALL change nothing.
 - **WHEN** the operator restores the export
 - **THEN** `acc_a` comes back at a revision greater than `3`
 - **AND** a write based on revision `1` is rejected with HTTP 409
+
+#### Scenario: Another process cannot write inside a restore
+
+- **GIVEN** a SQLite restore has read the snapshot and not yet committed
+- **WHEN** another process tries to insert a new record or change a record the restore leaves unchanged
+- **THEN** that write waits or fails without committing until the restore has ended
+- **AND** the stored records equal the document when the restore commits
 
 #### Scenario: Restore with a stale snapshot changes nothing
 
@@ -242,8 +283,14 @@ pause, quota, health or cooldown limits, and when changed does not move requests
 already in progress. Operators with write
 access SHALL be able to edit the fields and Save or Cancel; Cancel SHALL discard
 the draft without a request, and a rejected save SHALL show its error. Operators
-without write access SHALL see the values and no edit control. The section MUST
-NOT offer reset, redemption, scheduling or ranking controls.
+without write access SHALL see the values and no edit control. When write access
+is lost while a draft is open, the draft SHALL be discarded at once and no save
+SHALL be sent. When an account is deleted, or an account that may reuse a deleted
+id is created (import or sign-in), the dashboard SHALL discard cached lifecycle
+notes and reads in flight for that id, and a save response for a removed row
+SHALL NOT be cached, so a row given a recycled id never shows a removed row's
+notes. The section SHALL add no polling of its own. The section MUST NOT offer
+reset, redemption, scheduling or ranking controls.
 
 #### Scenario: Read-only presentation of declared precision
 
@@ -268,3 +315,16 @@ NOT offer reset, redemption, scheduling or ranking controls.
 - **GIVEN** an operator without account write access
 - **WHEN** they open an account's detail panel
 - **THEN** the lifecycle values are shown and no edit control is offered
+
+#### Scenario: Losing write access closes the draft
+
+- **GIVEN** an operator has the lifecycle editor open
+- **WHEN** their account write access is removed
+- **THEN** the draft is discarded, no Save control remains and no save is sent
+- **AND** regaining write access does not bring the draft back
+
+#### Scenario: A recycled id never shows a removed row's notes
+
+- **GIVEN** the dashboard showed lifecycle notes for `acc_a`
+- **WHEN** `acc_a` is deleted and a new row given the id `acc_a` is imported and selected
+- **THEN** the removed row's notes are never rendered for the new row, including from a read or save still in flight

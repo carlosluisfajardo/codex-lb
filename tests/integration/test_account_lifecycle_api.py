@@ -102,6 +102,18 @@ def _payload(
     }
 
 
+_UNREADABLE_TOKEN = "0" * 64
+
+
+async def _put(async_client, account_id: str, payload: dict[str, Any]):
+    """PUT the way a dashboard draft read just before would: with the account's current concurrency token."""
+    read = await async_client.get(f"/api/accounts/{account_id}/lifecycle")
+    token = read.json()["concurrencyToken"] if read.status_code == 200 else _UNREADABLE_TOKEN
+    return await async_client.put(
+        f"/api/accounts/{account_id}/lifecycle", json={**payload, "expectedConcurrencyToken": token}
+    )
+
+
 def _read_in_subprocess(account_id: str) -> dict[str, Any] | None:
     completed = subprocess.run(
         [sys.executable, "-c", _READ_IN_SUBPROCESS, account_id],
@@ -143,18 +155,22 @@ async def test_absent_saved_cleared_and_reloaded_from_a_separate_process(async_c
 
     absent = await async_client.get("/api/accounts/acc_fixture_hello/lifecycle")
     assert absent.status_code == 200
+    token = absent.json()["concurrencyToken"]
+    assert len(token) == 64
     assert absent.json() == {
         "accountId": "acc_fixture_hello",
         "endsOn": None,
         "renewsOn": None,
         "cancellationStatus": None,
         "revision": 0,
+        "concurrencyToken": token,
         "updatedAt": None,
     }
 
-    saved = await async_client.put(
-        "/api/accounts/acc_fixture_hello/lifecycle",
-        json=_payload(
+    saved = await _put(
+        async_client,
+        "acc_fixture_hello",
+        _payload(
             expected_revision=0,
             ends_on={"precision": "date", "date": "2026-10-12"},
             cancellation_status="cancelled",
@@ -172,9 +188,10 @@ async def test_absent_saved_cleared_and_reloaded_from_a_separate_process(async_c
     assert reloaded.json() == body
     assert _read_in_subprocess("acc_fixture_hello") == body
 
-    cleared = await async_client.put(
-        "/api/accounts/acc_fixture_hello/lifecycle",
-        json=_payload(expected_revision=1),
+    cleared = await _put(
+        async_client,
+        "acc_fixture_hello",
+        _payload(expected_revision=1),
     )
     assert cleared.status_code == 200, cleared.text
     cleared_body = cleared.json()
@@ -196,9 +213,10 @@ async def test_local_datetime_is_stored_and_returned_verbatim(async_client):
     renews_on = {"precision": "datetime", "date": "2026-11-03", "time": "09:30", "timezone": "America/New_York"}
     ends_on = {"precision": "datetime", "date": "2026-10-12", "time": "23:59:59", "timezone": "+02:00"}
 
-    response = await async_client.put(
-        "/api/accounts/acc_fixture_tz/lifecycle",
-        json=_payload(expected_revision=0, ends_on=ends_on, renews_on=renews_on),
+    response = await _put(
+        async_client,
+        "acc_fixture_tz",
+        _payload(expected_revision=0, ends_on=ends_on, renews_on=renews_on),
     )
 
     assert response.status_code == 200, response.text
@@ -226,15 +244,17 @@ async def test_local_datetime_is_stored_and_returned_verbatim(async_client):
 )
 async def test_invalid_values_are_rejected_and_change_nothing(async_client, ends_on):
     await _insert(_account("acc_fixture_invalid", "invalid@example.com"))
-    first = await async_client.put(
-        "/api/accounts/acc_fixture_invalid/lifecycle",
-        json=_payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
+    first = await _put(
+        async_client,
+        "acc_fixture_invalid",
+        _payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
     )
     assert first.status_code == 200
 
-    response = await async_client.put(
-        "/api/accounts/acc_fixture_invalid/lifecycle",
-        json=_payload(expected_revision=1, ends_on=ends_on),
+    response = await _put(
+        async_client,
+        "acc_fixture_invalid",
+        _payload(expected_revision=1, ends_on=ends_on),
     )
 
     assert response.status_code == 422
@@ -247,28 +267,32 @@ async def test_invalid_values_are_rejected_and_change_nothing(async_client, ends
 @pytest.mark.asyncio
 async def test_stale_and_concurrent_writes_are_rejected_with_conflict(async_client):
     await _insert(_account("acc_fixture_cas", "cas@example.com"))
-    created = await async_client.put(
-        "/api/accounts/acc_fixture_cas/lifecycle",
-        json=_payload(expected_revision=0, cancellation_status="not_cancelled"),
+    created = await _put(
+        async_client,
+        "acc_fixture_cas",
+        _payload(expected_revision=0, cancellation_status="not_cancelled"),
     )
     assert created.json()["revision"] == 1
 
     for stale in (0, 2, 7):
-        rejected = await async_client.put(
-            "/api/accounts/acc_fixture_cas/lifecycle",
-            json=_payload(expected_revision=stale, cancellation_status="cancelled"),
+        rejected = await _put(
+            async_client,
+            "acc_fixture_cas",
+            _payload(expected_revision=stale, cancellation_status="cancelled"),
         )
         assert rejected.status_code == 409
         assert rejected.json()["error"]["code"] == "account_lifecycle_conflict"
 
     responses = await asyncio.gather(
-        async_client.put(
-            "/api/accounts/acc_fixture_cas/lifecycle",
-            json=_payload(expected_revision=1, ends_on={"precision": "date", "date": "2026-12-01"}),
+        _put(
+            async_client,
+            "acc_fixture_cas",
+            _payload(expected_revision=1, ends_on={"precision": "date", "date": "2026-12-01"}),
         ),
-        async_client.put(
-            "/api/accounts/acc_fixture_cas/lifecycle",
-            json=_payload(expected_revision=1, ends_on={"precision": "date", "date": "2027-01-01"}),
+        _put(
+            async_client,
+            "acc_fixture_cas",
+            _payload(expected_revision=1, ends_on={"precision": "date", "date": "2027-01-01"}),
         ),
     )
 
@@ -285,9 +309,10 @@ async def test_first_write_race_on_an_absent_record_has_one_winner(async_client)
 
     responses = await asyncio.gather(
         *(
-            async_client.put(
-                "/api/accounts/acc_fixture_first/lifecycle",
-                json=_payload(expected_revision=0, ends_on={"precision": "date", "date": f"2026-10-1{day}"}),
+            _put(
+                async_client,
+                "acc_fixture_first",
+                _payload(expected_revision=0, ends_on={"precision": "date", "date": f"2026-10-1{day}"}),
             )
             for day in (1, 2)
         )
@@ -303,9 +328,10 @@ async def test_metadata_is_keyed_by_exact_id_and_never_shared_by_email(async_cli
         _account("acc_fixture_seat", "shared@example.com"),
         _account("acc_fixture_seat__copy2", "shared@example.com"),
     )
-    saved = await async_client.put(
-        "/api/accounts/acc_fixture_seat/lifecycle",
-        json=_payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
+    saved = await _put(
+        async_client,
+        "acc_fixture_seat",
+        _payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
     )
     assert saved.status_code == 200
 
@@ -313,9 +339,10 @@ async def test_metadata_is_keyed_by_exact_id_and_never_shared_by_email(async_cli
     assert sibling["revision"] == 0
     assert sibling["endsOn"] is None
 
-    sibling_saved = await async_client.put(
-        "/api/accounts/acc_fixture_seat__copy2/lifecycle",
-        json=_payload(expected_revision=0, cancellation_status="not_cancelled"),
+    sibling_saved = await _put(
+        async_client,
+        "acc_fixture_seat__copy2",
+        _payload(expected_revision=0, cancellation_status="not_cancelled"),
     )
     assert sibling_saved.status_code == 200
     original = (await async_client.get("/api/accounts/acc_fixture_seat/lifecycle")).json()
@@ -344,9 +371,10 @@ async def test_side_by_side_reimport_gets_a_new_id_that_inherits_nothing(async_c
     imported = await async_client.post("/api/accounts/import", files=files)
     assert imported.status_code == 200, imported.text
     account_id = imported.json()["accountId"]
-    saved = await async_client.put(
-        f"/api/accounts/{account_id}/lifecycle",
-        json=_payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
+    saved = await _put(
+        async_client,
+        account_id,
+        _payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
     )
     assert saved.status_code == 200
 
@@ -385,9 +413,10 @@ async def test_overwrite_mode_reimport_keeps_the_row_and_its_metadata(async_clie
     imported = await async_client.post("/api/accounts/import", files=files)
     assert imported.status_code == 200, imported.text
     account_id = imported.json()["accountId"]
-    saved = await async_client.put(
-        f"/api/accounts/{account_id}/lifecycle",
-        json=_payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
+    saved = await _put(
+        async_client,
+        account_id,
+        _payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
     )
     assert saved.status_code == 200
 
@@ -401,9 +430,10 @@ async def test_overwrite_mode_reimport_keeps_the_row_and_its_metadata(async_clie
 @pytest.mark.asyncio
 async def test_in_place_reauthentication_keeps_the_id_and_its_metadata(async_client):
     await _insert(_account("acc_fixture_reauth", "reauth@example.com"))
-    saved = await async_client.put(
-        "/api/accounts/acc_fixture_reauth/lifecycle",
-        json=_payload(expected_revision=0, renews_on={"precision": "date", "date": "2026-11-03"}),
+    saved = await _put(
+        async_client,
+        "acc_fixture_reauth",
+        _payload(expected_revision=0, renews_on={"precision": "date", "date": "2026-11-03"}),
     )
     assert saved.status_code == 200
 
@@ -422,9 +452,7 @@ async def test_unknown_and_pending_deletion_accounts_are_not_found(async_client)
     missing = await async_client.get("/api/accounts/acc_fixture_missing/lifecycle")
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "account_not_found"
-    missing_write = await async_client.put(
-        "/api/accounts/acc_fixture_missing/lifecycle", json=_payload(expected_revision=0)
-    )
+    missing_write = await _put(async_client, "acc_fixture_missing", _payload(expected_revision=0))
     assert missing_write.status_code == 404
     assert await _stored_row("acc_fixture_missing") is None
 
@@ -432,9 +460,10 @@ async def test_unknown_and_pending_deletion_accounts_are_not_found(async_client)
 @pytest.mark.asyncio
 async def test_deleted_account_notes_are_retained_but_never_shown_for_a_recreated_id(async_client):
     await _insert(_account("acc_fixture_gone", "gone@example.com"))
-    saved = await async_client.put(
-        "/api/accounts/acc_fixture_gone/lifecycle",
-        json=_payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
+    saved = await _put(
+        async_client,
+        "acc_fixture_gone",
+        _payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
     )
     assert saved.status_code == 200
 
@@ -442,9 +471,7 @@ async def test_deleted_account_notes_are_retained_but_never_shown_for_a_recreate
     assert deleted.status_code == 200
     pending = await async_client.get("/api/accounts/acc_fixture_gone/lifecycle")
     assert pending.status_code == 404
-    pending_write = await async_client.put(
-        "/api/accounts/acc_fixture_gone/lifecycle", json=_payload(expected_revision=1)
-    )
+    pending_write = await _put(async_client, "acc_fixture_gone", _payload(expected_revision=1))
     assert pending_write.status_code == 404
 
     assert await run_account_deletion_pass(batch_size=10) == {"acc_fixture_gone": "finalized"}
@@ -459,9 +486,10 @@ async def test_deleted_account_notes_are_retained_but_never_shown_for_a_recreate
     assert recreated.json()["revision"] == 0
     assert recreated.json()["endsOn"] is None
 
-    own = await async_client.put(
-        "/api/accounts/acc_fixture_gone/lifecycle",
-        json=_payload(expected_revision=0, cancellation_status="not_cancelled"),
+    own = await _put(
+        async_client,
+        "acc_fixture_gone",
+        _payload(expected_revision=0, cancellation_status="not_cancelled"),
     )
     assert own.status_code == 200, own.text
     assert own.json()["revision"] == 1
@@ -476,9 +504,10 @@ async def test_deleted_account_notes_are_retained_but_never_shown_for_a_recreate
 @pytest.mark.asyncio
 async def test_superseding_a_pending_deletion_in_place_keeps_the_notes(async_client):
     await _insert(_account("acc_fixture_back", "back@example.com"))
-    saved = await async_client.put(
-        "/api/accounts/acc_fixture_back/lifecycle",
-        json=_payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
+    saved = await _put(
+        async_client,
+        "acc_fixture_back",
+        _payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
     )
     assert saved.status_code == 200
     assert (await async_client.delete("/api/accounts/acc_fixture_back")).status_code == 200
@@ -498,15 +527,17 @@ async def test_superseding_a_pending_deletion_in_place_keeps_the_notes(async_cli
 async def test_marking_cancelled_leaves_the_dates_as_entered(async_client):
     await _insert(_account("acc_fixture_cancel", "cancel@example.com"))
     renews_on = {"precision": "date", "date": "2026-11-03", "time": None, "timezone": None}
-    seeded = await async_client.put(
-        "/api/accounts/acc_fixture_cancel/lifecycle",
-        json=_payload(expected_revision=0, renews_on={"precision": "date", "date": "2026-11-03"}),
+    seeded = await _put(
+        async_client,
+        "acc_fixture_cancel",
+        _payload(expected_revision=0, renews_on={"precision": "date", "date": "2026-11-03"}),
     )
     assert seeded.json()["revision"] == 1
 
-    cancelled = await async_client.put(
-        "/api/accounts/acc_fixture_cancel/lifecycle",
-        json=_payload(
+    cancelled = await _put(
+        async_client,
+        "acc_fixture_cancel",
+        _payload(
             expected_revision=1,
             renews_on={"precision": "date", "date": "2026-11-03"},
             cancellation_status="cancelled",
@@ -525,9 +556,7 @@ async def test_marking_cancelled_leaves_the_dates_as_entered(async_client):
 async def test_out_of_range_revisions_are_rejected_as_invalid(async_client, expected_revision):
     await _insert(_account("acc_fixture_range", "range@example.com"))
 
-    response = await async_client.put(
-        "/api/accounts/acc_fixture_range/lifecycle", json=_payload(expected_revision=expected_revision)
-    )
+    response = await _put(async_client, "acc_fixture_range", _payload(expected_revision=expected_revision))
 
     assert response.status_code == 422
     assert await _stored_rows("acc_fixture_range") == []
@@ -546,9 +575,10 @@ async def test_the_largest_storable_revision_can_still_be_read_and_exported(asyn
         )
         await session.commit()
 
-    response = await async_client.put(
-        "/api/accounts/acc_fixture_ceiling/lifecycle",
-        json=_payload(expected_revision=2**31 - 2, ends_on={"precision": "date", "date": "2026-10-12"}),
+    response = await _put(
+        async_client,
+        "acc_fixture_ceiling",
+        _payload(expected_revision=2**31 - 2, ends_on={"precision": "date", "date": "2026-10-12"}),
     )
 
     assert response.status_code == 200, response.text
@@ -563,9 +593,7 @@ async def test_non_ascii_digits_are_rejected(async_client):
     await _insert(_account("acc_fixture_digits", "digits@example.com"))
     ends_on = {"precision": "datetime", "date": "2026-10-12", "time": "0\u0669:3\u0660", "timezone": "+05:30"}
 
-    response = await async_client.put(
-        "/api/accounts/acc_fixture_digits/lifecycle", json=_payload(expected_revision=0, ends_on=ends_on)
-    )
+    response = await _put(async_client, "acc_fixture_digits", _payload(expected_revision=0, ends_on=ends_on))
 
     assert response.status_code == 422
     assert await _stored_rows("acc_fixture_digits") == []
@@ -577,9 +605,10 @@ async def test_saving_lifecycle_touches_neither_routing_policy_nor_settings_vers
     settings_before = await async_client.get("/api/settings")
     assert settings_before.status_code == 200
 
-    response = await async_client.put(
-        "/api/accounts/acc_fixture_burn/lifecycle",
-        json=_payload(
+    response = await _put(
+        async_client,
+        "acc_fixture_burn",
+        _payload(
             expected_revision=0,
             ends_on={"precision": "date", "date": "2026-10-12"},
             cancellation_status="cancelled",
@@ -608,15 +637,16 @@ def _use_principal(app_instance, monkeypatch, principal: DashboardPrincipal) -> 
 @pytest.mark.asyncio
 async def test_viewer_reads_but_cannot_write(app_instance, async_client, monkeypatch):
     await _insert(_account("acc_fixture_viewer", "viewer@example.com"))
-    saved = await async_client.put(
-        "/api/accounts/acc_fixture_viewer/lifecycle",
-        json=_payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
+    saved = await _put(
+        async_client,
+        "acc_fixture_viewer",
+        _payload(expected_revision=0, ends_on={"precision": "date", "date": "2026-10-12"}),
     )
     assert saved.status_code == 200
     _use_principal(app_instance, monkeypatch, guest_principal())
 
     read = await async_client.get("/api/accounts/acc_fixture_viewer/lifecycle")
-    write = await async_client.put("/api/accounts/acc_fixture_viewer/lifecycle", json=_payload(expected_revision=1))
+    write = await _put(async_client, "acc_fixture_viewer", _payload(expected_revision=1))
 
     assert read.status_code == 200
     assert read.json() == saved.json()
