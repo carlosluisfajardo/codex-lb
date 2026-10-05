@@ -6,6 +6,8 @@ import {
   AccountAliasResponseSchema,
   AccountAuthExportResponseSchema,
   AccountImportResponseSchema,
+  AccountLifecycleSchema,
+  AccountLifecycleUpdateRequestSchema,
   AccountLimitWarmupUpdateRequestSchema,
   AccountLimitWarmupUpdateResponseSchema,
   AccountUpdateRequestSchema,
@@ -30,6 +32,7 @@ import {
   RuntimeConnectAddressResponseSchema,
 } from "@/features/accounts/schemas";
 import type {
+  AccountLifecycleUpdateRequest,
   AccountRoutingPolicy,
   AccountUsageResetConsumeRequest,
 } from "@/features/accounts/schemas";
@@ -99,6 +102,25 @@ export function updateAccountRoutingPolicy(
     `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/routing-policy`,
     AccountRoutingPolicyUpdateResponseSchema,
     { body: payload },
+  );
+}
+
+export function getAccountLifecycle(accountId: string) {
+  return get(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/lifecycle`,
+    AccountLifecycleSchema,
+  );
+}
+
+export function updateAccountLifecycle(
+  accountId: string,
+  payload: AccountLifecycleUpdateRequest,
+) {
+  const validated = AccountLifecycleUpdateRequestSchema.parse(payload);
+  return put(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/lifecycle`,
+    AccountLifecycleSchema,
+    { body: validated },
   );
 }
 

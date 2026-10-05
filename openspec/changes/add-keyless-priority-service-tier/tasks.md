@@ -1,0 +1,9 @@
+- [x] 1. Define the keyless priority opt-in contract (spec delta under `responses-api-compat`).
+- [x] 2. Persist `dashboard_settings.keyless_priority_service_tier` (NOT NULL, server default false) with a forward revision and downgrade on the single current head.
+- [x] 3. Expose `keylessPriorityServiceTier` in `GET`/`PUT /api/settings` with partial-update semantics and settings audit coverage.
+- [x] 4. Apply the opt-in on subscription routes after API-key enforcement and model-source selection, before the catalog fallback, for HTTP Responses, chat completions, compact and native WebSocket.
+- [x] 5. Provider-free focused tests: opt-in on/off on HTTP (Codex, `/v1`, chat completions, compact), HTTP bridge and WebSocket; parity with a client Fast request (only the tier changes); prohibit veto; explicit tiers; keyed requests on HTTP and WebSocket; direct model sources; catalog fallback on the route and WebSocket; overflow projection; signed owner forwarding; requested versus actual request-log tiers; fresh-install default and persistence; migration upgrade/downgrade.
+- [x] 5a. Capture one coherent HTTP settings row and prove atomic opt-in/veto changes cannot inject priority across all five HTTP paths (manager recovery; meaningful failing-before/passing-after evidence).
+- [x] 5b. Collect the provider-free proof in the maintained unit suite, isolating its global settings and socket guards in a child process (manager recovery).
+- [ ] 6. Dashboard settings page control (needs a frontend source rebuild; not part of this change).
+- [ ] 7. Live acceptance on a deployment: observe outbound `priority` and the upstream-returned tier after enabling the setting.

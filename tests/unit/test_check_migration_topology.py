@@ -164,6 +164,27 @@ def test_prefix_collision_before_the_ratchet_is_grandfathered(checker: ModuleTyp
     assert not any(message.startswith("alembic_timestamp_prefix_collision") for message in _errors(reports))
 
 
+@pytest.mark.parametrize("alteration", [None, "missing_merge", "wrong_merge", "wrong_parent", "third_sibling"])
+def test_frozen_delivery_collision_requires_its_exact_merge(
+    checker: ModuleType, tmp_path: Path, alteration: str | None
+) -> None:
+    versions = tmp_path / "versions"
+    parent = "20260912_000000_merge_thread_cache_and_bridge_retirement_heads"
+    account = "20261005_000000_add_account_lifecycle_preferences"
+    priority = "20261005_000000_add_dashboard_keyless_priority_service_tier"
+    merge = "20261005_010000_merge_account_lifecycle_and_keyless_priority"
+    _write_revision(versions, parent, None)
+    _write_revision(versions, account, parent)
+    _write_revision(versions, priority, account if alteration == "wrong_parent" else parent)
+    if alteration != "missing_merge":
+        _write_revision(versions, merge, (account,) if alteration == "wrong_merge" else (account, priority))
+    if alteration == "third_sibling":
+        _write_revision(versions, "20261005_000000_another_change", parent)
+
+    collisions = checker.check_timestamp_prefix_collisions(checker.load_graph(versions)).errors
+    assert bool(collisions) is (alteration is not None)
+
+
 def test_revision_id_must_match_its_filename(checker: ModuleType, tmp_path: Path) -> None:
     versions = tmp_path / "versions"
     head = _linear_fixture(checker, versions)

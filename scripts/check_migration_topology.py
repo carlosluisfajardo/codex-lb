@@ -89,6 +89,17 @@ TIMESTAMP_PREFIX_PATTERN = re.compile(r"^(\d{8}_\d{6})_")
 # merge revision): zero violations at or after the cutoff.
 RATCHET_PREFIX = "20260911_000000"
 
+# These reviewed candidates are immutable delivery inputs. Only their exact
+# named convergence is grandfathered; future collisions still require new slots.
+PRESERVED_DELIVERY_PARENT = "20260912_000000_merge_thread_cache_and_bridge_retirement_heads"
+PRESERVED_DELIVERY_REVISIONS = frozenset(
+    {
+        "20261005_000000_add_account_lifecycle_preferences",
+        "20261005_000000_add_dashboard_keyless_priority_service_tier",
+    }
+)
+PRESERVED_DELIVERY_MERGE = "20261005_010000_merge_account_lifecycle_and_keyless_priority"
+
 _FAILURE_PREFIX = "check_migration_topology"
 
 
@@ -364,6 +375,13 @@ def check_timestamp_prefix_collisions(revisions: Sequence[Revision], ratchet_pre
         if len(group) < 2:
             continue
         if not _ratcheted((prefix,), ratchet_prefix):
+            continue
+        if (
+            len(group) == 2
+            and {item.revision for item in group} == PRESERVED_DELIVERY_REVISIONS
+            and all(item.down_revisions == (PRESERVED_DELIVERY_PARENT,) for item in group)
+            and frozenset(parents.get(PRESERVED_DELIVERY_MERGE, ())) == PRESERVED_DELIVERY_REVISIONS
+        ):
             continue
         group = sorted(group, key=lambda item: item.revision)
         described = "; ".join(revision.describe() for revision in group)

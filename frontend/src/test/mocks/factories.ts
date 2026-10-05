@@ -1,11 +1,13 @@
 import type { z } from "zod";
 import type {
+	AccountLifecycle,
 	AccountSummary,
 	AccountTrendsResponse,
 	OauthStartResponse,
 	OauthStatusResponse,
 } from "@/features/accounts/schemas";
 import {
+	AccountLifecycleSchema,
 	AccountSummarySchema,
 	AccountTrendsResponseSchema,
 	OauthCompleteResponseSchema,
@@ -97,6 +99,7 @@ export type { ModelContextWindowOverrides };
 export type OauthCompleteResponse = z.infer<typeof OauthCompleteResponseSchema>;
 
 export type {
+	AccountLifecycle,
 	AccountSummary,
 	AccountTrendsResponse,
 	DashboardOverview,
@@ -179,6 +182,22 @@ export function createDefaultAccounts(): AccountSummary[] {
 			},
 		}),
 	];
+}
+
+/** Never-saved metadata unless overridden: every field unset at revision 0. */
+export function createAccountLifecycle(
+	overrides: Partial<AccountLifecycle> = {},
+): AccountLifecycle {
+	return AccountLifecycleSchema.parse({
+		accountId: "acc_primary",
+		endsOn: null,
+		renewsOn: null,
+		cancellationStatus: null,
+		revision: 0,
+		concurrencyToken: "c".repeat(64),
+		updatedAt: null,
+		...overrides,
+	});
 }
 
 export function createModelSource(

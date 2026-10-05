@@ -41,6 +41,7 @@ class DashboardSettingsData:
     sticky_threads_enabled: bool
     upstream_stream_transport: str
     prohibit_fast_mode: bool
+    keyless_priority_service_tier: bool
     http_downstream_transport_policy: str
     # Effective mode; ``provenance`` carries the source and the fallbacks.
     thread_cache_identity_mode: str
@@ -159,6 +160,7 @@ class DashboardSettingsUpdateData:
     sticky_threads_enabled: bool
     upstream_stream_transport: str
     prohibit_fast_mode: bool
+    keyless_priority_service_tier: bool
     http_downstream_transport_policy: str
     thread_cache_identity_mode: str | None
     clear_thread_cache_identity_mode: bool
@@ -384,6 +386,7 @@ class SettingsService:
             sticky_threads_enabled=payload.sticky_threads_enabled,
             upstream_stream_transport=payload.upstream_stream_transport,
             prohibit_fast_mode=payload.prohibit_fast_mode,
+            keyless_priority_service_tier=payload.keyless_priority_service_tier,
             http_downstream_transport_policy=payload.http_downstream_transport_policy,
             thread_cache_identity_mode=payload.thread_cache_identity_mode,
             clear_thread_cache_identity_mode=payload.clear_thread_cache_identity_mode,
@@ -648,6 +651,7 @@ def _settings_data(row: DashboardSettings, totp: TotpEnrollmentSummary) -> Dashb
         sticky_threads_enabled=row.sticky_threads_enabled,
         upstream_stream_transport=row.upstream_stream_transport,
         prohibit_fast_mode=row.prohibit_fast_mode,
+        keyless_priority_service_tier=row.keyless_priority_service_tier,
         http_downstream_transport_policy=row.http_downstream_transport_policy,
         thread_cache_identity_mode=resolved["thread_cache_identity_mode"].value,
         thread_cache_identity_mode_override=normalize_thread_cache_identity_mode(row.thread_cache_identity_mode),
