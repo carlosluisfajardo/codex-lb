@@ -35,10 +35,11 @@ def test_combined_upgrade_backup_rollback_reupgrade_preserves_existing_data(
     run_upgrade(url, starting_revision, bootstrap_legacy=False)
     with sqlite3.connect(path) as db:
         db.execute(
-            "INSERT INTO accounts (id,email,plan_type,access_token_encrypted,refresh_token_encrypted,"
-            "id_token_encrypted,last_refresh,status) VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO accounts (id,codex_installation_id,email,plan_type,access_token_encrypted,"
+            "refresh_token_encrypted,id_token_encrypted,last_refresh,status) VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 "fixture-account",
+                "fixture-installation",
                 "fixture@example.invalid",
                 "plus",
                 "fixture-a",
@@ -75,6 +76,18 @@ def test_combined_upgrade_backup_rollback_reupgrade_preserves_existing_data(
     assert _preserved_data(backup) == before
     assert check_schema_drift(f"sqlite+aiosqlite:///{backup}") == ()
     with sqlite3.connect(backup) as db:
+        assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert db.execute("SELECT ends_on_date,revision FROM account_lifecycle_preferences").fetchone() == (
+            "2026-10-31",
+            7,
+        )
+
+    restored = tmp_path / "isolated-restore.sqlite"
+    with sqlite3.connect(backup) as source, sqlite3.connect(restored) as target:
+        source.backup(target)
+    assert _preserved_data(restored) == before
+    assert check_schema_drift(f"sqlite+aiosqlite:///{restored}") == ()
+    with sqlite3.connect(restored) as db:
         assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert db.execute("SELECT ends_on_date,revision FROM account_lifecycle_preferences").fetchone() == (
             "2026-10-31",

@@ -1,7 +1,7 @@
 ## 1. Integration
 - [x] 1.1 Import immutable account commits and retain the reviewed Fast bytes.
 - [x] 1.2 Join frozen migration heads and narrowly qualify the timestamp guard.
-- [ ] 1.3 Verify persistent upgrade, rollback, data preservation and default off.
+- [x] 1.3 Verify persistent upgrade, rollback, data preservation and default off.
 
 ## 2. Delivery
 - [ ] 2.1 Run proportionate independent checks of the final integration delta.
