@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
+from app.core.clients import upstream_wire_capture
 from app.core.config.inheritable import resolve_inheritable
 from app.core.config.settings import Settings, get_settings
 from app.core.config.settings_cache import get_settings_cache
@@ -148,6 +149,10 @@ def archive_json(
     headers: Mapping[str, str] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> None:
+    # Before the archive gate: the capture reads only named fields of the send object.
+    upstream_wire_capture.record_outgoing_payload(
+        direction=direction, kind=kind, transport=transport, method=method, url=url, payload=payload
+    )
     if not archive_enabled():
         return
 

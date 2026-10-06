@@ -6,6 +6,7 @@ from typing import Protocol, cast
 
 import anyio
 
+from app.core.clients import upstream_wire_capture
 from app.core.clock import clock_for, scheduler_for
 from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, proxy_phase_latency_seconds
 from app.modules.api_keys.service import ApiKeyData
@@ -219,6 +220,19 @@ class _RequestLogMixin:
         # ``latency_ms``; such rows are error rows and are not sampled.
         latency_upstream_terminal_ms: int | None = None,
     ) -> None:
+        upstream_wire_capture.record_request_log_row(
+            archive_request_id=archive_request_id,
+            request_id=request_id,
+            conversation_id=conversation_id,
+            status=status,
+            request_kind=request_kind,
+            transport=transport,
+            upstream_transport=upstream_transport,
+            upstream_proxy_route_mode=upstream_proxy_route_mode,
+            requested_service_tier=requested_service_tier,
+            actual_service_tier=actual_service_tier,
+            upstream_status_code=upstream_status_code,
+        )
         task = scheduler_for(self).create_task(
             self._persist_request_log(
                 affinity_observation=affinity_observation,

@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, Mapping, cast
 from uuid import uuid4
 
+from app.core.clients import upstream_wire_capture
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
 from app.core.clients.files import finalize_file as core_finalize_file  # noqa: F401
 from app.core.clients.proxy import (  # noqa: F401
@@ -439,6 +440,10 @@ async def _send_http_bridge_request_text_with_archive_id(
         request_state.response_create_attempt = attempt
         request_state.response_create_sent_at = clock.monotonic()
         session.upstream_reader_wakeup.set()
+        # No await between this snapshot and send_text: it captures the actual receiver.
+        capture_snapshot = upstream_wire_capture.snapshot_bridge_send(
+            upstream=session.upstream, pending_requests=session.pending_requests
+        )
         try:
             await session.upstream.send_text(text_data)
         except BaseException:
@@ -450,6 +455,7 @@ async def _send_http_bridge_request_text_with_archive_id(
                 request_state.response_create_sent_at = None
             session.upstream_reader_wakeup.set()
             raise
+        upstream_wire_capture.record_bridge_frame_sent(capture_snapshot, request_state, attempt.ordinal)
     finally:
         reset_request_id(token)
 
@@ -881,6 +887,11 @@ class _HTTPBridgeRequestSubmitMixin:
                     slim_summary["historical_tool_outputs_slimmed"],
                     slim_summary["historical_images_slimmed"],
                 )
+        upstream_wire_capture.note_bridge_frame_tier(
+            bridge_request_ref=request_state.request_id,
+            outgoing_service_tier=upstream_payload.get("service_tier"),
+            transport=transport,
+        )
         request_state.request_text = text_data
         _enforce_response_create_size_limit(request_state)
         return request_state, text_data
@@ -2979,6 +2990,7 @@ class _HTTPBridgeRequestSubmitMixin:
         *,
         request_state: _WebSocketRequestState,
     ) -> bool:
+        upstream_wire_capture.record_bridge_request_settled(request_state)
         detached = False
         async with session.pending_lock:
             if request_state in session.pending_requests and not request_state.draining_until_terminal:
