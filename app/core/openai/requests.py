@@ -365,7 +365,13 @@ def _normalize_responses_input_instructions(data: JsonValue) -> JsonValue:
             changed = True
             continue
         role = item_mapping.get("role")
-        if role not in ("system", "developer"):
+        if role == "developer":
+            # Input is inherited by previous_response_id; top-level instructions
+            # are not. Keep developer context in the original input position.
+            input_items.append(item)
+            changed = True  # Also default omitted instructions to an empty string.
+            continue
+        if role != "system":
             input_items.append(item)
             continue
         instruction_text, preserved_content = _split_responses_instruction_item_content(item_mapping)
@@ -1746,9 +1752,9 @@ def responses_input_contains_goal_continuation_context(input_value: JsonValue) -
 def responses_request_contains_goal_continuation_context(payload: ResponsesRequest) -> bool:
     """Return whether a normalized request carries Codex's goal restart marker."""
 
-    # ResponsesRequest normalization lifts developer/system input messages into
-    # ``instructions``. The marker can therefore disappear from ``input`` and
-    # follow pre-existing instruction text by the time affinity is classified.
+    # System input messages are lifted into ``instructions``; developer messages
+    # remain in ``input``. A system marker can therefore follow pre-existing
+    # instruction text by the time affinity is classified.
     # Keep both locations in this check or a harmless parser refactor can
     # silently break restart recovery while marker-preservation tests still pass.
     instructions = payload.instructions

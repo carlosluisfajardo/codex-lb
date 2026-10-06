@@ -834,8 +834,64 @@ def test_responses_input_system_message_moves_to_instructions():
     }
     request = ResponsesRequest.model_validate(payload)
 
-    assert request.instructions == "primary\nsys\ndev"
-    assert request.input == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    assert request.instructions == "primary\nsys"
+    assert request.input == [
+        {"type": "message", "role": "developer", "content": "dev"},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+
+
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+@pytest.mark.parametrize("instructions", [None, "explicit turn instructions"])
+def test_responses_input_developer_context_remains_in_input(request_type, instructions):
+    developer_messages = [
+        {"role": "developer", "content": "reference key: 34620"},
+        {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "retain the reference"}]},
+    ]
+    user_message = {"role": "user", "content": [{"type": "input_text", "text": "look up the key"}]}
+    input_items = [developer_messages[0], user_message, developer_messages[1]]
+    payload = {"model": "gpt-5.1", "input": input_items}
+    if instructions is not None:
+        payload["instructions"] = instructions
+
+    request = request_type.model_validate(payload)
+    forwarded = request.to_payload()
+
+    assert forwarded["instructions"] == (instructions or "")
+    assert forwarded["input"] == input_items
+    # A second normalization/serialization must not migrate developer context.
+    assert request_type.model_validate(forwarded).to_payload() == forwarded
+
+
+@pytest.mark.parametrize("lite", [False, True])
+def test_responses_chained_payload_keeps_developer_context_in_initial_input(lite):
+    developer_message = {"role": "developer", "content": "reference key: 34620"}
+    system_message = {"role": "system", "content": "system instruction"}
+    user_message = {"role": "user", "content": [{"type": "input_text", "text": "start"}]}
+    input_items = [developer_message, system_message, user_message]
+    if lite:
+        input_items.insert(0, {"type": "additional_tools", "role": "developer", "tools": []})
+
+    initial = ResponsesRequest.model_validate(
+        {"model": "gpt-5.1", "instructions": "first turn", "input": input_items}
+    ).to_payload()
+    continuation = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "previous_response_id": "resp_initial",
+            "instructions": "next turn",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "look up the key"}]}],
+        }
+    ).to_payload()
+
+    # These are actual normalized wire payloads, not a simulated provider answer.
+    # The initial developer data must stay in input, which the upstream contract
+    # carries forward; prior top-level instructions are not inherited.
+    assert initial["input"] == (input_items if lite else [developer_message, user_message])
+    assert initial["instructions"] == ("first turn" if lite else "first turn\nsystem instruction")
+    assert continuation["previous_response_id"] == "resp_initial"
+    assert continuation["instructions"] == "next turn"
+    assert continuation["input"] == [{"role": "user", "content": [{"type": "input_text", "text": "look up the key"}]}]
 
 
 @pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
@@ -912,9 +968,10 @@ def test_responses_input_non_message_system_and_developer_items_are_preserved(re
 
     request = request_type.model_validate(payload)
 
-    assert request.instructions == "dev"
+    assert request.instructions == ""
     assert request.input == [
         developer_directive,
+        {"type": "message", "role": "developer", "content": "dev"},
         system_directive,
         {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
     ]
@@ -1063,7 +1120,7 @@ def test_responses_input_developer_message_preserves_single_non_text_part():
     assert request.input == [
         {
             "type": "message",
-            "role": "user",
+            "role": "developer",
             "content": {"type": "input_file", "file_id": "file_123"},
         }
     ]
