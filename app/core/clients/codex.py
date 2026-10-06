@@ -13,6 +13,7 @@ from aiohttp_socks import ProxyConnector
 from python_socks import ProxyType
 from yarl import URL
 
+from app.core.clients import upstream_wire_capture
 from app.core.clients.native_egress import (
     NativeEgressClient,
     NativeEgressError,
@@ -481,6 +482,7 @@ def create_codex_session(*, max_clients: int = 10) -> Any:
         timeout=aiohttp.ClientTimeout(total=None),
         trust_env=False,
         skip_auto_headers=_CODEX_SKIP_AUTO_IDENTITY_HEADERS,
+        trace_configs=upstream_wire_capture.trace_configs(session_label="routed"),
     )
 
 
@@ -498,6 +500,7 @@ async def _request_via_socks_proxy(
         timeout=aiohttp.ClientTimeout(total=None),
         trust_env=False,
         skip_auto_headers=_CODEX_SKIP_AUTO_IDENTITY_HEADERS,
+        trace_configs=upstream_wire_capture.trace_configs(session_label="routed_socks"),
     )
     try:
         try:
@@ -537,6 +540,7 @@ async def _open_ws_via_socks_proxy(url: str, endpoint: ResolvedProxyEndpoint, **
         timeout=aiohttp.ClientTimeout(total=None),
         trust_env=False,
         skip_auto_headers=_CODEX_SKIP_AUTO_IDENTITY_HEADERS,
+        trace_configs=upstream_wire_capture.trace_configs(session_label="routed_socks"),
     )
     try:
         context = session.ws_connect(url, **kwargs)

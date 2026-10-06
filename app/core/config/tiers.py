@@ -84,6 +84,7 @@ SETTING_TIERS: Final[dict[str, Tier]] = {
     "encryption_key_fingerprint_mode": "T0",
     "database_migrations_fail_fast": "T0",
     "trace": "T4",
+    "wire_capture_file": "T4",
     "conversation_archive_enabled": "T3",
     "conversation_archive_dir": "T1",
     "conversation_archive_queue_max_bytes": "T1",

@@ -18,6 +18,7 @@ from aiohappyeyeballs.types import AddrInfoType
 from aiohttp_retry import RetryClient
 from aiohttp_socks import ProxyConnector
 
+from app.core.clients import upstream_wire_capture
 from app.core.config.settings import Settings, get_settings
 from app.core.types import JsonObject
 
@@ -240,6 +241,7 @@ async def _build_http_client() -> HttpClient:
         connector=connector,
         timeout=aiohttp.ClientTimeout(total=None),
         trust_env=not socks_config,
+        trace_configs=upstream_wire_capture.trace_configs(session_label="shared"),
     )
     try:
         if socks_config and settings.upstream_websocket_trust_env:

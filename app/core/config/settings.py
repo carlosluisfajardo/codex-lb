@@ -405,6 +405,10 @@ class Settings(BaseSettings):
     # (upstream request summary/completion), ``upstream_payload`` (upstream
     # request payload). Interactive incident use only, not steady-state config.
     trace: str = ""
+    # Incident-debugging upstream wire metadata capture (env
+    # ``CODEX_LB_WIRE_CAPTURE_FILE``): absolute path of a NEW 0600 file in a
+    # private directory. Unset (the default) disables capture entirely.
+    wire_capture_file: Path | None = None
     # T3 → dashboard (deprecated env alias, remove next minor): the
     # ``dashboard_settings.conversation_archive_enabled`` column wins when set;
     # the archive writer resolves it from the settings-cache snapshot.
