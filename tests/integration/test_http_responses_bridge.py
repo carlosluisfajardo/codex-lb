@@ -19313,3 +19313,44 @@ async def test_native_codex_http_bridge_sanitizes_upstream_rejection_text(
     for leaked in ("\x00", "\x1b", "abc.def-ghi_jkl", "sk-live-abcdefghijklmnopqrstuvwxyz0123", "ops@example.com"):
         assert leaked not in message
     assert len(message) <= 1_000
+
+
+@pytest.mark.asyncio
+async def test_owner_forward_relays_an_upstream_request_rejection_raw_for_the_origin(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    """On an internal bridge forward the owner relays the raw rejection frame, so
+    the origin decides the delivery for its own client."""
+    from app.modules.proxy import api as proxy_api_module
+
+    _install_bridge_settings(monkeypatch, enabled=True)
+    owner_settings = proxy_module.get_settings()
+    monkeypatch.setattr(proxy_api_module, "get_settings", lambda: owner_settings)
+    account_id = await _import_account(
+        async_client, "acc_owner_forward_rejection", "owner-forward-rejection@example.com"
+    )
+    upstream = _RejectsRequestUpstreamWebSocket(_INCIDENT_SHAPED_REJECTION_MESSAGE)
+    _install_denied_anchor_bridge_fakes(monkeypatch, account=await _get_account(account_id), upstream=upstream)
+
+    async with _client_reporting_committed_stream_failures(app_instance) as client:
+        payload, headers = _denied_anchor_owner_forward_headers(
+            {
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": _history_with_function_call("{}"),
+            },
+            session_key="owner-forward-rejection-session",
+        )
+        response = await client.post(
+            "/internal/bridge/responses",
+            json=payload.model_dump_for_forwarding(),
+            headers=headers,
+        )
+
+    assert response.status_code == 200, response.text
+    events = _sse_data_events(response.text)
+    assert [event.get("type") for event in events] == ["error"], response.text
+    assert events[0]["status"] == 400
+    assert events[0]["error"]["message"] == _INCIDENT_SHAPED_REJECTION_MESSAGE

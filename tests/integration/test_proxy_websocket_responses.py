@@ -14826,3 +14826,56 @@ def test_backend_responses_websocket_rejects_oversized_function_call_arguments_b
     assert error_event["error"]["param"] == "input[1].arguments"
     assert "length 1048577" in error_event["error"]["message"]
     assert "x" * 64 not in json.dumps(error_event)
+
+
+def test_backend_responses_websocket_leaves_oversized_history_of_a_source_owned_model_to_the_http_fallback(
+    app_instance,
+    monkeypatch,
+):
+    """A source-owned model is served over HTTP by its source. The oversized
+    arguments refusal must not preempt the 503 that sends the Codex client
+    there; the HTTP route routes to the source before the refusal applies."""
+    model = "external-ws-source-oversized-history"
+    source_checks: list[str | None] = []
+
+    async def configured_source(source_model, api_key, *, raw_model=None):
+        del api_key, raw_model
+        source_checks.append(source_model)
+        return source_model == model
+
+    async def fail_before_subscription_selection(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("a source-owned model must not select a subscription account")
+
+    monkeypatch.setattr(websocket_mixin_module, "responses_model_is_source_owned", configured_source)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_select_websocket_connect_account",
+        fail_before_subscription_selection,
+    )
+    response_create = _websocket_response_create("unused")
+    response_create.update(
+        {
+            "model": model,
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "ask me something"}]},
+                {
+                    "type": "function_call",
+                    "name": "request_user_input",
+                    "call_id": "call_oversized_history",
+                    "arguments": "x" * 1_048_577,
+                },
+                {"type": "function_call_output", "call_id": "call_oversized_history", "output": "invalid arguments"},
+            ],
+        }
+    )
+
+    with TestClient(app_instance, client=("127.0.0.1", 50000)) as client:
+        with client.websocket_connect("ws://localhost/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(response_create))
+            event = json.loads(websocket.receive_text())
+
+    assert event["type"] == "error"
+    assert event["status"] == 503
+    assert event["error"]["code"] == "model_source_requires_http_transport"
+    assert model in source_checks

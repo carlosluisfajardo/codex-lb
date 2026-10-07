@@ -8384,7 +8384,7 @@ class _NativeRequestRejection:
         return format_sse_event(response_failed_event(self.code, self.message, self.error_type, error_param=self.param))
 
 
-def _native_request_rejection(payload: Mapping[str, JsonValue]) -> _NativeRequestRejection | None:
+def _native_request_rejection(payload: dict[str, JsonValue]) -> _NativeRequestRejection | None:
     """Classify an upstream ``error`` frame that rejects the request itself.
 
     A native Codex client ignores a bare ``error`` SSE frame and reads the clean
@@ -8394,7 +8394,7 @@ def _native_request_rejection(payload: Mapping[str, JsonValue]) -> _NativeReques
     upstream returns for that request. Other error frames keep their raw
     shape, and stale-anchor denials keep their own masking contract.
     """
-    if payload.get("type") != "error":
+    if classify_event_type(payload) != "error":
         return None
     error_value = payload.get("error")
     detail: Mapping[str, JsonValue] = error_value if is_json_mapping(error_value) else payload

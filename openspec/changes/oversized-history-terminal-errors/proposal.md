@@ -27,8 +27,11 @@ could not help while the item stayed in the history.
   `input[N].arguments`); WebSocket routes get a status-400 error event. The
   message names the limit and the call, says to continue in a new conversation,
   and never echoes the arguments.
-- codex-lb does not truncate, replace or mark the arguments. A terminal
-  compaction trigger is left to the upstream compact flow.
+- codex-lb does not truncate, replace or mark the arguments.
+- Some requests are left to upstream or their source:
+  - a terminal compaction trigger keeps the upstream compact flow;
+  - a request anchored with `previous_response_id` is left to upstream;
+  - models served by a configured model source are unaffected.
 - On the native Codex HTTP route, an upstream request rejection is delivered in
   a form the client reads. A rejection is a wrapped error frame with status
   `400`, or a frame with no numeric status typed `invalid_request_error`.
@@ -37,10 +40,12 @@ could not help while the item stayed in the history.
   - Otherwise it is a terminal `response.failed` followed by `[DONE]`.
   - Other error frames keep raw passthrough.
   - The delivered message has control characters removed, credential-shaped
-    tokens and addresses redacted, and its length bounded.
-- Settlement is unchanged and is now pinned by tests: one error request-log
-  row, the API-key reservation released, no account-health penalty, no replay
-  or failover.
+    tokens and addresses redacted (on top of the log redactor's shapes), and
+    its length bounded.
+- Settlement is unchanged and is now pinned by tests for the rejection that is
+  finally delivered: one error request-log row, the API-key reservation
+  released, no account-health penalty, and no replay or failover beyond the
+  existing account model-route fallback.
 
 ## Capabilities
 

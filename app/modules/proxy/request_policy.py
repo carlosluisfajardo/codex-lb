@@ -1072,10 +1072,12 @@ def enforce_function_call_arguments_limit(request: ResponsesRequest) -> None:
     model never made into its history and change the call's side-effect replay
     identity, so the request fails locally with the deterministic 400 upstream
     returns, before any reservation or upstream work. A terminal compaction
-    trigger is left to the upstream compact flow.
+    trigger is left to the upstream compact flow, and a request anchored with
+    ``previous_response_id`` is left to upstream, which can hold the call
+    server-side while the proxy trims it from the forwarded input.
     """
     input_value = request.input
-    if not is_json_list(input_value) or not input_value:
+    if request.previous_response_id is not None or not is_json_list(input_value) or not input_value:
         return
     last_item = input_value[-1]
     if is_json_mapping(last_item) and last_item.get("type") == "compaction_trigger":

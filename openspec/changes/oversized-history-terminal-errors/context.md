@@ -57,41 +57,70 @@ visible.
   branch and before opportunistic admission and the API-key reservation.
   Nothing is reserved yet, so nothing needs settling. Like other request
   validation `400`s, the refusal writes no request-log row.
-- WebSocket: `_prepare_websocket_response_create_request`, right after payload
-  normalization and before the reservation. It raises `ClientPayloadError`,
-  which the existing handler sends as a status-400 error event.
-- Model-source routing decides before these points, so source-routed requests
-  (which may not share the upstream limit) are unaffected.
-- The guard judges the full forwarded `input`, matching the existing
-  `response.create` size guard. A full resend must stay servable for replay and
-  failover. A bridge-anchored turn that would have trimmed the item therefore
-  now fails one turn earlier; that thread fails on its next reconnect anyway.
+- WebSocket: `_prepare_websocket_response_create_request`, after the
+  source-route exclusion is known and before the reservation. It raises
+  `ClientPayloadError`, which the existing handler sends as a status-400 error
+  event.
+- Model sources are unaffected, because they may not share the upstream limit.
+  - On HTTP the route sends a source-owned request to the source before these
+    points.
+  - On WebSocket, when the guard finds an oversized argument it first checks
+    source ownership. A source-owned model (not route-excluded) is left to the
+    connect-time `503 model_source_requires_http_transport`, which sends the
+    Codex client to HTTP.
+- A request that carries `previous_response_id` is left to upstream. Upstream
+  can hold the call server-side, and the proxy trims previous-response output
+  items from such an input before sending it.
+- A full-history request (no `previous_response_id`) is judged as the client
+  sent it, matching the existing `response.create` size guard: a full resend
+  must stay servable for replay and failover. A bridge- or session-anchored
+  turn, whose anchor the proxy injects itself, would have trimmed the item, so
+  it now fails one turn earlier. That thread fails on its next reconnect anyway.
 - A terminal `compaction_trigger` is exempt, because compaction is the path
   that can still summarize such a history. Upstream decides whether its compact
   endpoint accepts the item.
 
 ### Which error frames are request rejections
 
-- A request rejection is a frame with `status`/`status_code` `400`, or a frame
-  with no numeric status whose error type is `invalid_request_error`.
+- A request rejection is an `error` event with `status`/`status_code` `400`, or
+  one with no numeric status whose error type is `invalid_request_error`. Event
+  classification is the shared one, so a typeless frame with an `error` object
+  counts.
 - Rate limits, server errors and status-less frames of other types keep raw
   passthrough.
 - A `previous_response_not_found` denial keeps its masking contract.
 - An internal owner forward relays the raw frame; the origin converts it for
   its own client.
-- The pre-commit conversion is limited to the HTTP bridge. There the request is
-  finalized before the frame is yielded, which is the same condition the SDK
-  conversion already relies on. On the bridge-off path the conversion happens
-  in-stream.
+- The pre-commit conversion runs when the route admitted the HTTP bridge,
+  which is the same gate the SDK conversion uses. That includes requests the
+  service later bypasses to the direct path for size or images. On a route
+  without the bridge the conversion happens in-stream.
+- Closing the stream after the converted frame settles exactly once:
+  - On the bridge, the terminal request state is popped from the pending set
+    before the frame is published, so the detach takes its non-pending branch
+    and neither releases nor retires the session. Request-log and reservation
+    settlement then run on the reader.
+  - The service signals cleanup-ready after submit, so the route does not
+    release the reservation a second time.
+  - The direct path settles in its `GeneratorExit` handler when the probe
+    closes it.
 
 ### Untrusted upstream text
 
-- Before delivery in this path, the message has control characters turned into
-  spaces.
-- Bearer values, `sk-`/`rk-`/`pk-`/`sess-` keys, JWT-shaped tokens and email
-  addresses are redacted.
+Before delivery in this path:
+
+- Control characters become spaces.
+- Redaction runs in two layers:
+  - the log redactor's secret shapes (keyed values, `Basic`, `Authorization`,
+    URL userinfo);
+  - then bearer values (also behind `%20`/`+`), percent-encoded keyed values,
+    `sk-`/`rk-`/`pk-`/`sess-` keys, JWT-shaped tokens and email addresses.
 - The text is bounded to 1,000 characters.
-- Request logs keep the upstream text for operators.
+- Redaction scans at most a 4,000-character window, cut at whitespace so no
+  token is split. A window with no whitespace keeps nothing, which yields a
+  generic message.
+
+Request logs keep the upstream text for operators.
 
 ## Example
 
@@ -122,11 +151,14 @@ The client stops and shows the message instead of retrying.
 
 - Only `function_call.arguments` is checked. The upstream limits for
   `custom_tool_call.input` and tool outputs are not established here.
-- `param` indexes the forwarded `input`. The proxy can lift leading
-  system/developer messages into `instructions`, so the index can differ from
-  the client's own; the call id in the message identifies the item.
+- `param` indexes the request's normalized `input`. The proxy lifts leading
+  system/developer messages into `instructions` and strips some items on the
+  wire, so the index can differ from the client's own and from the wire
+  position. The call id in the message identifies the item.
 - After commit, a client that does not recognize the error code in
   `response.failed` may still retry; each attempt fails fast with the real
   message.
 - Upstream error text on the SDK routes and on WebSocket passthrough keeps its
   existing handling.
+- Streams from a configured model source keep raw passthrough, including their
+  `error` frames.

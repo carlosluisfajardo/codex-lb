@@ -3172,7 +3172,6 @@ class _WebSocketMixin:
             payload,
             openai_compat=openai_cache_affinity,
         )
-        enforce_function_call_arguments_limit(responses_payload)
         # The client's raw model, captured before enforcement normalizes
         # aliases (``gpt-5-high`` -> ``gpt-5``). The source-ownership guards
         # must judge the raw alias too, or an alias-only model source is
@@ -3206,6 +3205,17 @@ class _WebSocketMixin:
             # parse failure keeps the source guards active instead of
             # changing that behavior here.
             source_route_excluded = False
+        try:
+            enforce_function_call_arguments_limit(responses_payload)
+        except ClientPayloadError:
+            # A source-owned model is served over HTTP by its source; the connect
+            # guard's 503 sends the client there, so leave the request to it.
+            if source_route_excluded or not await responses_model_is_source_owned(
+                responses_payload.model,
+                refreshed_api_key,
+                raw_model=raw_source_model,
+            ):
+                raise
         normalized_payload = responses_payload.to_payload()
         stripped_client_metadata = strip_capability_metadata(normalized_payload.get("client_metadata"))
         if stripped_client_metadata is not normalized_payload.get("client_metadata"):

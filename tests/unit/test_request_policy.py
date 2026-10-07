@@ -1087,3 +1087,19 @@ def test_function_call_arguments_limit_leaves_a_terminal_compaction_trigger_to_u
     )
 
     enforce_function_call_arguments_limit(request)
+
+
+def test_function_call_arguments_limit_leaves_an_anchored_request_to_upstream() -> None:
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "",
+            "previous_response_id": "resp_anchor",
+            "input": [
+                {"type": "function_call", "name": "shell", "call_id": "c", "arguments": "a" * 1_048_577},
+                {"type": "function_call_output", "call_id": "c", "output": "ok"},
+            ],
+        }
+    )
+
+    enforce_function_call_arguments_limit(request)

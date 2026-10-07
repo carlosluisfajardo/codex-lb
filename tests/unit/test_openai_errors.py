@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from app.core.errors import (
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
     OpenAIErrorParam,
@@ -230,13 +232,13 @@ def test_sanitize_public_upstream_error_message_scrubs_untrusted_text():
         "key sk-proj-abcdefghijklmnop0123 jwt eyJhbGciOiJI.eyJzdWIiOiIx.c2ln"
     )
 
-    assert sanitized == ("bad value [31m Authorization: [redacted] for [redacted] key [redacted] jwt [redacted]")
+    assert sanitized == "bad value [31m Authorization: [REDACTED] for [REDACTED] key [REDACTED] jwt [REDACTED]"
 
 
 def test_sanitize_public_upstream_error_message_bounds_length_and_defaults_empty_text():
-    bounded = sanitize_public_upstream_error_message("z" * 10_000)
+    bounded = sanitize_public_upstream_error_message("z " * 5_000)
 
-    assert len(bounded) == 1_000
+    assert len(bounded) <= 1_000
     assert bounded.endswith(" [truncated]")
     assert sanitize_public_upstream_error_message(None) == "Upstream rejected the request"
     assert sanitize_public_upstream_error_message(" \x00 ") == "Upstream rejected the request"
@@ -255,3 +257,37 @@ def test_sanitize_public_upstream_error_message_does_not_leave_a_cut_token_unred
     sanitized = sanitize_public_upstream_error_message("x " * 1_995 + "sk-proj-abcdefghijklmnop0123 tail")
 
     assert "sk-proj" not in sanitized
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        " " * 4_001,
+        "\n" * 4_001,
+        "\xa0" * 4_001,
+        " " * 4_000 + "x",
+        "sk-" + "a" * 3_985 + ",victim@exam" + "ple.com,tail",
+    ],
+)
+def test_sanitize_public_upstream_error_message_never_keeps_a_token_the_scan_window_cut(message: str):
+    assert sanitize_public_upstream_error_message(message) == "Upstream rejected the request"
+
+
+def test_sanitize_public_upstream_error_message_redacts_glued_encoded_and_keyed_secrets():
+    sanitized = sanitize_public_upstream_error_message(
+        "Authorization:Bearer%20eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig_x "
+        "x_sk-proj-abcdefghijklmnop0123 access_token%3DeyJhbGciOiJI.eyJzdWIiOiIx.c2ln "
+        "refresh_token%3Dopaque123 api_key=abcdef0123456789secret Basic dXNlcjpwYXNzd29yZA== "
+        "http://user:pw@localhost:8080/ ok"
+    )
+
+    assert sanitized == (
+        "Authorization:[REDACTED] x_[REDACTED] access_[REDACTED] refresh_[REDACTED] "
+        "api_key=[REDACTED] Basic [REDACTED] http://[REDACTED]@localhost:8080/ ok"
+    )
+
+
+def test_sanitize_public_upstream_error_message_keeps_words_that_resemble_token_prefixes():
+    message = "the risk-assessment task-scheduler for disk-imaging keyJudge says hey"
+
+    assert sanitize_public_upstream_error_message(message) == message

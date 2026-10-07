@@ -2359,16 +2359,23 @@ _REJECTION_MESSAGE = "Invalid 'input[66].arguments': string too long."
             "message": _REJECTION_MESSAGE,
             "param": "input[66].arguments",
         },
+        {
+            "status": 400,
+            "error": {"type": "invalid_request_error", "message": _REJECTION_MESSAGE, "param": "input[66].arguments"},
+        },
     ],
 )
+@pytest.mark.parametrize("framing", ["typed", "data_only"])
 @pytest.mark.asyncio
 async def test_normalize_public_responses_stream_ends_native_request_rejection_with_response_failed(
     frame: dict[str, JsonValue],
+    framing: str,
 ) -> None:
+    source = format_sse_event(frame) if framing == "typed" else f"data: {json.dumps(frame)}\n\n"
     blocks = [
         block
         async for block in proxy_api_module._normalize_public_responses_stream(
-            _iter_blocks(format_sse_event(frame)),
+            _iter_blocks(source),
             enforce_openai_sdk_contract=False,
             convert_native_request_rejections=True,
         )
@@ -2426,7 +2433,7 @@ async def test_normalize_public_responses_stream_keeps_other_native_error_frames
 
 
 @pytest.mark.asyncio
-async def test_normalize_public_responses_stream_relays_native_request_rejection_raw_for_owner_forward() -> None:
+async def test_normalize_public_responses_stream_keeps_native_request_rejection_raw_by_default() -> None:
     source = format_sse_event(
         {"type": "error", "status": 400, "error": {"type": "invalid_request_error", "message": "rejected"}}
     )
