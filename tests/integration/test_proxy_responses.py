@@ -4322,3 +4322,105 @@ async def test_v1_responses_disconnect_stamp_reaches_traced_response_through_rea
         "request_id=req_delivery_trace_stamp surface=responses outcome=terminal_after_disconnect "
         "terminal=response.completed"
     ) in records[0].getMessage()
+
+
+def _history_with_oversized_function_call() -> list[dict[str, object]]:
+    return [
+        {"role": "user", "content": [{"type": "input_text", "text": "ask me something"}]},
+        {
+            "type": "function_call",
+            "name": "request_user_input",
+            "call_id": "call_oversized_history",
+            "arguments": "x" * 1_048_577,
+        },
+        {"type": "function_call_output", "call_id": "call_oversized_history", "output": "invalid arguments"},
+        {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "stream"),
+    [("/backend-api/codex/responses", True), ("/v1/responses", True), ("/v1/responses", False)],
+)
+async def test_responses_reject_oversized_function_call_arguments_before_admission(
+    async_client,
+    monkeypatch,
+    path,
+    stream,
+):
+    async def unexpected(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("oversized function_call arguments must be refused before admission or upstream work")
+
+    monkeypatch.setattr(proxy_api_module, "_opportunistic_admission_denial", unexpected)
+    monkeypatch.setattr(proxy_api_module, "_enforce_request_limits", unexpected)
+    monkeypatch.setattr(proxy_module, "core_stream_responses", unexpected)
+
+    response = await async_client.post(
+        path,
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": _history_with_oversized_function_call(),
+            "stream": stream,
+        },
+        headers={"user-agent": "codex_exec/0.153.4"},
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "string_above_max_length"
+    assert error["param"] == "input[1].arguments"
+    assert "x" * 64 not in response.text
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_native_client_receives_upstream_request_rejection_as_terminal(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    """The Codex client ignores a bare ``error`` SSE frame; an upstream request
+    rejection must end its stream with ``response.failed`` and ``[DONE]``."""
+    auth_json = _make_auth_json("acc_native_raw_rejection", "native-raw-rejection@example.com")
+    response = await async_client.post(
+        "/api/accounts/import",
+        files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")},
+    )
+    assert response.status_code == 200
+    message = "Invalid 'input[1].arguments': string too long. Expected a string with maximum length 1048576."
+
+    async def fake_stream(payload, headers, access_token, account_id, **kwargs):
+        del payload, headers, access_token, account_id, kwargs
+        yield (
+            'data: {"type":"error","status":400,"error":{"type":"invalid_request_error",'
+            f'"message":"{message}","param":"input[1].arguments"}}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json={"model": "gpt-5.1", "instructions": "Return exactly OK.", "input": "hello", "stream": True},
+        headers={"user-agent": "codex_exec/0.153.4", "x-request-id": "req_native_raw_rejection"},
+    ) as streamed:
+        assert streamed.status_code == 200
+        lines = [line async for line in streamed.aiter_lines() if line.startswith("data: ")]
+
+    assert lines[-1] == "data: [DONE]"
+    events = [json.loads(line[6:]) for line in lines[:-1]]
+    assert [event["type"] for event in events] == ["response.failed"]
+    error = events[0]["response"]["error"]
+    assert (error["type"], error["code"], error["message"], error["param"]) == (
+        "invalid_request_error",
+        "invalid_request_error",
+        message,
+        "input[1].arguments",
+    )
+    await app_instance.state.proxy_service.drain_persistence_tasks(timeout_seconds=5)
+    async with SessionLocal() as session:
+        logs = (await session.execute(select(RequestLog))).scalars().all()
+    assert [(log.status, log.error_code) for log in logs] == [("error", "invalid_request_error")]

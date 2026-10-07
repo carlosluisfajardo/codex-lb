@@ -502,6 +502,7 @@ from app.modules.proxy.load_balancer import AccountLease, effective_account_conc
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_enforced_service_tier_model_fallback,
+    enforce_function_call_arguments_limit,
     model_alias_requests_fast_mode,
     normalize_responses_request_payload,
     openai_client_payload_error,
@@ -3171,6 +3172,7 @@ class _WebSocketMixin:
             payload,
             openai_compat=openai_cache_affinity,
         )
+        enforce_function_call_arguments_limit(responses_payload)
         # The client's raw model, captured before enforcement normalizes
         # aliases (``gpt-5-high`` -> ``gpt-5``). The source-ownership guards
         # must judge the raw alias too, or an alias-only model source is

@@ -2335,3 +2335,108 @@ def test_looks_like_sse_comment_block_fast_path_matches_scan() -> None:
 
     for event_block in blocks:
         assert proxy_api_module._looks_like_sse_comment_block(event_block) is scan(event_block), repr(event_block)
+
+
+_REJECTION_MESSAGE = "Invalid 'input[66].arguments': string too long."
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {
+            "type": "error",
+            "status": 400,
+            "error": {"type": "invalid_request_error", "message": _REJECTION_MESSAGE, "param": "input[66].arguments"},
+        },
+        {
+            "type": "error",
+            "status_code": 400,
+            "error": {"type": "invalid_request_error", "message": _REJECTION_MESSAGE, "param": "input[66].arguments"},
+        },
+        {
+            "type": "error",
+            "error_type": "invalid_request_error",
+            "message": _REJECTION_MESSAGE,
+            "param": "input[66].arguments",
+        },
+    ],
+)
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_ends_native_request_rejection_with_response_failed(
+    frame: dict[str, JsonValue],
+) -> None:
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(format_sse_event(frame)),
+            enforce_openai_sdk_contract=False,
+            convert_native_request_rejections=True,
+        )
+    ]
+
+    assert blocks[-1] == "data: [DONE]\n\n"
+    payload = proxy_api_module._parse_sse_payload(blocks[0])
+    assert payload is not None
+    assert payload["type"] == "response.failed"
+    response = payload["response"]
+    assert isinstance(response, dict)
+    assert response["error"] == {
+        "message": _REJECTION_MESSAGE,
+        "type": "invalid_request_error",
+        "code": "invalid_request_error",
+        "param": "input[66].arguments",
+    }
+    assert proxy_api_module.SYNTHETIC_TRANSPORT_FAILURE_MARKER not in payload
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"type": "error", "status": 429, "error": {"type": "rate_limit_error", "message": "slow down"}},
+        {"type": "error", "status": 500, "error": {"type": "invalid_request_error", "message": "boom"}},
+        {"type": "error", "error": {"code": "upstream_error", "message": "bad", "param": "model"}},
+        {
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "previous_response_not_found",
+                "message": "Previous response with id 'resp_1' not found.",
+                "param": "previous_response_id",
+            },
+        },
+    ],
+)
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_keeps_other_native_error_frames_raw(
+    frame: dict[str, JsonValue],
+) -> None:
+    source = format_sse_event(frame)
+
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(source),
+            enforce_openai_sdk_contract=False,
+            convert_native_request_rejections=True,
+        )
+    ]
+
+    assert blocks == [source, "data: [DONE]\n\n"]
+
+
+@pytest.mark.asyncio
+async def test_normalize_public_responses_stream_relays_native_request_rejection_raw_for_owner_forward() -> None:
+    source = format_sse_event(
+        {"type": "error", "status": 400, "error": {"type": "invalid_request_error", "message": "rejected"}}
+    )
+
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(source),
+            enforce_openai_sdk_contract=False,
+        )
+    ]
+
+    assert blocks == [source, "data: [DONE]\n\n"]

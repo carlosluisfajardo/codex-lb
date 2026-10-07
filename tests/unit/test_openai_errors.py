@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from app.core.errors import (
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
     OpenAIErrorParam,
@@ -8,6 +10,7 @@ from app.core.errors import (
     previous_response_id_from_not_found_message,
     previous_response_stream_incomplete_error,
     response_failed_event,
+    sanitize_public_upstream_error_message,
 )
 
 
@@ -210,3 +213,45 @@ def test_previous_response_stream_incomplete_error_is_public_safe():
     assert payload["error"].get("code") == "stream_incomplete"
     assert payload["error"].get("type") == "server_error"
     assert payload["error"].get("message") == PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE
+
+
+def test_sanitize_public_upstream_error_message_keeps_ordinary_text_unchanged():
+    message = (
+        "Invalid response.create payload: Invalid 'input[66].arguments': string too long. "
+        "Expected a string with maximum length 1048576, but got a string with length 5098360 instead."
+    )
+
+    assert sanitize_public_upstream_error_message(message) == message
+
+
+def test_sanitize_public_upstream_error_message_scrubs_untrusted_text():
+    sanitized = sanitize_public_upstream_error_message(
+        "bad\x00value\x1b[31m Authorization: Bearer abc.def-ghi for owner@example.com "
+        "key sk-proj-abcdefghijklmnop0123 jwt eyJhbGciOiJI.eyJzdWIiOiIx.c2ln"
+    )
+
+    assert sanitized == ("bad value [31m Authorization: [redacted] for [redacted] key [redacted] jwt [redacted]")
+
+
+def test_sanitize_public_upstream_error_message_bounds_length_and_defaults_empty_text():
+    bounded = sanitize_public_upstream_error_message("z" * 10_000)
+
+    assert len(bounded) == 1_000
+    assert bounded.endswith(" [truncated]")
+    assert sanitize_public_upstream_error_message(None) == "Upstream rejected the request"
+    assert sanitize_public_upstream_error_message(" \x00 ") == "Upstream rejected the request"
+
+
+def test_sanitize_public_upstream_error_message_cost_is_bounded_for_huge_untrusted_text():
+    # Unbounded patterns made these inputs quadratic (tens of seconds per message).
+    for hostile in ("eyJ-" * 1_250_000, "a" * 5_000_000, "x@" * 2_500_000):
+        started = time.monotonic()
+        sanitized = sanitize_public_upstream_error_message(hostile)
+        assert time.monotonic() - started < 1.0
+        assert len(sanitized) <= 1_000
+
+
+def test_sanitize_public_upstream_error_message_does_not_leave_a_cut_token_unredacted():
+    sanitized = sanitize_public_upstream_error_message("x " * 1_995 + "sk-proj-abcdefghijklmnop0123 tail")
+
+    assert "sk-proj" not in sanitized

@@ -38,6 +38,7 @@ from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
     Account,
     AccountStatus,
+    ApiKeyUsageReservation,
     DashboardSettings,
     HttpBridgeSessionRecord,
     HttpBridgeSessionState,
@@ -17209,7 +17210,7 @@ def _install_denied_anchor_bridge_fakes(
     monkeypatch: pytest.MonkeyPatch,
     *,
     account: Account,
-    upstream: _DeniesAnchoredTurnUpstreamWebSocket,
+    upstream: _FakeBridgeUpstreamWebSocket,
 ) -> None:
     """Pin selection, token refresh, and the upstream connect to one fake that
     denies every anchored turn."""
@@ -18433,19 +18434,12 @@ async def test_backend_responses_http_bridge_fails_a_self_excluded_hard_owner_re
         return
     # The model-fallback replay surfaces the upstream rejection that started
     # it, which is the actionable error for a hard owner that cannot serve the
-    # requested model.
-    assert response.status_code == 200
-    events = [
-        event
-        for line in body.splitlines()
-        if line.startswith("data: ") and line[6:] != "[DONE]"
-        if (event := json.loads(line[6:])).get("type") != "codex.keepalive"
-    ]
-    assert [event["type"] for event in events] == ["error"]
-    assert events[0]["error"]["code"] == "invalid_request_error"
-    assert events[0]["error"]["message"] == (
-        f"The '{model}' model is not supported when using Codex with a ChatGPT account."
-    )
+    # requested model. It is a request rejection, so the native client gets the
+    # HTTP 400 an HTTP upstream returns instead of a bare ``error`` frame.
+    assert response.status_code == 400
+    error = json.loads(body)["error"]
+    assert error["code"] == "invalid_request_error"
+    assert error["message"] == (f"The '{model}' model is not supported when using Codex with a ChatGPT account.")
 
 
 class _AcceptedOutputItemCapacityErrorUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
@@ -18977,3 +18971,345 @@ async def test_smart_single_turn_stays_http_before_history_promotes(async_client
     assert len(upstreams) == 1
     assert "reason=smart_single_turn" in caplog.text
     assert "reason=smart_history" in caplog.text
+
+
+# --- Oversized replayed function_call arguments and upstream request rejections ---
+
+_UPSTREAM_FUNCTION_CALL_ARGUMENTS_MAX_CHARS = 1_048_576
+_NATIVE_CODEX_USER_AGENT = "codex_exec/0.153.4"
+_INCIDENT_SHAPED_REJECTION_MESSAGE = (
+    "Invalid response.create payload: Invalid 'input[1].arguments': string too long. "
+    "Expected a string with maximum length 1048576, but got a string with length 1048600 instead."
+)
+
+
+class _RejectsRequestUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    """Answer every turn the way upstream answered the oversized-history replay:
+    a wrapped ``invalid_request_error`` before any ``response.created``."""
+
+    def __init__(self, message: str, *, release: asyncio.Event | None = None) -> None:
+        super().__init__("resp_rejected_request")
+        self._message = message
+        self._release = release
+        self._held_rejections: list[asyncio.Task[None]] = []
+
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        if self._release is None:
+            await self._reject()
+        else:
+            self._held_rejections.append(asyncio.create_task(self._reject_after_release(self._release)))
+
+    async def _reject_after_release(self, release: asyncio.Event) -> None:
+        await release.wait()
+        await self._reject()
+
+    async def _reject(self) -> None:
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": self._message,
+                            "param": "input[1].arguments",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
+def _history_with_function_call(arguments: str) -> list[dict[str, Any]]:
+    """A replayed turn whose history holds one completed ``request_user_input`` call."""
+    return [
+        {"role": "user", "content": [{"type": "input_text", "text": "ask me something"}]},
+        {
+            "type": "function_call",
+            "name": "request_user_input",
+            "call_id": "call_oversized_history",
+            "arguments": arguments,
+        },
+        {"type": "function_call_output", "call_id": "call_oversized_history", "output": "invalid arguments"},
+        {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+    ]
+
+
+async def _create_limited_api_key(async_client, name: str) -> tuple[str, str]:
+    response = await async_client.put("/api/settings", json={"apiKeyAuthEnabled": True})
+    assert response.status_code == 200
+    response = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": name,
+            "limits": [{"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 1_000_000}],
+        },
+    )
+    assert response.status_code == 200
+    return response.json()["id"], response.json()["key"]
+
+
+def _spy_account_health_penalties(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]:
+    spies: dict[str, AsyncMock] = {}
+    for name in ("record_error", "mark_rate_limit", "mark_quota_exceeded", "mark_permanent_failure"):
+        spies[name] = AsyncMock()
+        monkeypatch.setattr(load_balancer_module.LoadBalancer, name, spies[name])
+    return spies
+
+
+async def _assert_rejection_settled_once(app_instance, *, api_key_id: str) -> None:
+    """One error row for the one upstream attempt, and the key's reservation released."""
+    service = get_proxy_service_for_app(app_instance)
+    rows: list[RequestLog] = []
+    reservation_statuses: list[str] = []
+    deadline = time.monotonic() + _TEST_SYNC_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        assert await service.drain_persistence_tasks(timeout_seconds=10)
+        async with SessionLocal() as session:
+            rows = list((await session.execute(select(RequestLog))).scalars().all())
+            reservation_statuses = [
+                reservation.status
+                for reservation in (
+                    await session.execute(
+                        select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == api_key_id)
+                    )
+                ).scalars()
+            ]
+        if rows and reservation_statuses and "reserved" not in reservation_statuses:
+            break
+        await asyncio.sleep(0.05)
+    assert [(row.status, row.error_code, row.api_key_id) for row in rows] == [
+        ("error", "invalid_request_error", api_key_id)
+    ]
+    assert reservation_statuses == ["released"]
+
+
+def _sse_data_events(body: str) -> list[dict[str, Any]]:
+    return [
+        json.loads(block.split("data: ", 1)[1])
+        for block in body.split("\n\n")
+        if "data: " in block and "data: [DONE]" not in block
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_agent", [_NATIVE_CODEX_USER_AGENT, "OpenAI/Python 1.0.0"])
+async def test_backend_responses_http_bridge_rejects_oversized_function_call_arguments_before_upstream(
+    async_client,
+    app_instance,
+    monkeypatch,
+    user_agent,
+):
+    """Upstream rejects a replayed ``function_call`` whose arguments exceed its
+    string limit on every resend, so forwarding it turns one bad history item
+    into a retry loop that never succeeds. The proxy refuses it locally with an
+    actionable 400 instead, and never truncates or rewrites the call."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(async_client, "acc_oversized_arguments", "oversized-arguments@example.com")
+    upstream = _RejectsRequestUpstreamWebSocket(_INCIDENT_SHAPED_REJECTION_MESSAGE)
+    _install_denied_anchor_bridge_fakes(monkeypatch, account=await _get_account(account_id), upstream=upstream)
+    oversized_arguments = "x" * (_UPSTREAM_FUNCTION_CALL_ARGUMENTS_MAX_CHARS + 1)
+
+    async with _client_reporting_committed_stream_failures(app_instance) as client:
+        response = await client.post(
+            "/backend-api/codex/responses",
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": _history_with_function_call(oversized_arguments),
+                "stream": True,
+            },
+            headers={"session_id": "oversized-arguments-session", "user-agent": user_agent},
+        )
+
+    assert upstream.sent_text == [], "the oversized function_call arguments were sent upstream"
+    assert response.status_code == 400, f"client received {response.status_code}: {response.text[:300]!r}"
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "string_above_max_length"
+    assert error["param"] == "input[1].arguments"
+    assert "maximum length 1048576" in error["message"]
+    assert "length 1048577" in error["message"]
+    assert "call_oversized_history" in error["message"]
+    assert "x" * 64 not in response.text
+
+
+@pytest.mark.asyncio
+async def test_backend_responses_http_bridge_forwards_function_call_arguments_at_the_limit_unchanged(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(async_client, "acc_arguments_at_limit", "arguments-at-limit@example.com")
+    upstream = _FakeBridgeUpstreamWebSocket()
+    _install_denied_anchor_bridge_fakes(monkeypatch, account=await _get_account(account_id), upstream=upstream)
+    history = _history_with_function_call("y" * _UPSTREAM_FUNCTION_CALL_ARGUMENTS_MAX_CHARS)
+
+    async with _client_reporting_committed_stream_failures(app_instance) as client:
+        response = await client.post(
+            "/backend-api/codex/responses",
+            json={"model": "gpt-5.1", "instructions": "Return exactly OK.", "input": history, "stream": True},
+            headers={"session_id": "arguments-at-limit-session", "user-agent": _NATIVE_CODEX_USER_AGENT},
+        )
+
+    assert response.status_code == 200
+    assert len(upstream.sent_text) == 1
+    forwarded_input = json.loads(upstream.sent_text[0])["input"]
+    assert [item for item in forwarded_input if item.get("type") == "function_call"] == [history[1]]
+
+
+@pytest.mark.asyncio
+async def test_native_codex_http_bridge_returns_upstream_invalid_request_error_before_commit(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    """The Codex client ignores a bare ``error`` SSE frame, reads the clean EOF
+    as a dropped stream, and resends the same rejected history five times.
+    Before the response commits, an upstream request rejection must reach it as
+    the HTTP 400 a direct HTTP upstream returns, settled once, account untouched."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_native_rejection_precommit",
+        "native-rejection-precommit@example.com",
+    )
+    upstream = _RejectsRequestUpstreamWebSocket(_INCIDENT_SHAPED_REJECTION_MESSAGE)
+    _install_denied_anchor_bridge_fakes(monkeypatch, account=await _get_account(account_id), upstream=upstream)
+    api_key_id, api_key_token = await _create_limited_api_key(async_client, "native-rejection-precommit")
+    penalties = _spy_account_health_penalties(monkeypatch)
+
+    async with _client_reporting_committed_stream_failures(app_instance) as client:
+        response = await client.post(
+            "/backend-api/codex/responses",
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": _history_with_function_call("{}"),
+                "stream": True,
+            },
+            headers={
+                "session_id": "native-rejection-precommit-session",
+                "user-agent": _NATIVE_CODEX_USER_AGENT,
+                "Authorization": f"Bearer {api_key_token}",
+            },
+        )
+
+    assert response.status_code == 400, f"native client received {response.status_code}: {response.text!r}"
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_request_error"
+    assert error["message"] == _INCIDENT_SHAPED_REJECTION_MESSAGE
+    assert error["param"] == "input[1].arguments"
+    assert len(upstream.sent_text) == 1, "the rejected request was replayed upstream"
+    await _assert_rejection_settled_once(app_instance, api_key_id=api_key_id)
+    assert {name: spy.await_count for name, spy in penalties.items()} == dict.fromkeys(penalties, 0)
+
+
+@pytest.mark.asyncio
+async def test_native_codex_http_bridge_ends_committed_stream_with_upstream_invalid_request_error(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    """After commit the same rejection must end the body with a terminal the
+    client reads, ``response.failed`` then ``[DONE]``, instead of a bare
+    ``error`` frame and a clean EOF it treats as a dropped stream."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+    from app.modules.proxy import api as proxy_api_module
+
+    monkeypatch.setattr(proxy_api_module, "_HTTP_BRIDGE_STARTUP_ERROR_PROBE_SECONDS", 0.0)
+    account_id = await _import_account(
+        async_client,
+        "acc_native_rejection_postcommit",
+        "native-rejection-postcommit@example.com",
+    )
+    # Upstream answers only after the startup probe has handed the stream off,
+    # which is when the route commits the 200.
+    committed = asyncio.Event()
+    probe_stream_startup_error = proxy_api_module._probe_stream_startup_error
+
+    async def probe_then_commit(*args, **kwargs):
+        result = await probe_stream_startup_error(*args, **kwargs)
+        committed.set()
+        return result
+
+    monkeypatch.setattr(proxy_api_module, "_probe_stream_startup_error", probe_then_commit)
+    upstream = _RejectsRequestUpstreamWebSocket(_INCIDENT_SHAPED_REJECTION_MESSAGE, release=committed)
+    _install_denied_anchor_bridge_fakes(monkeypatch, account=await _get_account(account_id), upstream=upstream)
+    api_key_id, api_key_token = await _create_limited_api_key(async_client, "native-rejection-postcommit")
+    penalties = _spy_account_health_penalties(monkeypatch)
+
+    async with _client_reporting_committed_stream_failures(app_instance) as client:
+        response = await client.post(
+            "/backend-api/codex/responses",
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": _history_with_function_call("{}"),
+                "stream": True,
+            },
+            headers={
+                "session_id": "native-rejection-postcommit-session",
+                "user-agent": _NATIVE_CODEX_USER_AGENT,
+                "Authorization": f"Bearer {api_key_token}",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.text
+    events = _sse_data_events(body)
+    assert [event.get("type") for event in events] == ["response.failed"], body
+    error = events[0]["response"]["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_request_error"
+    assert error["message"] == _INCIDENT_SHAPED_REJECTION_MESSAGE
+    assert error["param"] == "input[1].arguments"
+    assert "_codex_lb_synthetic_transport_failure" not in body
+    assert body.rstrip().endswith("data: [DONE]")
+    assert len(upstream.sent_text) == 1, "the rejected request was replayed upstream"
+    await _assert_rejection_settled_once(app_instance, api_key_id=api_key_id)
+    assert {name: spy.await_count for name, spy in penalties.items()} == dict.fromkeys(penalties, 0)
+
+
+@pytest.mark.asyncio
+async def test_native_codex_http_bridge_sanitizes_upstream_rejection_text(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    """Upstream error text is not trusted: control characters, credential-shaped
+    tokens and addresses are scrubbed and the message is bounded before it is
+    delivered."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(async_client, "acc_native_rejection_text", "native-rejection-text@example.com")
+    hostile_message = (
+        "Invalid 'input[1].arguments': echoed\x00\x1b[31m Bearer abc.def-ghi_jkl "
+        "sk-live-abcdefghijklmnopqrstuvwxyz0123 for ops@example.com " + "z" * 5_000
+    )
+    upstream = _RejectsRequestUpstreamWebSocket(hostile_message)
+    _install_denied_anchor_bridge_fakes(monkeypatch, account=await _get_account(account_id), upstream=upstream)
+
+    async with _client_reporting_committed_stream_failures(app_instance) as client:
+        response = await client.post(
+            "/backend-api/codex/responses",
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": _history_with_function_call("{}"),
+                "stream": True,
+            },
+            headers={"session_id": "native-rejection-text-session", "user-agent": _NATIVE_CODEX_USER_AGENT},
+        )
+
+    assert response.status_code == 400, f"native client received {response.status_code}: {response.text[:300]!r}"
+    message = response.json()["error"]["message"]
+    assert message.startswith("Invalid 'input[1].arguments': echoed")
+    for leaked in ("\x00", "\x1b", "abc.def-ghi_jkl", "sk-live-abcdefghijklmnopqrstuvwxyz0123", "ops@example.com"):
+        assert leaked not in message
+    assert len(message) <= 1_000

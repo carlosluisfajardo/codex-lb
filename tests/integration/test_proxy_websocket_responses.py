@@ -14767,3 +14767,62 @@ def test_backend_responses_websocket_re_sends_an_anchored_accepted_failure_in_a_
     assert "previous_response_id" not in replayed_payload
     assert replayed_payload["input"] == [failover.HISTORICAL_INPUT, failover.FOLLOW_UP_INPUT]
     assert other_account_upstream.sent_text == []
+
+
+def test_backend_responses_websocket_rejects_oversized_function_call_arguments_before_upstream(
+    app_instance,
+    monkeypatch,
+):
+    """A replayed function_call whose arguments exceed upstream's string limit
+    fails locally with the status-400 error event the Codex client surfaces as
+    a non-retryable invalid request, before any upstream connect."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fail_connect_proxy_websocket(self, headers, **kwargs):
+        del self, headers, kwargs
+        raise AssertionError("oversized function_call arguments must fail before upstream websocket connect")
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "ask me something"}]},
+            {
+                "type": "function_call",
+                "name": "request_user_input",
+                "call_id": "call_oversized_history",
+                "arguments": "x" * 1_048_577,
+            },
+            {"type": "function_call_output", "call_id": "call_oversized_history", "output": "invalid arguments"},
+            {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            error_event = json.loads(websocket.receive_text())
+
+    assert error_event["type"] == "error"
+    assert error_event["status"] == 400
+    assert error_event["error"]["type"] == "invalid_request_error"
+    assert error_event["error"]["code"] == "string_above_max_length"
+    assert error_event["error"]["param"] == "input[1].arguments"
+    assert "length 1048577" in error_event["error"]["message"]
+    assert "x" * 64 not in json.dumps(error_event)

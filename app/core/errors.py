@@ -4,7 +4,7 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, NotRequired, TypedDict
+from typing import Final, Literal, NotRequired, TypedDict
 
 from app.core.types import JsonValue
 
@@ -258,6 +258,40 @@ def sanitize_public_error_detail(error: Mapping[str, JsonValue]) -> dict[str, Js
     else:
         normalized["param"] = public_param
     return normalized
+
+
+PUBLIC_UPSTREAM_ERROR_MESSAGE_MAX_CHARS: Final[int] = 1_000
+# Redaction scans at most this much text, so its cost stays bounded however
+# large an upstream message is.
+_PUBLIC_UPSTREAM_ERROR_SCAN_MAX_CHARS: Final[int] = 4 * PUBLIC_UPSTREAM_ERROR_MESSAGE_MAX_CHARS
+_PUBLIC_UPSTREAM_ERROR_TRUNCATION_SUFFIX: Final = " [truncated]"
+_PUBLIC_UPSTREAM_ERROR_CONTROL_CHARACTERS: Final = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_PUBLIC_UPSTREAM_ERROR_REDACTIONS: Final = (
+    re.compile(r"(?i)\bbearer\s+\S+"),
+    re.compile(r"\beyJ[\w-]{6,4096}\.[\w-]{6,4096}\.[\w-]*"),
+    re.compile(r"\b(?:sk|rk|pk|sess)-[\w-]{16,}"),
+    re.compile(r"[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){1,8}"),
+)
+
+
+def sanitize_public_upstream_error_message(message: JsonValue) -> str:
+    """Bound and scrub upstream error text before a client receives it.
+
+    Upstream error text is untrusted: it can echo request values or carry
+    credential-shaped tokens and account addresses. Control characters become
+    spaces, those tokens are redacted, and the text is bounded.
+    """
+    text = message if isinstance(message, str) else ""
+    if len(text) > _PUBLIC_UPSTREAM_ERROR_SCAN_MAX_CHARS:
+        # Cut at whitespace so no token is left half inside the scanned text.
+        text = text[:_PUBLIC_UPSTREAM_ERROR_SCAN_MAX_CHARS].rsplit(None, 1)[0]
+    text = _PUBLIC_UPSTREAM_ERROR_CONTROL_CHARACTERS.sub(" ", text).strip()
+    for pattern in _PUBLIC_UPSTREAM_ERROR_REDACTIONS:
+        text = pattern.sub("[redacted]", text)
+    if len(text) > PUBLIC_UPSTREAM_ERROR_MESSAGE_MAX_CHARS:
+        keep = PUBLIC_UPSTREAM_ERROR_MESSAGE_MAX_CHARS - len(_PUBLIC_UPSTREAM_ERROR_TRUNCATION_SUFFIX)
+        text = text[:keep].rstrip() + _PUBLIC_UPSTREAM_ERROR_TRUNCATION_SUFFIX
+    return text or "Upstream rejected the request"
 
 
 def is_previous_response_not_found_error(
