@@ -18439,7 +18439,7 @@ async def test_backend_responses_http_bridge_fails_a_self_excluded_hard_owner_re
     assert response.status_code == 400
     error = json.loads(body)["error"]
     assert error["code"] == "invalid_request_error"
-    assert error["message"] == (f"The '{model}' model is not supported when using Codex with a ChatGPT account.")
+    assert error["message"] == _UNSUPPORTED_MODEL_REJECTION
 
 
 class _AcceptedOutputItemCapacityErrorUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
@@ -18997,6 +18997,15 @@ _FALLBACK_REJECTION = (
     "change the request or continue in a new conversation."
 )
 _PRIVATE_MARKER = "SYNTHETIC_PRIVATE_REQUEST_BODY"
+_UNSUPPORTED_MODEL_REJECTION = (
+    "The requested model is not supported when using Codex with a ChatGPT account. "
+    "Retrying the same request fails the same way; choose a different model."
+)
+# Locally built credential shapes that are also a well-formed field path, model
+# slug and snake-case code: well-formed is not proof a value is public.
+_SYNTHETIC_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJTWU5USEVUSUNfUFJJVkFURSJ9.SYNTHETIC_SIGNATURE"
+_SYNTHETIC_SK_KEY = "sk-SYNTHETICPRIVATE" + "A" * 20
+_SYNTHETIC_HEX_TOKEN = "deadbeef" * 4
 
 
 class _RejectsRequestUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
@@ -19394,6 +19403,54 @@ _HOSTILE_REJECTIONS = [
         None,
         id="stale_anchor_prefix_plus_body",
     ),
+    pytest.param(
+        _rejection_frame({"type": "invalid_request_error", "message": "Unknown rejection", "param": _SYNTHETIC_JWT}),
+        "invalid_request_error",
+        _FALLBACK_REJECTION,
+        None,
+        id="credential_shaped_param",
+    ),
+    pytest.param(
+        _rejection_frame(
+            {
+                "type": "invalid_request_error",
+                "message": f"The '{_SYNTHETIC_SK_KEY}' model is not supported when using Codex with a ChatGPT account.",
+                "param": "model",
+            }
+        ),
+        "invalid_request_error",
+        _UNSUPPORTED_MODEL_REJECTION,
+        "model",
+        id="credential_shaped_model",
+    ),
+    pytest.param(
+        _rejection_frame(
+            {
+                "type": "invalid_request_error",
+                "code": _SYNTHETIC_HEX_TOKEN,
+                "message": "Unknown rejection",
+                "param": _SYNTHETIC_HEX_TOKEN,
+            }
+        ),
+        "invalid_request_error",
+        _FALLBACK_REJECTION,
+        None,
+        id="credential_shaped_code_and_param",
+    ),
+    pytest.param(
+        _rejection_frame(
+            {
+                "type": "invalid_request_error",
+                "code": "unsupported_value",
+                "message": "The 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT account.",
+                "param": "model",
+            }
+        ),
+        "unsupported_value",
+        _UNSUPPORTED_MODEL_REJECTION,
+        "model",
+        id="public_model",
+    ),
 ]
 
 
@@ -19470,9 +19527,10 @@ async def test_native_codex_http_bridge_rebuilds_upstream_rejection_from_validat
     committed_first,
 ):
     """Upstream error text and metadata are untrusted: they can echo request
-    bodies or secrets. The client gets a fixed ``type``, a validated ``code``
-    and ``param``, and a message restated from a recognized diagnostic's
-    validated numbers or a fixed instruction, never upstream's own text."""
+    bodies or secrets, and a well-formed value is not proof it is public. The
+    client gets a fixed ``type``, a documented ``code``, a ``param`` built from
+    request field names, and a message restated from a recognized diagnostic's
+    validated numbers or fixed text, never upstream's own text."""
     _install_bridge_settings(monkeypatch, enabled=True)
 
     error, body = await _native_rejection_error(
@@ -19485,6 +19543,8 @@ async def test_native_codex_http_bridge_rebuilds_upstream_rejection_from_validat
     )
 
     assert _PRIVATE_MARKER not in body, "upstream text or metadata reached the client"
+    for credential_shape in (_SYNTHETIC_JWT, _SYNTHETIC_SK_KEY, _SYNTHETIC_HEX_TOKEN):
+        assert credential_shape not in body, "an unvetted upstream value reached the client"
     assert error["type"] == "invalid_request_error"
     assert error["code"] == code
     assert error["message"] == message

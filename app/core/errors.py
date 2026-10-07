@@ -262,22 +262,110 @@ def sanitize_public_error_detail(error: Mapping[str, JsonValue]) -> dict[str, Js
 
 # An upstream request rejection reaches the client rebuilt from validated parts:
 # upstream text is never copied, because it can echo request bodies, secrets
-# or account data. Recognition reads at most this many leading characters.
+# or account data. A well-formed identifier is not proof a value is public, so
+# delivered text is drawn only from the fixed vocabularies below and from
+# integers re-rendered from a recognized diagnostic. Recognition reads at most
+# this many leading characters.
 PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS: Final[int] = 512
-_PUBLIC_ERROR_CODE_MAX_CHARS: Final[int] = 64
 _PUBLIC_ERROR_PARAM_MAX_CHARS: Final[int] = 128
-_PUBLIC_ERROR_CODE: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
-_PUBLIC_ERROR_PARAM: Final = re.compile(
-    r"[A-Za-z_][A-Za-z0-9_]{0,63}(?:\[[0-9]{1,7}\])*(?:\.[A-Za-z_][A-Za-z0-9_]{0,63}(?:\[[0-9]{1,7}\])*){0,7}"
+_PUBLIC_ERROR_PARAM_MAX_SEGMENTS: Final[int] = 8
+# Public request rejection codes of the Responses API.
+_PUBLIC_REQUEST_ERROR_CODES: Final = frozenset(
+    {
+        "array_above_max_length",
+        "array_below_min_length",
+        "context_length_exceeded",
+        "decimal_above_max_value",
+        "decimal_below_min_value",
+        "empty_array",
+        "integer_above_max_value",
+        "integer_below_min_value",
+        "invalid_encrypted_content",
+        "invalid_prompt",
+        "invalid_request_error",
+        "invalid_type",
+        "invalid_value",
+        "misalignment_policy_violation",
+        "missing_required_parameter",
+        "model_not_found",
+        "string_above_max_length",
+        "string_below_min_length",
+        "unknown_parameter",
+        "unsupported_parameter",
+        "unsupported_value",
+    }
 )
+# Field names of the Responses request schema; a ``param`` path is delivered
+# only when every segment names one of them.
+_PUBLIC_REQUEST_FIELDS: Final = frozenset(
+    {
+        "action",
+        "annotations",
+        "arguments",
+        "background",
+        "call_id",
+        "content",
+        "conversation",
+        "description",
+        "detail",
+        "effort",
+        "encrypted_content",
+        "file_data",
+        "file_id",
+        "file_url",
+        "filename",
+        "format",
+        "function",
+        "id",
+        "image_url",
+        "include",
+        "input",
+        "instructions",
+        "max_output_tokens",
+        "max_tool_calls",
+        "metadata",
+        "model",
+        "name",
+        "output",
+        "parallel_tool_calls",
+        "parameters",
+        "previous_response_id",
+        "prompt",
+        "prompt_cache_key",
+        "reasoning",
+        "role",
+        "safety_identifier",
+        "schema",
+        "service_tier",
+        "status",
+        "store",
+        "stream",
+        "strict",
+        "summary",
+        "temperature",
+        "text",
+        "tool_choice",
+        "tools",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "type",
+        "user",
+        "verbosity",
+    }
+)
+_PUBLIC_ERROR_PARAM_SEGMENT: Final = re.compile(r"(?P<field>[a-z_]{1,32})(?:\[[0-9]{1,7}\])?")
 _ARGUMENTS_TOO_LONG_DIAGNOSTIC: Final = re.compile(
     r"Invalid 'input\[(?P<index>[0-9]{1,7})\]\.arguments': string too long\. "
     r"Expected a string with maximum length (?P<maximum>[0-9]{1,10}), "
     r"but got a string with length (?P<actual>[0-9]{1,13}) instead\."
 )
 _MODEL_UNSUPPORTED_DIAGNOSTIC: Final = re.compile(
-    r"The '(?P<model>[A-Za-z0-9][A-Za-z0-9._:-]{0,63})' model is not supported "
-    r"when using Codex with a ChatGPT account\."
+    r"The '[A-Za-z0-9][A-Za-z0-9._:-]{0,63}' model is not supported when using Codex with a ChatGPT account\."
+)
+_PUBLIC_UNSUPPORTED_MODEL_MESSAGE: Final[str] = (
+    "The requested model is not supported when using Codex with a ChatGPT account. "
+    "Retrying the same request fails the same way; choose a different model."
 )
 
 
@@ -287,17 +375,30 @@ class PublicRequestRejection(NamedTuple):
     param: str | None
 
 
+def _public_request_param(param: JsonValue) -> str | None:
+    if not isinstance(param, str) or len(param) > _PUBLIC_ERROR_PARAM_MAX_CHARS:
+        return None
+    segments = param.split(".", _PUBLIC_ERROR_PARAM_MAX_SEGMENTS)
+    if len(segments) > _PUBLIC_ERROR_PARAM_MAX_SEGMENTS:
+        return None
+    for segment in segments:
+        match = _PUBLIC_ERROR_PARAM_SEGMENT.fullmatch(segment)
+        if match is None or match["field"] not in _PUBLIC_REQUEST_FIELDS:
+            return None
+    return param
+
+
 def public_request_rejection(*, code: JsonValue, message: JsonValue, param: JsonValue) -> PublicRequestRejection:
     """Rebuild an upstream request rejection from validated parts only.
 
-    A recognized diagnostic is restated from its validated numbers or model
-    slug; any other message becomes a fixed instruction. ``code`` must be a short
-    snake-case identifier and ``param`` a bounded field path, or they are
-    replaced or dropped.
+    The arguments-length diagnostic is restated from its re-rendered numbers and
+    the unsupported-model diagnostic as fixed text; any other message becomes a
+    fixed instruction. ``code`` is kept only when it is a listed public request
+    rejection code, and ``param`` only when it is a bounded path of listed
+    Responses request field names and indices; otherwise they are replaced or
+    dropped.
     """
-    public_param = None
-    if isinstance(param, str) and len(param) <= _PUBLIC_ERROR_PARAM_MAX_CHARS and _PUBLIC_ERROR_PARAM.fullmatch(param):
-        public_param = param
+    public_param = _public_request_param(param)
     text = message[:PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS] if isinstance(message, str) else ""
     arguments = _ARGUMENTS_TOO_LONG_DIAGNOSTIC.search(text)
     if arguments is not None and 0 < int(arguments["maximum"]) < int(arguments["actual"]):
@@ -309,18 +410,9 @@ def public_request_rejection(*, code: JsonValue, message: JsonValue, param: Json
             "Upstream rejects this history item on every request; continue in a new conversation without it.",
             f"input[{index}].arguments",
         )
-    public_code = (
-        code
-        if isinstance(code, str) and len(code) <= _PUBLIC_ERROR_CODE_MAX_CHARS and _PUBLIC_ERROR_CODE.fullmatch(code)
-        else "invalid_request_error"
-    )
-    model = _MODEL_UNSUPPORTED_DIAGNOSTIC.search(text)
-    if model is not None:
-        return PublicRequestRejection(
-            public_code,
-            f"The '{model['model']}' model is not supported when using Codex with a ChatGPT account.",
-            public_param,
-        )
+    public_code = code if isinstance(code, str) and code in _PUBLIC_REQUEST_ERROR_CODES else "invalid_request_error"
+    if _MODEL_UNSUPPORTED_DIAGNOSTIC.search(text) is not None:
+        return PublicRequestRejection(public_code, _PUBLIC_UNSUPPORTED_MODEL_MESSAGE, public_param)
     location = f" at '{public_param}'" if public_param is not None else ""
     return PublicRequestRejection(
         public_code,

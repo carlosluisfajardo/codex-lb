@@ -231,6 +231,12 @@ _FALLBACK = (
     "change the request or continue in a new conversation."
 )
 _MARKER = "SYNTHETIC_PRIVATE_REQUEST_BODY"
+_UNSUPPORTED_MODEL = (
+    "The requested model is not supported when using Codex with a ChatGPT account. "
+    "Retrying the same request fails the same way; choose a different model."
+)
+# A dotted base64url credential shape that is also a well-formed field path.
+_SYNTHETIC_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJTWU5USEVUSUNfUFJJVkFURSJ9.SYNTHETIC_SIGNATURE"
 
 
 @pytest.mark.parametrize(
@@ -287,8 +293,13 @@ def test_public_request_rejection_uses_the_fixed_instruction_for_anything_else(m
         ("context_length_exceeded", "input[1].content[0].text", "context_length_exceeded", "input[1].content[0].text"),
         (_MARKER, _MARKER + " x", "invalid_request_error", None),
         ("a" * 65, "p" * 129, "invalid_request_error", None),
-        ("ok_code", "input[1].arguments'; DROP", "ok_code", None),
+        ("invalid_value", "tools[0].function.parameters", "invalid_value", "tools[0].function.parameters"),
+        ("ok_code", "input[1].arguments'; DROP", "invalid_request_error", None),
         ("Bearer abc", "input[12345678].arguments", "invalid_request_error", None),
+        ("deadbeef" * 5, _SYNTHETIC_JWT, "invalid_request_error", None),
+        ("deadbeef" * 4, "deadbeef" * 4, "invalid_request_error", None),
+        ("invalid_value", "input[1].secret_field", "invalid_value", None),
+        ("invalid_value", ".".join(["input"] * 9), "invalid_value", None),
         (None, None, "invalid_request_error", None),
         (7, ["input"], "invalid_request_error", None),
     ],
@@ -300,13 +311,14 @@ def test_public_request_rejection_keeps_only_validated_bounded_metadata(code, pa
     assert rejection == (expected_code, _FALLBACK.format(location=location), expected_param)
 
 
-def test_public_request_rejection_restates_a_recognized_unsupported_model():
-    message = "The 'gpt-5.3-codex-spark' model is not supported when using Codex with a ChatGPT account."
+@pytest.mark.parametrize("model", ["gpt-5.3-codex-spark", "sk-SYNTHETICPRIVATE" + "A" * 20])
+def test_public_request_rejection_states_a_recognized_unsupported_model_as_fixed_text(model: str):
+    message = f"The '{model}' model is not supported when using Codex with a ChatGPT account. {_MARKER}"
 
-    assert public_request_rejection(code="invalid_request_error", message=f"{message} {_MARKER}", param=None) == (
+    assert public_request_rejection(code="invalid_request_error", message=message, param="model") == (
         "invalid_request_error",
-        message,
-        None,
+        _UNSUPPORTED_MODEL,
+        "model",
     )
     assert public_request_rejection(
         code="invalid_request_error",

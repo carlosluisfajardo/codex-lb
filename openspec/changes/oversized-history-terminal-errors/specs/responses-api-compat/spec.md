@@ -104,14 +104,18 @@ rejection MUST reach the client in a form the client treats as terminal:
 
 The delivered error MUST be rebuilt from validated parts and MUST NOT copy
 upstream text, because upstream error text and metadata can echo request
-bodies, secrets, or account data:
+bodies, secrets, or account data. A well-formed identifier, field path or model
+slug is not proof that a value is public, so delivered text MUST come only from
+fixed vocabularies and from integers re-rendered from a recognized diagnostic:
 
 - `type` MUST be `invalid_request_error`.
-- `code` MUST be upstream's code only when it is a lowercase snake-case
-  identifier of at most 64 characters, and `invalid_request_error` otherwise.
-- `param` MUST be upstream's param only when it is a field path of at most 128
-  characters, made of identifiers, `[<index>]` and `.`, and MUST be omitted
+- `code` MUST be upstream's code only when it is one of the public Responses
+  request rejection codes the proxy lists, and `invalid_request_error`
   otherwise.
+- `param` MUST be upstream's param only when it is a path of at most 128
+  characters and 8 dot-separated segments, where every segment is a Responses
+  request field name the proxy lists, optionally followed by one `[<index>]` of
+  at most 7 digits. It MUST be omitted otherwise.
 - The message MUST restate a recognized diagnostic from its validated values,
   and otherwise MUST be a fixed instruction that names the validated `param`
   and says that retrying the same request fails the same way. Two diagnostics
@@ -122,7 +126,10 @@ bodies, secrets, or account data:
     `string_above_max_length`, param `input[<index>].arguments`, the three
     validated numbers, and an instruction to continue in a new conversation
     without the item.
-  - The unsupported-model diagnostic, with a validated model slug.
+  - The unsupported-model diagnostic. It MUST be delivered as fixed text that
+    says the requested model is not supported when using Codex with a ChatGPT
+    account and that a different model is needed; upstream's model slug MUST
+    NOT be copied.
 - Recognition MUST read at most the first 512 characters of the upstream
   message. No regular expression on this delivery path may scan more, and text
   outside a recognized diagnostic, before or after it, MUST be discarded.
@@ -166,8 +173,9 @@ keep raw passthrough.
 #### Scenario: Untrusted upstream rejection text and metadata are never copied
 
 - **GIVEN** an upstream rejection with oversized or arbitrary `type`, `code`, or `param`, or whose message is arbitrary text, a body appended to a recognized diagnostic, a diagnostic with invalid numbers or field, a long blank string, or a long token
+- **OR** a credential-shaped value that is also a well-formed field path, snake-case code, or model slug in an unsupported-model diagnostic
 - **WHEN** the rejection is delivered to a native client before or after commit
-- **THEN** the client receives type `invalid_request_error`, the validated or default code, the validated param or none, and either the restated diagnostic or the fixed instruction
+- **THEN** the client receives type `invalid_request_error`, a listed or the default code, a param built from listed field names or none, and either the restated diagnostic, the fixed unsupported-model text, or the fixed instruction
 - **AND** no upstream text reaches the client
 
 #### Scenario: A truncated prefix never exempts a stale-anchor lookalike

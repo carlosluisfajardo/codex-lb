@@ -41,9 +41,11 @@ could not help while the item stayed in the history.
   - Other error frames keep raw passthrough.
   - The delivered error never copies upstream text or metadata:
     - `type` is fixed;
-    - `code` and `param` are validated and bounded, or replaced or dropped;
-    - the message restates a recognized diagnostic from validated values, or is
-      a fixed instruction;
+    - `code` and `param` are kept only from listed request rejection codes and
+      Responses request field names, or replaced or dropped;
+    - the message restates the argument-length diagnostic from re-rendered
+      numbers, states an unsupported model as fixed text, or is a fixed
+      instruction;
     - recognition reads at most 512 characters of the raw message.
 - Settlement is unchanged and is now pinned by tests for the rejection that is
   finally delivered: one error request-log row, the API-key reservation

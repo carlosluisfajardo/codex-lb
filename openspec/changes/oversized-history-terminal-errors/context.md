@@ -109,13 +109,24 @@ visible.
 
 Upstream error text and metadata are never copied to the client.
 `public_request_rejection` (`app/core/errors.py`) rebuilds the error from
-validated parts only:
+validated parts only. A well-formed value is not proof it is public: an
+earlier revision kept any snake-case code, any identifier path and any model
+slug, so a dotted JWT passed as `param` and an `sk-` key shape in the model
+diagnostic reached the client. Delivered text now comes only from fixed
+vocabularies and re-rendered integers:
 
 - `type` is always `invalid_request_error`.
-- `code` is kept only as a lowercase snake-case identifier of at most 64
-  characters, and is otherwise `invalid_request_error`.
-- `param` is kept only as a field path of at most 128 characters
-  (identifiers, `[<index>]`, `.`), and is otherwise dropped.
+- `code` is kept only when it is one of the public Responses request
+  rejection codes listed in `_PUBLIC_REQUEST_ERROR_CODES`, and is otherwise
+  `invalid_request_error`.
+- `param` is kept only when it is at most 128 characters and 8 segments, and
+  every segment is a Responses request field name listed in
+  `_PUBLIC_REQUEST_FIELDS`, optionally indexed once with `[<index>]`; it is
+  otherwise dropped.
+
+This bounds what the proxy itself copies. It is not a claim that an
+unrecognized value is free of secrets: the vocabularies are what make the
+delivered text known.
 
 The message is built in one of three ways:
 
@@ -124,7 +135,9 @@ The message is built in one of three ways:
   positive and below the actual length. It is delivered as
   `string_above_max_length` with param `input[<index>].arguments`.
 - The unsupported-model diagnostic, which the model-fallback replay surfaces,
-  is restated with its validated slug.
+  becomes fixed text: "The requested model is not supported when using Codex
+  with a ChatGPT account. Retrying the same request fails the same way; choose
+  a different model." Upstream's slug is not copied.
 - Anything else, including an appended body, invalid numbers, a blank string or
   a long token, gets a fixed instruction naming the validated param:
   "Upstream rejected the request as invalid at '<param>'. Retrying the same
