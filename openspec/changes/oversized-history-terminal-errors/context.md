@@ -134,8 +134,12 @@ The message is built in one of three ways:
 Bounds on this path:
 
 - Recognition reads at most the first 512 characters of the raw message, and
-  the stale-anchor classifier receives the same bounded prefix. No regex on
-  this path scans more.
+  no regex on this path scans more.
+- The stale-anchor exemption is decided from the error code, or from the whole
+  message when it fits in those 512 characters. A longer message is never
+  exempted because of its prefix: an earlier revision did that, so a
+  stale-anchor phrase followed by an arbitrary body passed through raw. Such a
+  message is now delivered as a rebuilt rejection.
 - Nothing from the raw text is copied, so a cut token, a blank string or a
   missing whitespace break can only fail recognition and fall back to the fixed
   instruction.

@@ -2415,6 +2415,16 @@ async def test_normalize_public_responses_stream_ends_native_request_rejection_w
                 "param": "previous_response_id",
             },
         },
+        {
+            "type": "error",
+            "status": 400,
+            "error": {"type": "invalid_request_error", "message": "Invalid previous_response_id"},
+        },
+        {
+            "type": "error",
+            "status": 400,
+            "error": {"type": "invalid_request_error", "message": "Previous response with id 'resp_1' not found."},
+        },
     ],
 )
 @pytest.mark.asyncio

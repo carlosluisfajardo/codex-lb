@@ -19385,6 +19385,15 @@ _HOSTILE_REJECTIONS = [
     pytest.param(
         _rejection_frame([_PRIVATE_MARKER]), "invalid_request_error", _FALLBACK_REJECTION, None, id="unknown_shape"
     ),
+    pytest.param(
+        _rejection_frame(
+            {"type": "invalid_request_error", "message": "Invalid previous_response_id" + " " * 512 + _PRIVATE_MARKER}
+        ),
+        "invalid_request_error",
+        _FALLBACK_REJECTION,
+        None,
+        id="stale_anchor_prefix_plus_body",
+    ),
 ]
 
 

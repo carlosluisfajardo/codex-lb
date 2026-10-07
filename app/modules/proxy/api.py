@@ -8415,10 +8415,18 @@ def _native_request_rejection(payload: dict[str, JsonValue]) -> _NativeRequestRe
         return None
     raw_code = detail.get("code")
     raw_message = detail.get("message")
+    # A stale-anchor denial is recognized from a whole message within the scan
+    # bound only: a longer message is never exempted on the strength of its
+    # prefix, so it is delivered as a rebuilt rejection instead of raw.
+    whole_message = (
+        raw_message
+        if isinstance(raw_message, str) and len(raw_message) <= PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS
+        else None
+    )
     if is_previous_response_not_found_public_shape(
         code=raw_code.strip() if isinstance(raw_code, str) and raw_code.strip() else error_type,
         param=OpenAIErrorParam.from_mapping(detail),
-        message=raw_message[:PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS] if isinstance(raw_message, str) else None,
+        message=whole_message,
     ):
         return None
     public = public_request_rejection(code=raw_code, message=raw_message, param=detail.get("param"))

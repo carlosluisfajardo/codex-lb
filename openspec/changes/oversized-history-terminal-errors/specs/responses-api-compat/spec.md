@@ -89,8 +89,11 @@ A request rejection is an upstream `error` event, including a typeless frame
 whose `error` is an object. It either carries status `400` (in `status` or
 `status_code`), or has no numeric status and an error type of
 `invalid_request_error`. A `previous_response_not_found` denial is not a
-request rejection here; it keeps its own contract. A request rejection MUST
-reach the client in a form the client treats as terminal:
+request rejection here; it keeps its own contract. That exemption MUST be
+established from the error code, or from the whole message when the message is
+at most 512 characters long. A longer message MUST NOT be exempted on the
+strength of its prefix; it is delivered as a request rejection. A request
+rejection MUST reach the client in a form the client treats as terminal:
 
 - On the HTTP bridge, when the rejection arrives before the downstream response
   commits, the client MUST receive HTTP `400` with the error envelope in the
@@ -166,6 +169,14 @@ keep raw passthrough.
 - **WHEN** the rejection is delivered to a native client before or after commit
 - **THEN** the client receives type `invalid_request_error`, the validated or default code, the validated param or none, and either the restated diagnostic or the fixed instruction
 - **AND** no upstream text reaches the client
+
+#### Scenario: A truncated prefix never exempts a stale-anchor lookalike
+
+- **GIVEN** an upstream rejection with status `400`, no code or param, and a message that starts with a stale-anchor phrase followed by more text past the 512-character bound
+- **WHEN** the rejection is delivered to a native client before or after commit
+- **THEN** the client receives the rebuilt rejection with the fixed instruction
+- **AND** no raw frame or upstream text reaches the client
+- **AND** a whole short stale-anchor message, or a `previous_response_not_found` code, keeps its own contract
 
 #### Scenario: Recognition reads a bounded prefix
 
