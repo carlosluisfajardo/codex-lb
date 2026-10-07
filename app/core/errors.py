@@ -269,12 +269,15 @@ def sanitize_public_error_detail(error: Mapping[str, JsonValue]) -> dict[str, Js
 PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS: Final[int] = 512
 _PUBLIC_ERROR_PARAM_MAX_CHARS: Final[int] = 128
 _PUBLIC_ERROR_PARAM_MAX_SEGMENTS: Final[int] = 8
-# Public request rejection codes of the Responses API.
+# Public request rejection codes of the Responses API, including the policy
+# codes the Codex client classifies on their own.
 _PUBLIC_REQUEST_ERROR_CODES: Final = frozenset(
     {
         "array_above_max_length",
         "array_below_min_length",
+        "bio_policy",
         "context_length_exceeded",
+        "cyber_policy",
         "decimal_above_max_value",
         "decimal_below_min_value",
         "empty_array",

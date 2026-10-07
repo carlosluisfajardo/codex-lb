@@ -290,6 +290,8 @@ def test_public_request_rejection_uses_the_fixed_instruction_for_anything_else(m
     ("code", "param", "expected_code", "expected_param"),
     [
         ("unsupported_value", "parallel_tool_calls", "unsupported_value", "parallel_tool_calls"),
+        ("cyber_policy", None, "cyber_policy", None),
+        ("bio_policy", None, "bio_policy", None),
         ("context_length_exceeded", "input[1].content[0].text", "context_length_exceeded", "input[1].content[0].text"),
         (_MARKER, _MARKER + " x", "invalid_request_error", None),
         ("a" * 65, "p" * 129, "invalid_request_error", None),

@@ -19451,6 +19451,24 @@ _HOSTILE_REJECTIONS = [
         "model",
         id="public_model",
     ),
+    pytest.param(
+        _rejection_frame(
+            {"type": "invalid_request_error", "code": "cyber_policy", "message": f"Flagged: {_PRIVATE_MARKER}"}
+        ),
+        "cyber_policy",
+        _FALLBACK_REJECTION,
+        None,
+        id="public_cyber_policy_code",
+    ),
+    pytest.param(
+        _rejection_frame(
+            {"type": "invalid_request_error", "code": "bio_policy", "message": f"Flagged: {_PRIVATE_MARKER}"}
+        ),
+        "bio_policy",
+        _FALLBACK_REJECTION,
+        None,
+        id="public_bio_policy_code",
+    ),
 ]
 
 

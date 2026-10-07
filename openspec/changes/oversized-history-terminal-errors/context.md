@@ -118,7 +118,11 @@ vocabularies and re-rendered integers:
 - `type` is always `invalid_request_error`.
 - `code` is kept only when it is one of the public Responses request
   rejection codes listed in `_PUBLIC_REQUEST_ERROR_CODES`, and is otherwise
-  `invalid_request_error`.
+  `invalid_request_error`. The list includes the codes the Codex client
+  classifies on their own (`context_length_exceeded`, `invalid_prompt`,
+  `cyber_policy`, `bio_policy`, `misalignment_policy_violation`): on
+  `response.failed` it treats an unknown code as retryable, so rewriting one of
+  them would lose the client's classification.
 - `param` is kept only when it is at most 128 characters and 8 segments, and
   every segment is a Responses request field name listed in
   `_PUBLIC_REQUEST_FIELDS`, optionally indexed once with `[<index>]`; it is

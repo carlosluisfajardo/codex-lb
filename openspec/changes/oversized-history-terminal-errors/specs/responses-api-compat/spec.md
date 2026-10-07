@@ -178,6 +178,13 @@ keep raw passthrough.
 - **THEN** the client receives type `invalid_request_error`, a listed or the default code, a param built from listed field names or none, and either the restated diagnostic, the fixed unsupported-model text, or the fixed instruction
 - **AND** no upstream text reaches the client
 
+#### Scenario: Known public rejection codes keep their classification
+
+- **GIVEN** an upstream rejection with a listed public code such as `cyber_policy` or `bio_policy` and arbitrary message text
+- **WHEN** the rejection is delivered to a native client before or after commit
+- **THEN** the client receives that code with the fixed instruction
+- **AND** no upstream text reaches the client
+
 #### Scenario: A truncated prefix never exempts a stale-anchor lookalike
 
 - **GIVEN** an upstream rejection with status `400`, no code or param, and a message that starts with a stale-anchor phrase followed by more text past the 512-character bound
