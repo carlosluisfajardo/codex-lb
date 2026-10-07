@@ -4414,10 +4414,13 @@ async def test_backend_responses_native_client_receives_upstream_request_rejecti
     events = [json.loads(line[6:]) for line in lines[:-1]]
     assert [event["type"] for event in events] == ["response.failed"]
     error = events[0]["response"]["error"]
+    # A partial diagnostic is not recognized, so the client gets the fixed
+    # instruction rather than upstream's text.
     assert (error["type"], error["code"], error["message"], error["param"]) == (
         "invalid_request_error",
         "invalid_request_error",
-        message,
+        "Upstream rejected the request as invalid at 'input[1].arguments'. Retrying the same request fails "
+        "the same way; change the request or continue in a new conversation.",
         "input[1].arguments",
     )
     await app_instance.state.proxy_service.drain_persistence_tasks(timeout_seconds=5)

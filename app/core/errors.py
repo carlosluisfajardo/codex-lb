@@ -4,9 +4,8 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Final, Literal, NotRequired, TypedDict
+from typing import Final, Literal, NamedTuple, NotRequired, TypedDict
 
-from app.core.runtime_logging import redact_rendered_log_text
 from app.core.types import JsonValue
 
 
@@ -261,46 +260,74 @@ def sanitize_public_error_detail(error: Mapping[str, JsonValue]) -> dict[str, Js
     return normalized
 
 
-PUBLIC_UPSTREAM_ERROR_MESSAGE_MAX_CHARS: Final[int] = 1_000
-# Redaction scans at most this much text, so its cost stays bounded however
-# large an upstream message is.
-_PUBLIC_UPSTREAM_ERROR_SCAN_MAX_CHARS: Final[int] = 4 * PUBLIC_UPSTREAM_ERROR_MESSAGE_MAX_CHARS
-_PUBLIC_UPSTREAM_ERROR_TRUNCATION_SUFFIX: Final = " [truncated]"
-_PUBLIC_UPSTREAM_ERROR_CONTROL_CHARACTERS: Final = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
-# Shapes the log redactor does not cover, including percent-encoded ones. The
-# letter-only lookbehinds still match a token glued to a digit, underscore or
-# escape (``x_sk-...``); a JWT is recognized by its shape alone.
-_PUBLIC_UPSTREAM_ERROR_REDACTIONS: Final = (
-    re.compile(r"(?i)(?<![a-z])bearer(?:\s+|%20|\+)[^\s,;&'\"]+"),
-    re.compile(r"(?i)(?<![a-z])(?:password|passwd|pwd|token|secret|api[_-]?key)%3D[^\s,;&'\"]+"),
-    re.compile(r"eyJ[\w-]{6,4096}\.[\w-]{6,4096}\.[\w-]*"),
-    re.compile(r"(?<![A-Za-z])(?:sk|rk|pk|sess)-[\w-]{16,}"),
-    re.compile(r"[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){1,8}"),
+# An upstream request rejection reaches the client rebuilt from validated parts:
+# upstream text is never copied, because it can echo request bodies, secrets
+# or account data. Recognition reads at most this many leading characters.
+PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS: Final[int] = 512
+_PUBLIC_ERROR_CODE_MAX_CHARS: Final[int] = 64
+_PUBLIC_ERROR_PARAM_MAX_CHARS: Final[int] = 128
+_PUBLIC_ERROR_CODE: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_PUBLIC_ERROR_PARAM: Final = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]{0,63}(?:\[[0-9]{1,7}\])*(?:\.[A-Za-z_][A-Za-z0-9_]{0,63}(?:\[[0-9]{1,7}\])*){0,7}"
+)
+_ARGUMENTS_TOO_LONG_DIAGNOSTIC: Final = re.compile(
+    r"Invalid 'input\[(?P<index>[0-9]{1,7})\]\.arguments': string too long\. "
+    r"Expected a string with maximum length (?P<maximum>[0-9]{1,10}), "
+    r"but got a string with length (?P<actual>[0-9]{1,13}) instead\."
+)
+_MODEL_UNSUPPORTED_DIAGNOSTIC: Final = re.compile(
+    r"The '(?P<model>[A-Za-z0-9][A-Za-z0-9._:-]{0,63})' model is not supported "
+    r"when using Codex with a ChatGPT account\."
 )
 
 
-def sanitize_public_upstream_error_message(message: JsonValue) -> str:
-    """Bound and scrub upstream error text before a client receives it.
+class PublicRequestRejection(NamedTuple):
+    code: str
+    message: str
+    param: str | None
 
-    Upstream error text is untrusted: it can echo request values or carry
-    credential-shaped tokens and account addresses. Control characters become
-    spaces, the log redactor's secret shapes plus bearer values, API keys, JWTs
-    and email addresses are redacted, and the text is bounded.
+
+def public_request_rejection(*, code: JsonValue, message: JsonValue, param: JsonValue) -> PublicRequestRejection:
+    """Rebuild an upstream request rejection from validated parts only.
+
+    A recognized diagnostic is restated from its validated numbers or model
+    slug; any other message becomes a fixed instruction. ``code`` must be a short
+    snake-case identifier and ``param`` a bounded field path, or they are
+    replaced or dropped.
     """
-    text = message if isinstance(message, str) else ""
-    text = _PUBLIC_UPSTREAM_ERROR_CONTROL_CHARACTERS.sub(" ", text)
-    if len(text) > _PUBLIC_UPSTREAM_ERROR_SCAN_MAX_CHARS:
-        # Keep whole whitespace-separated tokens only: a token cut in half can
-        # slip past every pattern, so a window without a break keeps nothing.
-        head = text[:_PUBLIC_UPSTREAM_ERROR_SCAN_MAX_CHARS].rsplit(None, 1)
-        text = head[0] if len(head) == 2 else ""
-    text = redact_rendered_log_text(text.strip())
-    for pattern in _PUBLIC_UPSTREAM_ERROR_REDACTIONS:
-        text = pattern.sub("[REDACTED]", text)
-    if len(text) > PUBLIC_UPSTREAM_ERROR_MESSAGE_MAX_CHARS:
-        keep = PUBLIC_UPSTREAM_ERROR_MESSAGE_MAX_CHARS - len(_PUBLIC_UPSTREAM_ERROR_TRUNCATION_SUFFIX)
-        text = text[:keep].rstrip() + _PUBLIC_UPSTREAM_ERROR_TRUNCATION_SUFFIX
-    return text or "Upstream rejected the request"
+    public_param = None
+    if isinstance(param, str) and len(param) <= _PUBLIC_ERROR_PARAM_MAX_CHARS and _PUBLIC_ERROR_PARAM.fullmatch(param):
+        public_param = param
+    text = message[:PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS] if isinstance(message, str) else ""
+    arguments = _ARGUMENTS_TOO_LONG_DIAGNOSTIC.search(text)
+    if arguments is not None and 0 < int(arguments["maximum"]) < int(arguments["actual"]):
+        index = int(arguments["index"])
+        return PublicRequestRejection(
+            "string_above_max_length",
+            f"Invalid 'input[{index}].arguments': string too long. Expected a string with maximum length "
+            f"{int(arguments['maximum'])}, but got a string with length {int(arguments['actual'])} instead. "
+            "Upstream rejects this history item on every request; continue in a new conversation without it.",
+            f"input[{index}].arguments",
+        )
+    public_code = (
+        code
+        if isinstance(code, str) and len(code) <= _PUBLIC_ERROR_CODE_MAX_CHARS and _PUBLIC_ERROR_CODE.fullmatch(code)
+        else "invalid_request_error"
+    )
+    model = _MODEL_UNSUPPORTED_DIAGNOSTIC.search(text)
+    if model is not None:
+        return PublicRequestRejection(
+            public_code,
+            f"The '{model['model']}' model is not supported when using Codex with a ChatGPT account.",
+            public_param,
+        )
+    location = f" at '{public_param}'" if public_param is not None else ""
+    return PublicRequestRejection(
+        public_code,
+        f"Upstream rejected the request as invalid{location}. Retrying the same request fails the same way; "
+        "change the request or continue in a new conversation.",
+        public_param,
+    )
 
 
 def is_previous_response_not_found_error(

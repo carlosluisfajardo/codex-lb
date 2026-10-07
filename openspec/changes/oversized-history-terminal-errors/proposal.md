@@ -39,9 +39,12 @@ could not help while the item stayed in the history.
     HTTP upstream returns.
   - Otherwise it is a terminal `response.failed` followed by `[DONE]`.
   - Other error frames keep raw passthrough.
-  - The delivered message has control characters removed, credential-shaped
-    tokens and addresses redacted (on top of the log redactor's shapes), and
-    its length bounded.
+  - The delivered error never copies upstream text or metadata:
+    - `type` is fixed;
+    - `code` and `param` are validated and bounded, or replaced or dropped;
+    - the message restates a recognized diagnostic from validated values, or is
+      a fixed instruction;
+    - recognition reads at most 512 characters of the raw message.
 - Settlement is unchanged and is now pinned by tests for the rejection that is
   finally delivered: one error request-log row, the API-key reservation
   released, no account-health penalty, and no replay or failover beyond the

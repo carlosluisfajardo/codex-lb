@@ -96,15 +96,33 @@ reach the client in a form the client treats as terminal:
   commits, the client MUST receive HTTP `400` with the error envelope in the
   body.
 - Otherwise the client MUST receive a terminal `response.failed` with the same
-  error type, code, and param, followed by `[DONE]`. That terminal MUST NOT be
-  marked as a synthetic transport failure.
+  error type, code, message, and param, followed by `[DONE]`. That terminal MUST
+  NOT be marked as a synthetic transport failure.
 
-The delivered message MUST be sanitized:
+The delivered error MUST be rebuilt from validated parts and MUST NOT copy
+upstream text, because upstream error text and metadata can echo request
+bodies, secrets, or account data:
 
-- control characters removed;
-- the secret shapes the log redactor masks, plus bearer values, API keys, JWTs
-  and email addresses, redacted;
-- length bounded to 1,000 characters.
+- `type` MUST be `invalid_request_error`.
+- `code` MUST be upstream's code only when it is a lowercase snake-case
+  identifier of at most 64 characters, and `invalid_request_error` otherwise.
+- `param` MUST be upstream's param only when it is a field path of at most 128
+  characters, made of identifiers, `[<index>]` and `.`, and MUST be omitted
+  otherwise.
+- The message MUST restate a recognized diagnostic from its validated values,
+  and otherwise MUST be a fixed instruction that names the validated `param`
+  and says that retrying the same request fails the same way. Two diagnostics
+  are recognized:
+  - The argument-length diagnostic `Invalid 'input[<index>].arguments': string
+    too long. ...`, whose index is a non-negative integer and whose maximum is
+    a positive integer below the actual length. It MUST be delivered with code
+    `string_above_max_length`, param `input[<index>].arguments`, the three
+    validated numbers, and an instruction to continue in a new conversation
+    without the item.
+  - The unsupported-model diagnostic, with a validated model slug.
+- Recognition MUST read at most the first 512 characters of the upstream
+  message. No regular expression on this delivery path may scan more, and text
+  outside a recognized diagnostic, before or after it, MUST be discarded.
 
 The rejection that is finally delivered MUST settle once:
 
@@ -131,7 +149,7 @@ keep raw passthrough.
 
 - **GIVEN** a native Codex HTTP request served through the HTTP bridge
 - **WHEN** upstream answers with `{"type":"error","status":400,"error":{"type":"invalid_request_error",...}}` before the downstream response commits
-- **THEN** the client receives HTTP `400` with that error's type, code, sanitized message, and param
+- **THEN** the client receives HTTP `400` with the error rebuilt from its validated parts
 - **AND** the request is settled once without penalizing the account
 
 #### Scenario: Native request rejection after commit
@@ -142,11 +160,19 @@ keep raw passthrough.
 - **AND** no bare `error` frame is delivered
 - **AND** the request is settled once without penalizing the account
 
-#### Scenario: Untrusted upstream rejection text is sanitized
+#### Scenario: Untrusted upstream rejection text and metadata are never copied
 
-- **GIVEN** an upstream rejection whose message holds control characters, a bearer value, an API key, an email address, or more than 1,000 characters
+- **GIVEN** an upstream rejection with oversized or arbitrary `type`, `code`, or `param`, or whose message is arbitrary text, a body appended to a recognized diagnostic, a diagnostic with invalid numbers or field, a long blank string, or a long token
+- **WHEN** the rejection is delivered to a native client before or after commit
+- **THEN** the client receives type `invalid_request_error`, the validated or default code, the validated param or none, and either the restated diagnostic or the fixed instruction
+- **AND** no upstream text reaches the client
+
+#### Scenario: Recognition reads a bounded prefix
+
+- **GIVEN** an upstream rejection whose message is a recognized diagnostic followed by more than a megabyte of text
 - **WHEN** the rejection is delivered to a native client
-- **THEN** the control characters are removed, the tokens and the address are redacted, and the message has at most 1,000 characters
+- **THEN** no regular expression on the delivery path scans more than 512 characters of it
+- **AND** the client receives the restated diagnostic
 
 ### Requirement: Typeless terminal errors retain settlement and correlation data
 

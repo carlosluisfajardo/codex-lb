@@ -2388,7 +2388,10 @@ async def test_normalize_public_responses_stream_ends_native_request_rejection_w
     response = payload["response"]
     assert isinstance(response, dict)
     assert response["error"] == {
-        "message": _REJECTION_MESSAGE,
+        "message": (
+            "Upstream rejected the request as invalid at 'input[66].arguments'. Retrying the same request "
+            "fails the same way; change the request or continue in a new conversation."
+        ),
         "type": "invalid_request_error",
         "code": "invalid_request_error",
         "param": "input[66].arguments",

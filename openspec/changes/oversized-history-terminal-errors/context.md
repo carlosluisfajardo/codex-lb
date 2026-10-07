@@ -107,20 +107,43 @@ visible.
 
 ### Untrusted upstream text
 
-Before delivery in this path:
+Upstream error text and metadata are never copied to the client.
+`public_request_rejection` (`app/core/errors.py`) rebuilds the error from
+validated parts only:
 
-- Control characters become spaces.
-- Redaction runs in two layers:
-  - the log redactor's secret shapes (keyed values, `Basic`, `Authorization`,
-    URL userinfo);
-  - then bearer values (also behind `%20`/`+`), percent-encoded keyed values,
-    `sk-`/`rk-`/`pk-`/`sess-` keys, JWT-shaped tokens and email addresses.
-- The text is bounded to 1,000 characters.
-- Redaction scans at most a 4,000-character window, cut at whitespace so no
-  token is split. A window with no whitespace keeps nothing, which yields a
-  generic message.
+- `type` is always `invalid_request_error`.
+- `code` is kept only as a lowercase snake-case identifier of at most 64
+  characters, and is otherwise `invalid_request_error`.
+- `param` is kept only as a field path of at most 128 characters
+  (identifiers, `[<index>]`, `.`), and is otherwise dropped.
 
-Request logs keep the upstream text for operators.
+The message is built in one of three ways:
+
+- The argument-length diagnostic is restated from its validated index, maximum
+  and actual length. The index must be non-negative, and the maximum must be
+  positive and below the actual length. It is delivered as
+  `string_above_max_length` with param `input[<index>].arguments`.
+- The unsupported-model diagnostic, which the model-fallback replay surfaces,
+  is restated with its validated slug.
+- Anything else, including an appended body, invalid numbers, a blank string or
+  a long token, gets a fixed instruction naming the validated param:
+  "Upstream rejected the request as invalid at '<param>'. Retrying the same
+  request fails the same way; change the request or continue in a new
+  conversation."
+
+Bounds on this path:
+
+- Recognition reads at most the first 512 characters of the raw message, and
+  the stale-anchor classifier receives the same bounded prefix. No regex on
+  this path scans more.
+- Nothing from the raw text is copied, so a cut token, a blank string or a
+  missing whitespace break can only fail recognition and fall back to the fixed
+  instruction.
+
+An earlier revision pattern-redacted the upstream message. That was replaced
+because redaction cannot establish that an arbitrary body or secret is gone,
+and because it normalized the full raw message before bounding it. Request logs
+keep the upstream text for operators.
 
 ## Example
 

@@ -88,15 +88,16 @@ from app.core.crypto import TokenEncryptor
 from app.core.errors import (
     HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE,
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
+    PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS,
     SYNTHETIC_TRANSPORT_FAILURE_MARKER,
     OpenAIErrorEnvelope,
     OpenAIErrorParam,
     is_previous_response_not_found_public_shape,
     normalize_public_error_param,
     openai_error,
+    public_request_rejection,
     response_failed_event,
     sanitize_public_error_detail,
-    sanitize_public_upstream_error_message,
     synthetic_transport_failure_event,
 )
 from app.core.exceptions import (
@@ -8371,8 +8372,8 @@ def _stream_startup_error_response(
 class _NativeRequestRejection:
     code: str
     message: str
-    error_type: str
     param: str | None
+    error_type: str = "invalid_request_error"
 
     def envelope(self) -> OpenAIErrorEnvelope:
         envelope = openai_error(self.code, self.message, error_type=self.error_type)
@@ -8392,7 +8393,9 @@ def _native_request_rejection(payload: dict[str, JsonValue]) -> _NativeRequestRe
     A wrapped frame with status ``400``, or a status-less frame typed
     ``invalid_request_error``, is the stream form of the HTTP 400 an HTTP
     upstream returns for that request. Other error frames keep their raw
-    shape, and stale-anchor denials keep their own masking contract.
+    shape, and stale-anchor denials keep their own masking contract. The
+    delivered error is rebuilt from validated parts and never copies upstream
+    text.
     """
     if classify_event_type(payload) != "error":
         return None
@@ -8411,21 +8414,15 @@ def _native_request_rejection(payload: dict[str, JsonValue]) -> _NativeRequestRe
     if status != 400 and not (status is None and error_type == "invalid_request_error"):
         return None
     raw_code = detail.get("code")
-    code = raw_code.strip() if isinstance(raw_code, str) and raw_code.strip() else error_type
     raw_message = detail.get("message")
-    param = OpenAIErrorParam.from_mapping(detail)
     if is_previous_response_not_found_public_shape(
-        code=code,
-        param=param,
-        message=raw_message if isinstance(raw_message, str) else None,
+        code=raw_code.strip() if isinstance(raw_code, str) and raw_code.strip() else error_type,
+        param=OpenAIErrorParam.from_mapping(detail),
+        message=raw_message[:PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS] if isinstance(raw_message, str) else None,
     ):
         return None
-    return _NativeRequestRejection(
-        code=code or "invalid_request_error",
-        message=sanitize_public_upstream_error_message(raw_message),
-        error_type=error_type or "invalid_request_error",
-        param=normalize_public_error_param(param),
-    )
+    public = public_request_rejection(code=raw_code, message=raw_message, param=detail.get("param"))
+    return _NativeRequestRejection(code=public.code, message=public.message, param=public.param)
 
 
 def _stream_event_error_envelope(event_block: str) -> OpenAIErrorEnvelopeModel | None:

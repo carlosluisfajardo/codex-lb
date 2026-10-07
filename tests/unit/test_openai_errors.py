@@ -6,13 +6,14 @@ import pytest
 
 from app.core.errors import (
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
+    PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS,
     OpenAIErrorParam,
     is_previous_response_not_found_error,
     is_previous_response_not_found_public_shape,
     previous_response_id_from_not_found_message,
     previous_response_stream_incomplete_error,
+    public_request_rejection,
     response_failed_event,
-    sanitize_public_upstream_error_message,
 )
 
 
@@ -217,77 +218,122 @@ def test_previous_response_stream_incomplete_error_is_public_safe():
     assert payload["error"].get("message") == PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE
 
 
-def test_sanitize_public_upstream_error_message_keeps_ordinary_text_unchanged():
-    message = (
-        "Invalid response.create payload: Invalid 'input[66].arguments': string too long. "
-        "Expected a string with maximum length 1048576, but got a string with length 5098360 instead."
-    )
-
-    assert sanitize_public_upstream_error_message(message) == message
-
-
-def test_sanitize_public_upstream_error_message_scrubs_untrusted_text():
-    sanitized = sanitize_public_upstream_error_message(
-        "bad\x00value\x1b[31m Authorization: Bearer abc.def-ghi for owner@example.com "
-        "key sk-proj-abcdefghijklmnop0123 jwt eyJhbGciOiJI.eyJzdWIiOiIx.c2ln"
-    )
-
-    assert sanitized == "bad value [31m Authorization: [REDACTED] for [REDACTED] key [REDACTED] jwt [REDACTED]"
-
-
-def test_sanitize_public_upstream_error_message_bounds_length_and_defaults_empty_text():
-    bounded = sanitize_public_upstream_error_message("z " * 5_000)
-
-    assert len(bounded) <= 1_000
-    assert bounded.endswith(" [truncated]")
-    assert sanitize_public_upstream_error_message(None) == "Upstream rejected the request"
-    assert sanitize_public_upstream_error_message(" \x00 ") == "Upstream rejected the request"
-
-
-def test_sanitize_public_upstream_error_message_cost_is_bounded_for_huge_untrusted_text():
-    # Unbounded patterns made these inputs quadratic (tens of seconds per message).
-    for hostile in ("eyJ-" * 1_250_000, "a" * 5_000_000, "x@" * 2_500_000):
-        started = time.monotonic()
-        sanitized = sanitize_public_upstream_error_message(hostile)
-        assert time.monotonic() - started < 1.0
-        assert len(sanitized) <= 1_000
-
-
-def test_sanitize_public_upstream_error_message_does_not_leave_a_cut_token_unredacted():
-    sanitized = sanitize_public_upstream_error_message("x " * 1_995 + "sk-proj-abcdefghijklmnop0123 tail")
-
-    assert "sk-proj" not in sanitized
+_ARGUMENTS_DIAGNOSTIC = (
+    "Invalid 'input[66].arguments': string too long. Expected a string with maximum length 1048576, "
+    "but got a string with length 5098360 instead."
+)
+_RESTATED_ARGUMENTS_DIAGNOSTIC = (
+    _ARGUMENTS_DIAGNOSTIC + " Upstream rejects this history item on every request; "
+    "continue in a new conversation without it."
+)
+_FALLBACK = (
+    "Upstream rejected the request as invalid{location}. Retrying the same request fails the same way; "
+    "change the request or continue in a new conversation."
+)
+_MARKER = "SYNTHETIC_PRIVATE_REQUEST_BODY"
 
 
 @pytest.mark.parametrize(
     "message",
     [
-        " " * 4_001,
-        "\n" * 4_001,
-        "\xa0" * 4_001,
-        " " * 4_000 + "x",
-        "sk-" + "a" * 3_985 + ",victim@exam" + "ple.com,tail",
+        _ARGUMENTS_DIAGNOSTIC,
+        "Invalid response.create payload: " + _ARGUMENTS_DIAGNOSTIC,
+        f'{_MARKER} {_ARGUMENTS_DIAGNOSTIC} {_MARKER} {{"password": "{_MARKER}"}}',
     ],
 )
-def test_sanitize_public_upstream_error_message_never_keeps_a_token_the_scan_window_cut(message: str):
-    assert sanitize_public_upstream_error_message(message) == "Upstream rejected the request"
+def test_public_request_rejection_restates_the_arguments_diagnostic_from_validated_numbers(message: str):
+    rejection = public_request_rejection(code=None, message=message, param=_MARKER)
+
+    assert rejection == ("string_above_max_length", _RESTATED_ARGUMENTS_DIAGNOSTIC, "input[66].arguments")
 
 
-def test_sanitize_public_upstream_error_message_redacts_glued_encoded_and_keyed_secrets():
-    sanitized = sanitize_public_upstream_error_message(
-        "Authorization:Bearer%20eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig_x "
-        "x_sk-proj-abcdefghijklmnop0123 access_token%3DeyJhbGciOiJI.eyJzdWIiOiIx.c2ln "
-        "refresh_token%3Dopaque123 api_key=abcdef0123456789secret Basic dXNlcjpwYXNzd29yZA== "
-        "http://user:pw@localhost:8080/ ok"
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Invalid 'input[-1].arguments': string too long. Expected a string with maximum length 1048576, "
+        "but got a string with length 5098360 instead.",
+        "Invalid 'input[66].arguments': string too long. Expected a string with maximum length -7, "
+        "but got a string with length -8 instead.",
+        "Invalid 'input[66].arguments': string too long. Expected a string with maximum length 9, "
+        "but got a string with length 9 instead.",
+        "Invalid 'input[66].arguments': string too long. Expected a string with maximum length 0, "
+        "but got a string with length 9 instead.",
+        "Invalid 'input[\u0666].arguments': string too long. Expected a string with maximum length 1048576, "
+        "but got a string with length 5098360 instead.",
+        "Invalid 'input[66].arguments': string too long. Expected a string with maximum length 1048576, "
+        "but got a string with length 50983",
+        _MARKER,
+        " " * 4_001,
+        "eyJ" + "a" * 5_000 + ".bbbbbbbb.cccccccc",
+        "z" * 4_001,
+        None,
+        {"message": _MARKER},
+    ],
+)
+def test_public_request_rejection_uses_the_fixed_instruction_for_anything_else(message):
+    rejection = public_request_rejection(code="invalid_request_error", message=message, param="input[66].arguments")
+
+    assert rejection == (
+        "invalid_request_error",
+        _FALLBACK.format(location=" at 'input[66].arguments'"),
+        "input[66].arguments",
     )
 
-    assert sanitized == (
-        "Authorization:[REDACTED] x_[REDACTED] access_[REDACTED] refresh_[REDACTED] "
-        "api_key=[REDACTED] Basic [REDACTED] http://[REDACTED]@localhost:8080/ ok"
+
+@pytest.mark.parametrize(
+    ("code", "param", "expected_code", "expected_param"),
+    [
+        ("unsupported_value", "parallel_tool_calls", "unsupported_value", "parallel_tool_calls"),
+        ("context_length_exceeded", "input[1].content[0].text", "context_length_exceeded", "input[1].content[0].text"),
+        (_MARKER, _MARKER + " x", "invalid_request_error", None),
+        ("a" * 65, "p" * 129, "invalid_request_error", None),
+        ("ok_code", "input[1].arguments'; DROP", "ok_code", None),
+        ("Bearer abc", "input[12345678].arguments", "invalid_request_error", None),
+        (None, None, "invalid_request_error", None),
+        (7, ["input"], "invalid_request_error", None),
+    ],
+)
+def test_public_request_rejection_keeps_only_validated_bounded_metadata(code, param, expected_code, expected_param):
+    rejection = public_request_rejection(code=code, message=_MARKER, param=param)
+
+    location = f" at '{expected_param}'" if expected_param is not None else ""
+    assert rejection == (expected_code, _FALLBACK.format(location=location), expected_param)
+
+
+def test_public_request_rejection_restates_a_recognized_unsupported_model():
+    message = "The 'gpt-5.3-codex-spark' model is not supported when using Codex with a ChatGPT account."
+
+    assert public_request_rejection(code="invalid_request_error", message=f"{message} {_MARKER}", param=None) == (
+        "invalid_request_error",
+        message,
+        None,
     )
+    assert public_request_rejection(
+        code="invalid_request_error",
+        message="The 'gpt 5 with spaces' model is not supported when using Codex with a ChatGPT account.",
+        param=None,
+    ) == ("invalid_request_error", _FALLBACK.format(location=""), None)
 
 
-def test_sanitize_public_upstream_error_message_keeps_words_that_resemble_token_prefixes():
-    message = "the risk-assessment task-scheduler for disk-imaging keyJudge says hey"
+def test_public_request_rejection_reads_only_a_bounded_prefix(monkeypatch):
+    import app.core.errors as errors_module
 
-    assert sanitize_public_upstream_error_message(message) == message
+    scanned: list[int] = []
+
+    class _ScanSpy:
+        def __init__(self, pattern):
+            self._pattern = pattern
+
+        def search(self, text):
+            scanned.append(len(text))
+            return self._pattern.search(text)
+
+    for name in ("_ARGUMENTS_TOO_LONG_DIAGNOSTIC", "_MODEL_UNSUPPORTED_DIAGNOSTIC"):
+        monkeypatch.setattr(errors_module, name, _ScanSpy(getattr(errors_module, name)))
+
+    started = time.monotonic()
+    late = public_request_rejection(code=None, message="x" * (1 << 20) + _ARGUMENTS_DIAGNOSTIC, param=None)
+
+    assert time.monotonic() - started < 1.0
+    assert late.code == "invalid_request_error"
+    assert scanned and max(scanned) == PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS

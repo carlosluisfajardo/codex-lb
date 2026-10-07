@@ -18981,16 +18981,39 @@ _INCIDENT_SHAPED_REJECTION_MESSAGE = (
     "Invalid response.create payload: Invalid 'input[1].arguments': string too long. "
     "Expected a string with maximum length 1048576, but got a string with length 1048600 instead."
 )
+# What the client receives for that rejection: restated from its validated
+# numbers, never copied from upstream.
+_RECONSTRUCTED_INCIDENT_MESSAGE = (
+    "Invalid 'input[1].arguments': string too long. Expected a string with maximum length 1048576, "
+    "but got a string with length 1048600 instead. Upstream rejects this history item on every request; "
+    "continue in a new conversation without it."
+)
+_FALLBACK_REJECTION_AT_ARGUMENTS = (
+    "Upstream rejected the request as invalid at 'input[1].arguments'. Retrying the same request fails "
+    "the same way; change the request or continue in a new conversation."
+)
+_FALLBACK_REJECTION = (
+    "Upstream rejected the request as invalid. Retrying the same request fails the same way; "
+    "change the request or continue in a new conversation."
+)
+_PRIVATE_MARKER = "SYNTHETIC_PRIVATE_REQUEST_BODY"
 
 
 class _RejectsRequestUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     """Answer every turn the way upstream answered the oversized-history replay:
     a wrapped ``invalid_request_error`` before any ``response.created``."""
 
-    def __init__(self, message: str, *, release: asyncio.Event | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        release: asyncio.Event | None = None,
+        frame: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__("resp_rejected_request")
         self._message = message
         self._release = release
+        self._frame = frame
         self._held_rejections: list[asyncio.Task[None]] = []
 
     async def send_text(self, text: str) -> None:
@@ -19005,23 +19028,16 @@ class _RejectsRequestUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         await self._reject()
 
     async def _reject(self) -> None:
-        await self._messages.put(
-            _FakeUpstreamMessage(
-                "text",
-                text=json.dumps(
-                    {
-                        "type": "error",
-                        "status": 400,
-                        "error": {
-                            "type": "invalid_request_error",
-                            "message": self._message,
-                            "param": "input[1].arguments",
-                        },
-                    },
-                    separators=(",", ":"),
-                ),
-            )
-        )
+        frame = self._frame or {
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "message": self._message,
+                "param": "input[1].arguments",
+            },
+        }
+        await self._messages.put(_FakeUpstreamMessage("text", text=json.dumps(frame, separators=(",", ":"))))
 
 
 def _history_with_function_call(arguments: str) -> list[dict[str, Any]]:
@@ -19203,8 +19219,8 @@ async def test_native_codex_http_bridge_returns_upstream_invalid_request_error_b
     assert response.status_code == 400, f"native client received {response.status_code}: {response.text!r}"
     error = response.json()["error"]
     assert error["type"] == "invalid_request_error"
-    assert error["code"] == "invalid_request_error"
-    assert error["message"] == _INCIDENT_SHAPED_REJECTION_MESSAGE
+    assert error["code"] == "string_above_max_length"
+    assert error["message"] == _RECONSTRUCTED_INCIDENT_MESSAGE
     assert error["param"] == "input[1].arguments"
     assert len(upstream.sent_text) == 1, "the rejected request was replayed upstream"
     await _assert_rejection_settled_once(app_instance, api_key_id=api_key_id)
@@ -19267,8 +19283,8 @@ async def test_native_codex_http_bridge_ends_committed_stream_with_upstream_inva
     assert [event.get("type") for event in events] == ["response.failed"], body
     error = events[0]["response"]["error"]
     assert error["type"] == "invalid_request_error"
-    assert error["code"] == "invalid_request_error"
-    assert error["message"] == _INCIDENT_SHAPED_REJECTION_MESSAGE
+    assert error["code"] == "string_above_max_length"
+    assert error["message"] == _RECONSTRUCTED_INCIDENT_MESSAGE
     assert error["param"] == "input[1].arguments"
     assert "_codex_lb_synthetic_transport_failure" not in body
     assert body.rstrip().endswith("data: [DONE]")
@@ -19277,22 +19293,135 @@ async def test_native_codex_http_bridge_ends_committed_stream_with_upstream_inva
     assert {name: spy.await_count for name, spy in penalties.items()} == dict.fromkeys(penalties, 0)
 
 
-@pytest.mark.asyncio
-async def test_native_codex_http_bridge_sanitizes_upstream_rejection_text(
+def _rejection_frame(error: Any, *, typed: bool = True) -> dict[str, Any]:
+    frame: dict[str, Any] = {"status": 400, "error": error}
+    if typed:
+        frame["type"] = "error"
+    return frame
+
+
+_HOSTILE_METADATA = {
+    "type": _PRIVATE_MARKER * 600,
+    "code": _PRIVATE_MARKER * 600,
+    "param": _PRIVATE_MARKER * 600,
+    "message": _PRIVATE_MARKER,
+}
+_HOSTILE_REJECTIONS = [
+    pytest.param(
+        _rejection_frame(_HOSTILE_METADATA), "invalid_request_error", _FALLBACK_REJECTION, None, id="metadata"
+    ),
+    pytest.param(
+        _rejection_frame(_HOSTILE_METADATA, typed=False),
+        "invalid_request_error",
+        _FALLBACK_REJECTION,
+        None,
+        id="typeless_metadata",
+    ),
+    pytest.param(
+        _rejection_frame(
+            {
+                "type": "invalid_request_error",
+                "message": f'{_INCIDENT_SHAPED_REJECTION_MESSAGE} {_PRIVATE_MARKER} {{"password":"{_PRIVATE_MARKER}"}}',
+                "param": "input[1].arguments",
+            }
+        ),
+        "string_above_max_length",
+        _RECONSTRUCTED_INCIDENT_MESSAGE,
+        "input[1].arguments",
+        id="recognized_prefix_plus_body",
+    ),
+    pytest.param(
+        _rejection_frame(
+            {
+                "type": "invalid_request_error",
+                "message": (
+                    f"{_PRIVATE_MARKER} Invalid 'input[-1].arguments': string too long. Expected a string with "
+                    "maximum length -7, but got a string with length -8 instead."
+                ),
+                "param": "input[1].arguments",
+            }
+        ),
+        "invalid_request_error",
+        _FALLBACK_REJECTION_AT_ARGUMENTS,
+        "input[1].arguments",
+        id="invalid_numbers",
+    ),
+    pytest.param(
+        _rejection_frame(
+            {
+                "type": "invalid_request_error",
+                "message": (
+                    "Invalid 'input[1].arguments': string too long. Expected a string with maximum length 9, "
+                    "but got a string with length 9 instead."
+                ),
+                "param": f"input[1].arguments {_PRIVATE_MARKER}",
+            }
+        ),
+        "invalid_request_error",
+        _FALLBACK_REJECTION,
+        None,
+        id="limit_not_exceeded_invalid_field",
+    ),
+    pytest.param(
+        _rejection_frame({"type": "invalid_request_error", "message": " " * 4_001, "param": "input[1].arguments"}),
+        "invalid_request_error",
+        _FALLBACK_REJECTION_AT_ARGUMENTS,
+        "input[1].arguments",
+        id="long_blank",
+    ),
+    pytest.param(
+        _rejection_frame(
+            {
+                "type": "invalid_request_error",
+                "message": "eyJ" + _PRIVATE_MARKER * 200 + ".bbbbbbbb.cccccccc",
+                "param": "input[1].arguments",
+            }
+        ),
+        "invalid_request_error",
+        _FALLBACK_REJECTION_AT_ARGUMENTS,
+        "input[1].arguments",
+        id="long_token",
+    ),
+    pytest.param(
+        _rejection_frame([_PRIVATE_MARKER]), "invalid_request_error", _FALLBACK_REJECTION, None, id="unknown_shape"
+    ),
+]
+
+
+async def _native_rejection_error(
     async_client,
     app_instance,
-    monkeypatch,
-):
-    """Upstream error text is not trusted: control characters, credential-shaped
-    tokens and addresses are scrubbed and the message is bounded before it is
-    delivered."""
-    _install_bridge_settings(monkeypatch, enabled=True)
-    account_id = await _import_account(async_client, "acc_native_rejection_text", "native-rejection-text@example.com")
-    hostile_message = (
-        "Invalid 'input[1].arguments': echoed\x00\x1b[31m Bearer abc.def-ghi_jkl "
-        "sk-live-abcdefghijklmnopqrstuvwxyz0123 for ops@example.com " + "z" * 5_000
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    frame: dict[str, Any],
+    committed_first: bool,
+    account_suffix: str,
+) -> tuple[dict[str, Any], str]:
+    """Deliver ``frame`` as upstream's answer to a native turn; return the
+    client-visible error and the raw response body."""
+    from app.modules.proxy import api as proxy_api_module
+
+    release: asyncio.Event | None = None
+    if committed_first:
+        # Upstream answers only after the startup probe has handed the stream
+        # off, which is when the route commits the 200.
+        monkeypatch.setattr(proxy_api_module, "_HTTP_BRIDGE_STARTUP_ERROR_PROBE_SECONDS", 0.0)
+        release = asyncio.Event()
+        committed = release
+        probe_stream_startup_error = proxy_api_module._probe_stream_startup_error
+
+        async def probe_then_commit(*args, **kwargs):
+            result = await probe_stream_startup_error(*args, **kwargs)
+            committed.set()
+            return result
+
+        monkeypatch.setattr(proxy_api_module, "_probe_stream_startup_error", probe_then_commit)
+    account_id = await _import_account(
+        async_client,
+        f"acc_native_rejection_{account_suffix}",
+        f"native-rejection-{account_suffix}@example.com",
     )
-    upstream = _RejectsRequestUpstreamWebSocket(hostile_message)
+    upstream = _RejectsRequestUpstreamWebSocket("unused", release=release, frame=frame)
     _install_denied_anchor_bridge_fakes(monkeypatch, account=await _get_account(account_id), upstream=upstream)
 
     async with _client_reporting_committed_stream_failures(app_instance) as client:
@@ -19304,15 +19433,134 @@ async def test_native_codex_http_bridge_sanitizes_upstream_rejection_text(
                 "input": _history_with_function_call("{}"),
                 "stream": True,
             },
-            headers={"session_id": "native-rejection-text-session", "user-agent": _NATIVE_CODEX_USER_AGENT},
+            headers={"session_id": f"native-rejection-{account_suffix}", "user-agent": _NATIVE_CODEX_USER_AGENT},
         )
 
+    if committed_first:
+        assert response.status_code == 200, response.text[:300]
+        events = _sse_data_events(response.text)
+        assert [event.get("type") for event in events] == ["response.failed"], response.text[:300]
+        assert response.text.rstrip().endswith("data: [DONE]")
+        return events[0]["response"]["error"], response.text
     assert response.status_code == 400, f"native client received {response.status_code}: {response.text[:300]!r}"
-    message = response.json()["error"]["message"]
-    assert message.startswith("Invalid 'input[1].arguments': echoed")
-    for leaked in ("\x00", "\x1b", "abc.def-ghi_jkl", "sk-live-abcdefghijklmnopqrstuvwxyz0123", "ops@example.com"):
-        assert leaked not in message
-    assert len(message) <= 1_000
+    return response.json()["error"], response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committed_first", [False, True], ids=["before_commit", "after_commit"])
+@pytest.mark.parametrize(("frame", "code", "message", "param"), _HOSTILE_REJECTIONS)
+async def test_native_codex_http_bridge_rebuilds_upstream_rejection_from_validated_parts(
+    async_client,
+    app_instance,
+    monkeypatch,
+    request,
+    frame,
+    code,
+    message,
+    param,
+    committed_first,
+):
+    """Upstream error text and metadata are untrusted: they can echo request
+    bodies or secrets. The client gets a fixed ``type``, a validated ``code``
+    and ``param``, and a message restated from a recognized diagnostic's
+    validated numbers or a fixed instruction, never upstream's own text."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+
+    error, body = await _native_rejection_error(
+        async_client,
+        app_instance,
+        monkeypatch,
+        frame=frame,
+        committed_first=committed_first,
+        account_suffix=request.node.callspec.id.replace("-", "_").lower(),
+    )
+
+    assert _PRIVATE_MARKER not in body, "upstream text or metadata reached the client"
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == code
+    assert error["message"] == message
+    assert error.get("param") == param
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("param", ["input[1].arguments", None], ids=["with_param", "without_param"])
+async def test_native_codex_http_bridge_reads_a_bounded_prefix_of_a_huge_upstream_rejection(
+    async_client,
+    app_instance,
+    monkeypatch,
+    param,
+):
+    """Delivering a rejection never runs a regex over more than a bounded
+    prefix of upstream text, however large the message is."""
+    import re
+
+    import app.core.errors as core_errors_module
+    from app.modules.proxy import api as proxy_api_module
+
+    _install_bridge_settings(monkeypatch, enabled=True)
+    scanned: list[int] = []
+    delivering = False
+
+    def record(text: object) -> None:
+        if delivering and isinstance(text, str):
+            scanned.append(len(text))
+
+    class _PatternSpy:
+        def __init__(self, pattern: re.Pattern[str]) -> None:
+            self._pattern = pattern
+
+        def __getattr__(self, name: str) -> Any:
+            method = getattr(self._pattern, name)
+            if name in {"sub", "subn"}:
+                return lambda repl, text, *args, **kwargs: (record(text), method(repl, text, *args, **kwargs))[1]
+            if name in {"search", "match", "fullmatch", "findall", "finditer", "split"}:
+                return lambda text, *args, **kwargs: (record(text), method(text, *args, **kwargs))[1]
+            return method
+
+    class _ReSpy:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(re, name)
+
+        def search(self, pattern: str, text: str, flags: int = 0) -> Any:
+            record(text)
+            return re.search(pattern, text, flags)
+
+    for name, value in list(vars(core_errors_module).items()):
+        if isinstance(value, re.Pattern):
+            monkeypatch.setattr(core_errors_module, name, _PatternSpy(value))
+    monkeypatch.setattr(core_errors_module, "re", _ReSpy())
+    native_request_rejection = proxy_api_module._native_request_rejection
+
+    def recording_native_request_rejection(payload):
+        nonlocal delivering
+        delivering = True
+        try:
+            return native_request_rejection(payload)
+        finally:
+            delivering = False
+
+    monkeypatch.setattr(proxy_api_module, "_native_request_rejection", recording_native_request_rejection)
+    # Without ``param`` the stale-anchor classifier reads the message too.
+    huge_error: dict[str, Any] = {
+        "type": "invalid_request_error",
+        "message": _INCIDENT_SHAPED_REJECTION_MESSAGE + " " + "x" * (1 << 20),
+    }
+    if param is not None:
+        huge_error["param"] = param
+
+    error, body = await _native_rejection_error(
+        async_client,
+        app_instance,
+        monkeypatch,
+        frame=_rejection_frame(huge_error),
+        committed_first=False,
+        account_suffix=f"huge_message_{param is not None}".lower(),
+    )
+
+    assert scanned, "no regex ran while the rejection was delivered"
+    assert max(scanned) <= 512, f"a regex scanned {max(scanned)} characters of upstream text"
+    assert error["message"] == _RECONSTRUCTED_INCIDENT_MESSAGE
+    assert "x" * 64 not in body
 
 
 @pytest.mark.asyncio
