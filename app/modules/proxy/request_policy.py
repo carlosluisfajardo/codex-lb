@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
-from typing import NamedTuple
+from typing import Final, NamedTuple
 
 from pydantic import ValidationError
 
@@ -1050,5 +1051,53 @@ def enforce_strict_function_tools_format(
             violation.message,
             param=violation.param,
             code=violation.code,
+            error_type="invalid_request_error",
+        )
+
+
+# Upstream rejects a ``function_call.arguments`` string longer than this
+# (``Invalid 'input[N].arguments': string too long``). The check counts code
+# points, which never exceed the UTF-8 byte or UTF-16 unit count, so a local
+# refusal never rejects arguments upstream would accept.
+UPSTREAM_FUNCTION_CALL_ARGUMENTS_MAX_CHARS: Final[int] = 1_048_576
+_PUBLIC_CALL_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+
+
+def enforce_function_call_arguments_limit(request: ResponsesRequest) -> None:
+    """Reject replayed ``function_call`` arguments upstream cannot accept.
+
+    Codex clients replay the whole history every turn, so one call whose
+    arguments exceed the upstream string limit makes every later request fail
+    upstream. Truncating or replacing the arguments would put a tool request the
+    model never made into its history and change the call's side-effect replay
+    identity, so the request fails locally with the deterministic 400 upstream
+    returns, before any reservation or upstream work. A terminal compaction
+    trigger is left to the upstream compact flow, and a request anchored with
+    ``previous_response_id`` is left to upstream, which can hold the call
+    server-side while the proxy trims it from the forwarded input.
+    """
+    input_value = request.input
+    if request.previous_response_id is not None or not is_json_list(input_value) or not input_value:
+        return
+    last_item = input_value[-1]
+    if is_json_mapping(last_item) and last_item.get("type") == "compaction_trigger":
+        return
+    for index, item in enumerate(input_value):
+        if not is_json_mapping(item) or item.get("type") != "function_call":
+            continue
+        arguments = item.get("arguments")
+        if not isinstance(arguments, str) or len(arguments) <= UPSTREAM_FUNCTION_CALL_ARGUMENTS_MAX_CHARS:
+            continue
+        call_id = item.get("call_id")
+        call_label = (
+            f" (call_id {call_id})" if isinstance(call_id, str) and _PUBLIC_CALL_ID_PATTERN.fullmatch(call_id) else ""
+        )
+        raise ClientPayloadError(
+            f"Invalid 'input[{index}].arguments': string too long. Expected a string with maximum length "
+            f"{UPSTREAM_FUNCTION_CALL_ARGUMENTS_MAX_CHARS}, but got a string with length {len(arguments)} instead. "
+            f"Upstream rejects this replayed function_call{call_label} on every request and codex-lb does not "
+            "truncate or rewrite tool-call arguments; continue in a new conversation without this item.",
+            param=f"input[{index}].arguments",
+            code="string_above_max_length",
             error_type="invalid_request_error",
         )

@@ -88,12 +88,14 @@ from app.core.crypto import TokenEncryptor
 from app.core.errors import (
     HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE,
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
+    PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS,
     SYNTHETIC_TRANSPORT_FAILURE_MARKER,
     OpenAIErrorEnvelope,
     OpenAIErrorParam,
     is_previous_response_not_found_public_shape,
     normalize_public_error_param,
     openai_error,
+    public_request_rejection,
     response_failed_event,
     sanitize_public_error_detail,
     synthetic_transport_failure_event,
@@ -293,6 +295,7 @@ from app.modules.proxy.request_policy import (
     apply_api_key_enforcement_to_chat_payload,
     apply_enforced_service_tier_model_fallback,
     apply_prohibit_fast_mode,
+    enforce_function_call_arguments_limit,
     enforce_strict_function_tools_format,
     enforce_strict_text_format,
     model_alias_requests_fast_mode,
@@ -6383,6 +6386,10 @@ async def _stream_responses(
         except ClientPayloadError as exc:
             error = openai_client_payload_error(exc)
             return _logged_error_json_response(request, 400, error)
+    try:
+        enforce_function_call_arguments_limit(payload)
+    except ClientPayloadError as exc:
+        return _logged_error_json_response(request, 400, openai_client_payload_error(exc))
     admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=payload.model)
     if admission_denial is not None:
         return admission_denial
@@ -6419,6 +6426,8 @@ async def _stream_responses(
     )
     effective_headers = forwarded_headers or request.headers
     preserve_native_failure_lifecycle = not enforce_openai_sdk_contract and _is_native_codex_request(effective_headers)
+    # An owner forward relays raw frames; the origin converts them for its own client.
+    convert_native_request_rejections = not enforce_openai_sdk_contract and not forwarded_request
     bridge_active = await _http_bridge_active_for_request(
         payload,
         effective_headers,
@@ -6595,6 +6604,7 @@ async def _stream_responses(
             stream, startup_error = await _probe_stream_startup_error(
                 stream,
                 convert_event_errors=bridge_active and enforce_openai_sdk_contract,
+                convert_native_request_rejections=bridge_active and convert_native_request_rejections,
                 timeout_seconds=(
                     _HTTP_BRIDGE_STARTUP_ERROR_PROBE_SECONDS
                     if prefer_http_bridge
@@ -6677,6 +6687,7 @@ async def _stream_responses(
         ),
         enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         preserve_native_failure_lifecycle=preserve_native_failure_lifecycle,
+        convert_native_request_rejections=convert_native_request_rejections,
     )
     service_stream = stream
     use_codex_keepalive = native_codex_heartbeat or not enforce_openai_sdk_contract
@@ -6800,6 +6811,10 @@ async def _collect_responses(
         service_tier_was_enforced=service_tier_was_enforced,
     )
     validate_model_access(api_key, payload.model)
+    try:
+        enforce_function_call_arguments_limit(payload)
+    except ClientPayloadError as exc:
+        return _logged_error_json_response(request, 400, openai_client_payload_error(exc))
     admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=payload.model)
     if admission_denial is not None:
         return admission_denial
@@ -7619,6 +7634,7 @@ async def _probe_stream_startup_error(
     stream: AsyncIterator[str],
     *,
     convert_event_errors: bool = False,
+    convert_native_request_rejections: bool = False,
     timeout_seconds: float | None = None,
     capacity_wait_event: asyncio.Event | None = None,
     capacity_ready_event: asyncio.Event | None = None,
@@ -7699,13 +7715,16 @@ async def _probe_stream_startup_error(
                 )
             except ProxyResponseError as exc:
                 return _prepend_first(None, stream), exc
-            if convert_event_errors:
-                first_error = _stream_event_error_envelope(first)
-                if first_error is not None:
-                    aclose = getattr(stream, "aclose", None)
-                    if callable(aclose):
-                        await aclose()
-                    return _prepend_first(None, stream), first_error
+            first_error = _startup_event_error(
+                first,
+                convert_event_errors=convert_event_errors,
+                convert_native_request_rejections=convert_native_request_rejections,
+            )
+            if first_error is not None:
+                aclose = getattr(stream, "aclose", None)
+                if callable(aclose):
+                    await aclose()
+                return _prepend_first(None, stream), first_error
             buffered_before_cleanup_ready.append(first)
             first_task = _create_first_stream_probe_task(stream, scheduler=scheduler)
 
@@ -7733,14 +7752,33 @@ async def _probe_stream_startup_error(
         return _prepend_first(None, stream), None
     except ProxyResponseError as exc:
         return _prepend_first(None, stream), exc
-    if convert_event_errors:
-        first_error = _stream_event_error_envelope(first)
-        if first_error is not None:
-            aclose = getattr(stream, "aclose", None)
-            if callable(aclose):
-                await aclose()
-            return _prepend_first(None, stream), first_error
+    first_error = _startup_event_error(
+        first,
+        convert_event_errors=convert_event_errors,
+        convert_native_request_rejections=convert_native_request_rejections,
+    )
+    if first_error is not None:
+        aclose = getattr(stream, "aclose", None)
+        if callable(aclose):
+            await aclose()
+        return _prepend_first(None, stream), first_error
     return _prepend_first(first, stream), None
+
+
+def _startup_event_error(
+    event_block: str,
+    *,
+    convert_event_errors: bool,
+    convert_native_request_rejections: bool,
+) -> ProxyResponseError | OpenAIErrorEnvelopeModel | None:
+    if convert_event_errors:
+        return _stream_event_error_envelope(event_block)
+    if not convert_native_request_rejections:
+        return None
+    payload = _parse_sse_payload(event_block)
+    rejection = _native_request_rejection(payload) if payload is not None else None
+    # 400 is the status an HTTP upstream answers the same request with.
+    return ProxyResponseError(400, rejection.envelope()) if rejection is not None else None
 
 
 _CHAT_COMPLETIONS_STARTUP_EVENT_TYPES: Final[set[str]] = {
@@ -8328,6 +8366,71 @@ def _stream_startup_error_response(
         envelope.model_dump(mode="json", exclude_none=True),
         headers=headers,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeRequestRejection:
+    code: str
+    message: str
+    param: str | None
+    error_type: str = "invalid_request_error"
+
+    def envelope(self) -> OpenAIErrorEnvelope:
+        envelope = openai_error(self.code, self.message, error_type=self.error_type)
+        if self.param is not None:
+            envelope["error"]["param"] = self.param
+        return envelope
+
+    def failed_event_block(self) -> str:
+        return format_sse_event(response_failed_event(self.code, self.message, self.error_type, error_param=self.param))
+
+
+def _native_request_rejection(payload: dict[str, JsonValue]) -> _NativeRequestRejection | None:
+    """Classify an upstream ``error`` frame that rejects the request itself.
+
+    A native Codex client ignores a bare ``error`` SSE frame and reads the clean
+    EOF after it as a dropped stream, so it resends the same rejected request.
+    A wrapped frame with status ``400``, or a status-less frame typed
+    ``invalid_request_error``, is the stream form of the HTTP 400 an HTTP
+    upstream returns for that request. Other error frames keep their raw
+    shape, and stale-anchor denials keep their own masking contract. The
+    delivered error is rebuilt from validated parts and never copies upstream
+    text.
+    """
+    if classify_event_type(payload) != "error":
+        return None
+    error_value = payload.get("error")
+    detail: Mapping[str, JsonValue] = error_value if is_json_mapping(error_value) else payload
+    raw_type = detail.get("type") if detail is not payload else payload.get("error_type")
+    error_type = raw_type.strip() if isinstance(raw_type, str) and raw_type.strip() else None
+    status = next(
+        (
+            value
+            for field in ("status", "status_code")
+            if isinstance(value := payload.get(field), int) and not isinstance(value, bool)
+        ),
+        None,
+    )
+    if status != 400 and not (status is None and error_type == "invalid_request_error"):
+        return None
+    raw_code = detail.get("code")
+    raw_message = detail.get("message")
+    # A stale-anchor denial is recognized from a whole message within the scan
+    # bound only: a longer message is never exempted on the strength of its
+    # prefix, so it is delivered as a rebuilt rejection instead of raw.
+    whole_message = (
+        raw_message
+        if isinstance(raw_message, str) and len(raw_message) <= PUBLIC_REQUEST_REJECTION_SCAN_MAX_CHARS
+        else None
+    )
+    if is_previous_response_not_found_public_shape(
+        code=raw_code.strip() if isinstance(raw_code, str) and raw_code.strip() else error_type,
+        param=OpenAIErrorParam.from_mapping(detail),
+        message=whole_message,
+    ):
+        return None
+    public = public_request_rejection(code=raw_code, message=raw_message, param=detail.get("param"))
+    return _NativeRequestRejection(code=public.code, message=public.message, param=public.param)
 
 
 def _stream_event_error_envelope(event_block: str) -> OpenAIErrorEnvelopeModel | None:
@@ -9011,6 +9114,7 @@ async def _normalize_public_responses_stream(
     enforce_openai_sdk_contract: bool = True,
     forward_unparseable_data: bool = False,
     preserve_native_failure_lifecycle: bool = False,
+    convert_native_request_rejections: bool = False,
 ) -> AsyncIterator[str]:
     stream = _normalize_reasoning_summary_stream(stream)
     """Normalize the upstream SSE event stream for the public /v1 surface.
@@ -9187,7 +9291,10 @@ async def _normalize_public_responses_stream(
             synthetic_created["sequence_number"] = synthetic_created_sequence
         if not enforce_openai_sdk_contract and event_type in {"error", "response.failed"}:
             terminal_seen = True
-            if normalized_payload is parsed_payload:
+            rejection = _native_request_rejection(normalized_payload) if convert_native_request_rejections else None
+            if rejection is not None:
+                yield rejection.failed_event_block()
+            elif normalized_payload is parsed_payload:
                 yield event_block
             else:
                 yield format_sse_event(normalized_payload)

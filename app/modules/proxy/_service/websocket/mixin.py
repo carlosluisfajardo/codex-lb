@@ -502,6 +502,7 @@ from app.modules.proxy.load_balancer import AccountLease, effective_account_conc
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_enforced_service_tier_model_fallback,
+    enforce_function_call_arguments_limit,
     model_alias_requests_fast_mode,
     normalize_responses_request_payload,
     openai_client_payload_error,
@@ -3204,6 +3205,17 @@ class _WebSocketMixin:
             # parse failure keeps the source guards active instead of
             # changing that behavior here.
             source_route_excluded = False
+        try:
+            enforce_function_call_arguments_limit(responses_payload)
+        except ClientPayloadError:
+            # A source-owned model is served over HTTP by its source; the connect
+            # guard's 503 sends the client there, so leave the request to it.
+            if source_route_excluded or not await responses_model_is_source_owned(
+                responses_payload.model,
+                refreshed_api_key,
+                raw_model=raw_source_model,
+            ):
+                raise
         normalized_payload = responses_payload.to_payload()
         stripped_client_metadata = strip_capability_metadata(normalized_payload.get("client_metadata"))
         if stripped_client_metadata is not normalized_payload.get("client_metadata"):
