@@ -3266,7 +3266,18 @@ class _WebSocketMixin:
                 input_value=responses_payload.input,
                 continuity_state=continuity_state,
             )
-            trimmed_input_items = _trim_websocket_previous_response_input_items(previous_response_input_items)
+            # Only calls this session saw the referenced response emit prove a replay;
+            # a call the proxy has no record of is kept with its output.
+            previous_response_tool_calls = (
+                continuity_state.last_pending_tool_call_types
+                if continuity_state is not None
+                and continuity_state.last_completed_response_id == responses_payload.previous_response_id
+                else None
+            )
+            trimmed_input_items = _trim_websocket_previous_response_input_items(
+                previous_response_input_items,
+                previous_response_tool_calls=previous_response_tool_calls,
+            )
             if len(trimmed_input_items) != len(previous_response_input_items):
                 previous_response_trimmed_input_count = len(previous_response_input_items)
                 previous_response_trimmed_input_fingerprint = _facade()._fingerprint_input_items(

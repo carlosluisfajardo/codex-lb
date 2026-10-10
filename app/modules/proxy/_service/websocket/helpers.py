@@ -2298,7 +2298,19 @@ def _serialize_websocket_error_event(payload: dict[str, JsonValue]) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
-def _trim_websocket_previous_response_input_items(input_items: list[JsonValue]) -> list[JsonValue]:
+def _trim_websocket_previous_response_input_items(
+    input_items: list[JsonValue],
+    *,
+    previous_response_tool_calls: Mapping[str, str] | None = None,
+) -> list[JsonValue]:
+    """Drop previous-response output a client replayed before its first tool output.
+
+    Assistant messages and reasoning items are recognized by their shape. A tool call
+    is replay only when its ``call_id`` and type match a tool call the previous
+    response emitted (``previous_response_tool_calls``, recorded from that response's
+    ``response.output_item.done`` events). Any other call is a new call/result pair
+    and stays in place, in order: dropping it would orphan its output.
+    """
     first_output_index = next(
         (
             index
@@ -2313,7 +2325,25 @@ def _trim_websocket_previous_response_input_items(input_items: list[JsonValue]) 
     prefix = input_items[:first_output_index]
     if not all(_is_websocket_previous_response_output_item(item) for item in prefix):
         return input_items
-    return input_items[first_output_index:]
+    recorded_calls = previous_response_tool_calls or {}
+    kept_calls = [
+        item
+        for item in prefix
+        if _websocket_input_item_type(item) in _WEBSOCKET_TOOL_CALL_ITEM_TYPES
+        and not _is_recorded_previous_response_tool_call(item, recorded_calls)
+    ]
+    if len(kept_calls) == len(prefix):
+        return input_items
+    return [*kept_calls, *input_items[first_output_index:]]
+
+
+def _is_recorded_previous_response_tool_call(item: JsonValue, recorded_calls: Mapping[str, str]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    call_id = item.get("call_id")
+    return (
+        isinstance(call_id, str) and bool(call_id) and recorded_calls.get(call_id) == _websocket_input_item_type(item)
+    )
 
 
 def _is_websocket_previous_response_output_item(item: JsonValue) -> bool:
