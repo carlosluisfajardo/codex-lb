@@ -2200,7 +2200,166 @@ def test_trim_websocket_previous_response_input_items_accepts_untyped_assistant_
         {"role": "user", "content": [{"type": "input_text", "text": "next"}]},
     ]
 
-    assert proxy_service._trim_websocket_previous_response_input_items(items) == items[2:]
+    trimmed = proxy_service._trim_websocket_previous_response_input_items(
+        items,
+        previous_response_tool_calls={"call_custom": "custom_tool_call"},
+    )
+
+    assert trimmed == items[2:]
+
+
+_NEW_CALL_RESULT_PAIRS = [
+    pytest.param(
+        {"type": "function_call", "call_id": "call_new", "name": "visualization_state", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_new", "output": "{}"},
+        id="function_call",
+    ),
+    pytest.param(
+        {"type": "custom_tool_call", "call_id": "call_new", "name": "visualization_state", "input": "{}"},
+        {"type": "custom_tool_call_output", "call_id": "call_new", "output": "{}"},
+        id="custom_tool_call",
+    ),
+    pytest.param(
+        {"type": "apply_patch_call", "call_id": "call_new", "input": "*** Begin Patch\n*** End Patch\n"},
+        {"type": "apply_patch_call_output", "call_id": "call_new", "output": "Success"},
+        id="apply_patch_call",
+    ),
+]
+
+
+@pytest.mark.parametrize(("call_item", "output_item"), _NEW_CALL_RESULT_PAIRS)
+def test_trim_websocket_previous_response_input_items_keeps_new_call_result_pair(
+    call_item: dict[str, JsonValue],
+    output_item: dict[str, JsonValue],
+) -> None:
+    items: list[JsonValue] = [
+        call_item,
+        output_item,
+        {"role": "user", "content": [{"type": "input_text", "text": "next"}]},
+    ]
+
+    assert proxy_service._trim_websocket_previous_response_input_items(items) == items
+
+
+def test_trim_websocket_previous_response_input_items_keeps_call_the_previous_response_did_not_emit() -> None:
+    items: list[JsonValue] = [
+        {"type": "custom_tool_call", "call_id": "call_new", "name": "visualization_state", "input": "{}"},
+        {"type": "custom_tool_call_output", "call_id": "call_new", "output": "{}"},
+        {"type": "custom_tool_call_output", "call_id": "call_previous", "output": "/tmp"},
+    ]
+
+    trimmed = proxy_service._trim_websocket_previous_response_input_items(
+        items,
+        previous_response_tool_calls={"call_previous": "custom_tool_call"},
+    )
+
+    assert trimmed == items
+
+
+def test_trim_websocket_previous_response_input_items_requires_the_recorded_call_type() -> None:
+    items: list[JsonValue] = [
+        {"type": "custom_tool_call", "call_id": "call_shared", "name": "shell", "input": "pwd"},
+        {"type": "custom_tool_call_output", "call_id": "call_shared", "output": "/tmp"},
+    ]
+
+    trimmed = proxy_service._trim_websocket_previous_response_input_items(
+        items,
+        previous_response_tool_calls={"call_shared": "function_call"},
+    )
+
+    assert trimmed == items
+
+
+def test_trim_websocket_previous_response_input_items_matches_call_id_not_item_id() -> None:
+    replayed_call: dict[str, JsonValue] = {
+        "type": "function_call",
+        "id": "fc_replayed",
+        "call_id": "call_previous",
+        "name": "exec_command",
+        "arguments": "{}",
+    }
+    new_call: dict[str, JsonValue] = {
+        "type": "function_call",
+        "id": "call_previous",
+        "call_id": "call_new",
+        "name": "visualization_state",
+        "arguments": "{}",
+    }
+    items: list[JsonValue] = [
+        replayed_call,
+        new_call,
+        {"type": "function_call_output", "call_id": "call_previous", "output": "ok"},
+        {"type": "function_call_output", "call_id": "call_new", "output": "{}"},
+    ]
+
+    trimmed = proxy_service._trim_websocket_previous_response_input_items(
+        items,
+        previous_response_tool_calls={"call_previous": "function_call"},
+    )
+
+    assert trimmed == items[1:]
+
+
+def test_trim_websocket_previous_response_input_items_removes_only_recorded_calls_in_order() -> None:
+    new_call: dict[str, JsonValue] = {
+        "type": "custom_tool_call",
+        "call_id": "call_new",
+        "name": "visualization_state",
+        "input": "{}",
+    }
+    new_output: dict[str, JsonValue] = {"type": "custom_tool_call_output", "call_id": "call_new", "output": "{}"}
+    previous_output: dict[str, JsonValue] = {"type": "function_call_output", "call_id": "call_previous", "output": "ok"}
+    items: list[JsonValue] = [
+        {"type": "reasoning", "summary": []},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "running"}]},
+        new_call,
+        {"type": "function_call", "call_id": "call_previous", "name": "exec_command", "arguments": "{}"},
+        new_output,
+        previous_output,
+    ]
+
+    trimmed = proxy_service._trim_websocket_previous_response_input_items(
+        items,
+        previous_response_tool_calls={"call_previous": "function_call"},
+    )
+
+    assert trimmed == [new_call, new_output, previous_output]
+
+
+def test_trim_websocket_previous_response_input_items_leaves_ordinary_continuations() -> None:
+    output: dict[str, JsonValue] = {"type": "function_call_output", "call_id": "call_previous", "output": "ok"}
+    user_message: dict[str, JsonValue] = {"role": "user", "content": [{"type": "input_text", "text": "next"}]}
+    recorded = {"call_previous": "function_call"}
+
+    for items in ([output, user_message], [user_message, output], [user_message]):
+        trimmed = proxy_service._trim_websocket_previous_response_input_items(
+            list(items),
+            previous_response_tool_calls=recorded,
+        )
+        assert trimmed == items
+
+
+def test_websocket_output_event_owner_is_proven_only_for_exact_or_unique_created_owner() -> None:
+    def request(name: str, response_id: str | None) -> proxy_service._WebSocketRequestState:
+        return proxy_service._WebSocketRequestState(
+            request_id=name,
+            model="gpt-5.4",
+            service_tier=None,
+            reasoning_effort=None,
+            api_key_reservation=None,
+            started_at=0.0,
+            response_id=response_id,
+        )
+
+    created_a, created_b, uncreated_c = request("A", "resp_A"), request("B", "resp_B"), request("C", None)
+    is_proven = websocket_helpers_module._websocket_output_event_owner_is_proven
+
+    assert is_proven(deque([created_a, uncreated_c]), created_a, response_id=None)
+    assert not is_proven(deque([created_a, uncreated_c]), uncreated_c, response_id=None)
+    assert not is_proven(deque([created_a, created_b]), created_a, response_id=None)
+    assert not is_proven(deque([created_a, created_b, uncreated_c]), uncreated_c, response_id=None)
+    assert is_proven(deque([created_a, created_b]), created_b, response_id="resp_B")
+    assert not is_proven(deque([created_a, created_b]), created_a, response_id="resp_B")
 
 
 def test_trim_websocket_previous_response_input_items_keeps_non_replay_prefix() -> None:
@@ -48031,7 +48190,10 @@ def test_trim_websocket_previous_response_input_items_handles_apply_patch_replay
         {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
     ]
 
-    trimmed = proxy_service._trim_websocket_previous_response_input_items(input_items)
+    trimmed = proxy_service._trim_websocket_previous_response_input_items(
+        input_items,
+        previous_response_tool_calls={"patch_1": "apply_patch_call"},
+    )
 
     assert trimmed == input_items[2:]
 

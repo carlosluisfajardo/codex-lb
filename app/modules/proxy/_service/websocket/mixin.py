@@ -449,6 +449,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _websocket_event_incomplete_reason,
     _websocket_full_resend_conflicts_with_visible_pending,
     _websocket_input_items_are_self_contained_fresh_replay,
+    _websocket_output_event_owner_is_proven,
     _websocket_owner_switch_has_other_pending_requests,
     _websocket_precreated_auth_error_code,
     _websocket_precreated_replay_fallback_error,
@@ -3266,7 +3267,18 @@ class _WebSocketMixin:
                 input_value=responses_payload.input,
                 continuity_state=continuity_state,
             )
-            trimmed_input_items = _trim_websocket_previous_response_input_items(previous_response_input_items)
+            # Only calls this session saw the referenced response provably emit prove a
+            # replay; a call the proxy cannot attribute to it is kept with its output.
+            previous_response_tool_calls = (
+                continuity_state.last_proven_tool_call_types
+                if continuity_state is not None
+                and continuity_state.last_completed_response_id == responses_payload.previous_response_id
+                else None
+            )
+            trimmed_input_items = _trim_websocket_previous_response_input_items(
+                previous_response_input_items,
+                previous_response_tool_calls=previous_response_tool_calls,
+            )
             if len(trimmed_input_items) != len(previous_response_input_items):
                 previous_response_trimmed_input_count = len(previous_response_input_items)
                 previous_response_trimmed_input_fingerprint = _facade()._fingerprint_input_items(
@@ -5579,6 +5591,12 @@ class _WebSocketMixin:
                     if completed_call_id not in request_state.pending_function_call_ids:
                         request_state.pending_function_call_ids.append(completed_call_id)
                     request_state.pending_tool_call_types[completed_call_id] = completed_call_type
+                    if _websocket_output_event_owner_is_proven(
+                        pending_requests,
+                        request_state,
+                        response_id=response_id,
+                    ):
+                        request_state.proven_tool_call_types[completed_call_id] = completed_call_type
                 if mark_duplicate_tool_call_downstream_event(
                     payload,
                     seen_tool_call_keys=request_state.seen_tool_call_keys,

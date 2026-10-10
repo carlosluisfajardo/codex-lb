@@ -1253,6 +1253,10 @@ class _WebSocketRequestState:
     suppressed_duplicate_tool_call: bool = False
     pending_function_call_ids: list[str] = field(default_factory=list)
     pending_tool_call_types: dict[str, str] = field(default_factory=dict)
+    # The subset of ``pending_tool_call_types`` this response provably emitted: the done
+    # event named this response id, or arrived anonymously while this was the only created
+    # response. Only these calls may prove that a later continuation replays this response.
+    proven_tool_call_types: dict[str, str] = field(default_factory=dict)
     added_tool_call_types: dict[str, str] = field(default_factory=dict)
     tool_call_manifest_invalid: bool = False
     seen_tool_call_keys: dict[ToolCallDedupeKey, None] = field(default_factory=dict)
@@ -1555,6 +1559,7 @@ class _WebSocketContinuityState:
     last_completed_input_prefix_fingerprint: str | None = None
     last_pending_function_call_ids: list[str] = field(default_factory=list)
     last_pending_tool_call_types: dict[str, str] = field(default_factory=dict)
+    last_proven_tool_call_types: dict[str, str] = field(default_factory=dict)
     responses_lite_model: str | None = None
     responses_lite_response_id: str | None = None
 
