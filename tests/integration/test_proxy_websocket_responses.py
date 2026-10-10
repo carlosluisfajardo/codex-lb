@@ -5833,6 +5833,121 @@ def test_backend_responses_websocket_keeps_recorded_call_when_continuing_another
     assert sent[1]["input"] == [replayed_call, _REPLAY_PREVIOUS_OUTPUT]
 
 
+def _run_multiplexed_tool_replay(
+    monkeypatch,
+    app_instance,
+    *,
+    third_turn: list[_FakeUpstreamMessage],
+    continuation_input: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Pipeline A, B and C on one socket so A and B are created while C is not, then continue from C."""
+    turns = [
+        [_tool_replay_event({"type": "response.created", "response": {"id": "resp_A", "status": "in_progress"}})],
+        [_tool_replay_event({"type": "response.created", "response": {"id": "resp_B", "status": "in_progress"}})],
+        third_turn,
+        _tool_replay_turn("resp_D"),
+    ]
+    fake_upstream = _SequencedUpstreamWebSocket([], deferred_message_batches=turns)
+    _patch_tool_replay_websocket(monkeypatch, fake_upstream, account_id="acct_ws_multiplexed_replay")
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={
+                "Authorization": "Bearer external-token",
+                "session_id": "thread-ws-multiplexed-replay-1",
+                "openai-beta": "responses_websockets=2026-02-06",
+            },
+        ) as websocket:
+            for text in ("first", "second", "third"):
+                user_message = {"role": "user", "content": [{"type": "input_text", "text": text}]}
+                websocket.send_text(json.dumps(_tool_replay_request([user_message], previous_response_id=None)))
+                if text != "third":
+                    assert json.loads(websocket.receive_text())["type"] == "response.created"
+            third_events = [json.loads(websocket.receive_text()) for _ in third_turn]
+            assert third_events[-1]["type"] == "response.completed"
+            assert third_events[-1]["response"]["id"] == "resp_C"
+            websocket.send_text(json.dumps(_tool_replay_request(continuation_input, previous_response_id="resp_C")))
+            continuation_events = [json.loads(websocket.receive_text()) for _ in turns[3]]
+            assert continuation_events[-1]["type"] == "response.completed"
+    sent = [json.loads(message) for message in fake_upstream.sent_text]
+    assert sent[3]["previous_response_id"] == "resp_C"
+    return sent[3]
+
+
+def _multiplexed_completed(response_id: str) -> _FakeUpstreamMessage:
+    return _tool_replay_event(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+    )
+
+
+def test_backend_responses_websocket_ambiguous_anonymous_tool_call_does_not_prove_replay(app_instance, monkeypatch):
+    # With A and B created and C still uncreated, an anonymous done event carrying A's call is
+    # attributed to C by the pipelined-socket fallback. It must not prove that resp_C emitted it.
+    call_from_a = {
+        "id": "fc_from_A",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "call_from_A",
+        "name": "visualization_state",
+        "arguments": "{}",
+    }
+    continuation_call = {k: v for k, v in call_from_a.items() if k not in {"id", "status"}}
+    continuation_output = {"type": "function_call_output", "call_id": "call_from_A", "output": "{}"}
+    upstream_continuation = _run_multiplexed_tool_replay(
+        monkeypatch,
+        app_instance,
+        third_turn=[
+            _tool_replay_event({"type": "response.output_item.done", "item": call_from_a, "output_index": 0}),
+            _multiplexed_completed("resp_A"),
+            _multiplexed_completed("resp_B"),
+            _tool_replay_event({"type": "response.created", "response": {"id": "resp_C", "status": "in_progress"}}),
+            _multiplexed_completed("resp_C"),
+        ],
+        continuation_input=[continuation_call, continuation_output],
+    )
+
+    assert upstream_continuation["input"] == [continuation_call, continuation_output]
+
+
+def test_backend_responses_websocket_explicit_response_id_proves_replay_on_multiplexed_socket(
+    app_instance,
+    monkeypatch,
+):
+    call_from_c = {
+        "id": "fc_from_C",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "call_from_C",
+        "name": "exec_command",
+        "arguments": "{}",
+    }
+    replayed_call = {k: v for k, v in call_from_c.items() if k not in {"id", "status"}}
+    continuation_output = {"type": "function_call_output", "call_id": "call_from_C", "output": "ok"}
+    upstream_continuation = _run_multiplexed_tool_replay(
+        monkeypatch,
+        app_instance,
+        third_turn=[
+            _tool_replay_event({"type": "response.created", "response": {"id": "resp_C", "status": "in_progress"}}),
+            _tool_replay_event(
+                {"type": "response.output_item.done", "response_id": "resp_C", "item": call_from_c, "output_index": 0}
+            ),
+            _multiplexed_completed("resp_A"),
+            _multiplexed_completed("resp_B"),
+            _multiplexed_completed("resp_C"),
+        ],
+        continuation_input=[replayed_call, continuation_output],
+    )
+
+    assert upstream_continuation["input"] == [continuation_output]
+
+
 @pytest.mark.parametrize(
     ("new_call", "new_output"),
     [

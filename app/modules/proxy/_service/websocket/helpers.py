@@ -704,6 +704,7 @@ def _retire_websocket_continuity_anchor(continuity_state: _WebSocketContinuitySt
     continuity_state.last_completed_input_prefix_fingerprint = None
     continuity_state.last_pending_function_call_ids = []
     continuity_state.last_pending_tool_call_types = {}
+    continuity_state.last_proven_tool_call_types = {}
 
 
 def _websocket_continuity_anchor_for_payload(
@@ -829,6 +830,7 @@ def _record_websocket_continuity_completion(
         continuity_state.last_completed_input_prefix_fingerprint = None
     continuity_state.last_pending_function_call_ids = list(request_state.pending_function_call_ids)
     continuity_state.last_pending_tool_call_types = dict(request_state.pending_tool_call_types)
+    continuity_state.last_proven_tool_call_types = dict(request_state.proven_tool_call_types)
 
 
 def _record_websocket_responses_lite_acceptance(
@@ -1866,6 +1868,25 @@ def _is_response_output_event(event_type: str | None) -> bool:
     )
 
 
+def _websocket_output_event_owner_is_proven(
+    pending_requests: deque[_WebSocketRequestState],
+    request_state: _WebSocketRequestState,
+    *,
+    response_id: str | None,
+) -> bool:
+    """Whether the request matched to an output frame certainly owns it.
+
+    True when the frame named this request's response id, or arrived without one while
+    this was the only response upstream had created (issue #2350). The other anonymous
+    fallbacks keep routing the frame, but cannot prove which response emitted it.
+    """
+    if request_state.response_id is None:
+        return False
+    if response_id is not None:
+        return response_id == request_state.response_id
+    return sum(1 for pending in pending_requests if pending.response_id is not None) == 1
+
+
 def _match_websocket_request_state_for_anonymous_event(
     pending_requests: deque[_WebSocketRequestState],
     *,
@@ -2307,9 +2328,10 @@ def _trim_websocket_previous_response_input_items(
 
     Assistant messages and reasoning items are recognized by their shape. A tool call
     is replay only when its ``call_id`` and type match a tool call the previous
-    response emitted (``previous_response_tool_calls``, recorded from that response's
-    ``response.output_item.done`` events). Any other call is a new call/result pair
-    and stays in place, in order: dropping it would orphan its output.
+    response provably emitted (``previous_response_tool_calls``: done events that named
+    that response, or arrived while it was the only created response). Any other call
+    is a new call/result pair and stays in place, in order: dropping it would orphan
+    its output.
     """
     first_output_index = next(
         (

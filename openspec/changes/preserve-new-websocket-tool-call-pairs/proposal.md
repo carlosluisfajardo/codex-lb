@@ -15,17 +15,23 @@ output at the start of a continuation loses the call, and the upstream receives
 an output whose call it never saw. An existing unit test pinned exactly that
 removal for a `custom_tool_call` whose own output follows it.
 
-The service already knows which tool calls a response emitted. For every
-completed response it records the `call_id` and type of each tool-call
-`response.output_item.done` event, next to that response id, on the session's
-continuity state. That record proves which leading calls are replay; nothing
-else does.
+The service already records, for every completed response, the `call_id` and
+type of each tool-call `response.output_item.done` event routed to it, next to
+that response id, on the session's continuity state. Output frames usually carry
+no response id, though. On a pipelined socket with several created responses,
+the relay's fallback can route a frame to a response that did not emit it. Only
+a call whose ownership is certain proves that a leading call is replay: its
+event named the response id, or arrived while that response was the only
+created one.
 
 ## What Changes
 
 - Remove a leading tool call only when its `call_id` and type match a tool call
-  recorded for the response named by `previous_response_id` on the same
+  proven for the response named by `previous_response_id` on the same
   continuity state.
+- Record proven tool calls in their own map on the request and continuity
+  state. The existing pending record keeps driving the interrupted-output
+  injection and replay-safety checks unchanged.
 - Keep every other leading tool call in place and in order, so a new
   call/result pair reaches the upstream intact. A request that refers to a
   response the service has no record of keeps all of its tool calls.
@@ -39,7 +45,8 @@ else does.
 
 ## Non Goals
 
-- No new stored state, schema, setting or API change. The record already exists.
+- No schema, setting or API change. The only new state is one in-memory map of
+  proven tool calls on the request and continuity state.
 - No synthesized, duplicated or resent tool calls, tool outputs or side effects.
 - No change to the HTTP bridge counterpart, which classifies replay by a
   response-output marker (`id` or `status`) rather than by type alone.
@@ -59,8 +66,10 @@ None.
 
 ## Impact
 
-- Code: `app/modules/proxy/_service/websocket/helpers.py` (trim helper) and its
-  one call site in `app/modules/proxy/_service/websocket/mixin.py`.
+- Code: `app/modules/proxy/_service/websocket/helpers.py` (trim helper,
+  ownership predicate, continuity record), `app/modules/proxy/_service/websocket/mixin.py`
+  (tool-call collector and the trim call site) and
+  `app/modules/proxy/_service/support.py` (the proven-call map fields).
 - Tests: `tests/unit/test_proxy_utils.py` and
   `tests/integration/test_proxy_websocket_responses.py`.
 - Behavior: a continuation that references a response the service did not
