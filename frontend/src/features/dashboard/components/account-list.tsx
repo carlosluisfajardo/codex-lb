@@ -1,17 +1,18 @@
 import { ArrowDown, ArrowUp, ArrowUpDown, Clock, ExternalLink, List, Play, RotateCcw, Zap } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 
 import { EmptyState } from "@/components/empty-state";
 import { StatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
-import type { AccountAction } from "@/features/dashboard/components/account-card";
+import { AccountLifecycleDates, type AccountAction } from "@/features/dashboard/components/account-card";
 import {
   accountSubscriptionCredits,
   formatCreditValue,
   formatPurchasedCredits,
 } from "@/features/dashboard/account-credit-display";
+import type { AccountLifecycleMap } from "@/features/dashboard/hooks/use-account-lifecycle-map";
 import type { AccountSummary } from "@/features/dashboard/schemas";
 import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
 import { usePrivacyStore } from "@/hooks/use-privacy";
@@ -30,10 +31,15 @@ import {
 const ACCOUNT_LIST_VISIBLE_ROWS = 8;
 const ACCOUNT_LIST_ROW_HEIGHT_REM = 4.5;
 const ACCOUNT_LIST_COLUMNS = "minmax(13rem,1.3fr) 7.75rem 5rem minmax(14rem,1.2fr) 7.5rem 7.5rem minmax(8rem,0.8fr) 8rem";
+// The subscription dates column sits next to Plan when the session may read the dates.
+const ACCOUNT_LIST_COLUMNS_WITH_DATES =
+  "minmax(11.5rem,1.2fr) 7.75rem 5rem minmax(11.5rem,1fr) minmax(14rem,1.2fr) 7.5rem 7.5rem minmax(7rem,0.7fr) 8rem";
 
 type AccountListProps = {
   accounts: AccountSummary[];
   readOnly?: boolean;
+  /** Saved subscription dates by account id; `null` or omitted when the session may not read them. */
+  lifecycle?: AccountLifecycleMap | null;
   sort?: AccountListSort;
   onSortChange?: (sort: AccountListSort) => void;
   onAction?: (account: AccountSummary, action: AccountAction) => void;
@@ -289,6 +295,7 @@ export function AccountList({
   readOnly = false,
   sort: controlledSort,
   onSortChange,
+  lifecycle,
   onAction,
 }: AccountListProps) {
   const { t } = useTranslation();
@@ -331,27 +338,36 @@ export function AccountList({
     );
   }
 
+  const columns = lifecycle ? ACCOUNT_LIST_COLUMNS_WITH_DATES : ACCOUNT_LIST_COLUMNS;
+
   return (
     <div
       data-testid="dashboard-account-list"
       className="overflow-x-auto rounded-lg border bg-card"
     >
       <div
-        className="min-w-[76rem] divide-y overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        className={cn(
+          "divide-y overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+          lifecycle ? "min-w-[86rem]" : "min-w-[76rem]",
+        )}
         style={{ maxHeight: `${ACCOUNT_LIST_VISIBLE_ROWS * ACCOUNT_LIST_ROW_HEIGHT_REM}rem` }}
       >
         <div
           className="sticky top-0 z-10 grid gap-3 border-b bg-card/95 px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground backdrop-blur supports-[backdrop-filter]:bg-card/85"
-          style={{ gridTemplateColumns: ACCOUNT_LIST_COLUMNS }}
+          style={{ gridTemplateColumns: columns }}
         >
 	          {SORTABLE_HEADERS.map((header) => (
-	            <SortHeader
-	              key={header.key}
-	              label={t(SORTABLE_HEADER_KEY[header.key], { defaultValue: header.label })}
-	              sortKey={header.key}
-	              activeSort={sort}
-	              onSort={handleSort}
-	            />
+	            <Fragment key={header.key}>
+	              <SortHeader
+	                label={t(SORTABLE_HEADER_KEY[header.key], { defaultValue: header.label })}
+	                sortKey={header.key}
+	                activeSort={sort}
+	                onSort={handleSort}
+	              />
+	              {lifecycle && header.key === "plan" ? (
+	                <span className="truncate">{t("dashboard.accountList.headers.subscriptionDates")}</span>
+	              ) : null}
+	            </Fragment>
 	          ))}
 	          <span className="text-right">{t("apiKeys.table.actions")}</span>
         </div>
@@ -389,7 +405,7 @@ export function AccountList({
               key={account.accountId}
               data-testid="account-list-row"
               className="grid min-h-[4.5rem] items-center gap-3 px-3 py-2 text-sm"
-              style={{ animationDelay: `${index * 50}ms`, gridTemplateColumns: ACCOUNT_LIST_COLUMNS }}
+              style={{ animationDelay: `${index * 50}ms`, gridTemplateColumns: columns }}
             >
               <div className="min-w-0">
                 <p className="truncate font-medium leading-tight">
@@ -406,6 +422,9 @@ export function AccountList({
               </div>
               <StatusBadge status={status} />
               <span className="text-xs text-muted-foreground">{formatSlug(account.planType)}</span>
+              {lifecycle ? (
+                <AccountLifecycleDates entry={lifecycle.get(account.accountId) ?? { status: "loading" }} className="gap-x-2" />
+              ) : null}
               <AccountQuotaCells account={account} />
 	              <span className="font-medium tabular-nums">
 	                {formatCreditValue(accountSubscriptionCredits(account))}
