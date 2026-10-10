@@ -9,11 +9,14 @@ reasoning items and tool calls, the service MAY remove the assistant messages
 and reasoning items of that prefix before forwarding the request. It MUST
 remove a leading `function_call`, `custom_tool_call` or `apply_patch_call` item
 only when that item's `call_id` and type equal the `call_id` and type of a tool
-call the service recorded from the `response.output_item.done` events of the
-response named by `previous_response_id`, on the same WebSocket continuity
-state. The service MUST NOT treat a tool call as replay because of its item
-type, the presence of `previous_response_id`, its item `id`, or a matching
-output in the same request. Every other leading tool call MUST be forwarded
+call the service proved the response named by `previous_response_id` emitted,
+on the same WebSocket continuity state. A tool call is proven only when its
+`response.output_item.done` event named that response's id, or arrived without
+a response id while that response was the only one the upstream had created on
+the connection. A tool call attributed to the response by any other routing
+fallback MUST NOT prove replay. The service MUST NOT treat a tool call as replay
+because of its item type, the presence of `previous_response_id`, its item `id`,
+or a matching output in the same request. Every other leading tool call MUST be forwarded
 unchanged and in its original order relative to the forwarded items, so a new
 call and its output reach the upstream together. When the prefix contains any
 other item, the request MUST be forwarded unchanged. The service MUST NOT
@@ -32,6 +35,20 @@ when it keeps or removes these items.
 - **GIVEN** the response `resp_a` emitted the `function_call` `call_previous` on this WebSocket continuity state
 - **WHEN** the client continues from `resp_a` with a reasoning item, an assistant message, the `function_call` `call_previous` and its `function_call_output`
 - **THEN** the upstream receives only the `function_call_output` of `call_previous`
+
+#### Scenario: A tool call attributed by a pipelined-socket fallback does not prove replay
+
+- **GIVEN** responses `resp_A` and `resp_B` were created on the connection and a third request is still waiting for its `response.created`
+- **AND** a `response.output_item.done` event without a response id, carrying the `function_call` `call_from_A`, is routed to that third request, which then completes as `resp_C`
+- **WHEN** the client continues from `resp_C` with the `function_call` `call_from_A` and its `function_call_output`
+- **THEN** the upstream receives both items unchanged
+
+#### Scenario: An explicit response id proves replay on a multiplexed connection
+
+- **GIVEN** responses `resp_A`, `resp_B` and `resp_C` were created on the connection
+- **AND** a `response.output_item.done` event naming `resp_C` carried the `function_call` `call_from_C`
+- **WHEN** the client continues from `resp_C` replaying the `function_call` `call_from_C` before its `function_call_output`
+- **THEN** the upstream receives only the `function_call_output`
 
 #### Scenario: A response the service did not observe keeps its tool calls
 

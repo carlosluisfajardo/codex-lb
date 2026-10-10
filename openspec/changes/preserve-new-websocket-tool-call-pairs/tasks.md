@@ -12,6 +12,8 @@
   call in place and in order.
 - [x] 2.2 Supply the recorded calls from the continuity state only when
   `previous_response_id` equals its `last_completed_response_id`.
+- [x] 2.3 Admit a done tool call to the proven record only when its event named
+  the response id or arrived while that response was the only created one.
 
 ## 3. Regression coverage
 
@@ -21,6 +23,9 @@
   other recorded call, mismatched type, call id versus item id, mixed order and
   ordinary continuations.
 - [x] 3.3 Replace the expectations that blessed removal by type.
+- [x] 3.4 Pipelined-socket discriminator (A and B created, C not created, an
+  anonymous done event of A's call routed to C), seen failing before the
+  correction, plus explicit-response-id and ownership-predicate controls.
 
 ## 4. Validation
 

@@ -20,17 +20,28 @@ For every completed response the WebSocket path records, on the session's
 
 - `last_completed_response_id`: the response that just completed;
 - `last_pending_tool_call_types`: `call_id` to item type for every
-  `function_call`, `custom_tool_call` and `apply_patch_call` that response
-  emitted as a `response.output_item.done` event.
+  `function_call`, `custom_tool_call` and `apply_patch_call`
+  `response.output_item.done` event the socket relay routed to that response.
+  It drives the interrupted-tool-output injection;
+- `last_proven_tool_call_types`: the subset whose ownership is certain. The done
+  event either named that response's id, or arrived without one while that
+  response was the only one the upstream had created on the connection (the
+  rule the relay already uses for anonymous output, issue #2350).
+
+Output frames usually carry no response id. On a pipelined socket where two
+responses are created and a third is still waiting for its `response.created`,
+the relay's fallback can route such a frame to the waiting request. That routing
+stays as it is, but it cannot prove which response emitted the call, so the call
+enters only the pending record, not the proven one.
 
 The state is keyed by the session's continuity aliases and API key, or held for
-the life of one connection when session affinity is off. The same record already
-drives the interrupted-tool-output injection for that response.
+the life of one connection when session affinity is off.
 
 A leading tool call is replay exactly when the request's `previous_response_id`
 equals `last_completed_response_id` and the call's `call_id` maps to its own
-item type in that record. The `call_id` pairs a call with its output; the item
-`id` (`fc_...`) is a separate identifier and is never used as call identity.
+item type in `last_proven_tool_call_types`. The `call_id` pairs a call with its
+output; the item `id` (`fc_...`) is a separate identifier and is never used as
+call identity.
 
 ## Decisions and the alternatives rejected
 
@@ -48,8 +59,10 @@ item type in that record. The `call_id` pairs a call with its output; the item
   replayed assistant messages or reasoning items, and those items carry no
   call/result pairing, so their existing removal is kept. Recording their item
   ids would not help: replaying clients send them without ids.
-- **No state change.** The record is already kept, so no request, response or
-  continuity state type changes.
+- **A separate proven record.** The pending record keeps its existing
+  admission because replay-safety checks and interrupted-output injection rely
+  on it. A second map on the request and continuity state carries only calls
+  with certain ownership. It is the one the trim trusts.
 - **HTTP bridge untouched.** `_trim_http_bridge_previous_response_input_items`
   only treats items with a response-output marker (`id` or `status`) as replay.
   It is a different heuristic and outside this change.
@@ -60,6 +73,9 @@ item type in that record. The `call_id` pairs a call with its output; the item
   with its output; assistant message and reasoning items are still removed.
 - **Output item events missing.** A call whose `response.output_item.done` never
   arrived is not in the record and is forwarded.
+- **Ambiguous attribution on a pipelined socket.** A call routed to a response by
+  a fallback (several responses created, no response id on the frame) is not
+  proven, so a replay of it is forwarded with its output.
 - **Client reuses a recorded `call_id` with the same type for a new call.** It
   is treated as replay of the recorded call, which is what its output then
   refers to.

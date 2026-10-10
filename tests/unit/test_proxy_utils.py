@@ -2339,6 +2339,29 @@ def test_trim_websocket_previous_response_input_items_leaves_ordinary_continuati
         assert trimmed == items
 
 
+def test_websocket_output_event_owner_is_proven_only_for_exact_or_unique_created_owner() -> None:
+    def request(name: str, response_id: str | None) -> proxy_service._WebSocketRequestState:
+        return proxy_service._WebSocketRequestState(
+            request_id=name,
+            model="gpt-5.4",
+            service_tier=None,
+            reasoning_effort=None,
+            api_key_reservation=None,
+            started_at=0.0,
+            response_id=response_id,
+        )
+
+    created_a, created_b, uncreated_c = request("A", "resp_A"), request("B", "resp_B"), request("C", None)
+    is_proven = websocket_helpers_module._websocket_output_event_owner_is_proven
+
+    assert is_proven(deque([created_a, uncreated_c]), created_a, response_id=None)
+    assert not is_proven(deque([created_a, uncreated_c]), uncreated_c, response_id=None)
+    assert not is_proven(deque([created_a, created_b]), created_a, response_id=None)
+    assert not is_proven(deque([created_a, created_b, uncreated_c]), uncreated_c, response_id=None)
+    assert is_proven(deque([created_a, created_b]), created_b, response_id="resp_B")
+    assert not is_proven(deque([created_a, created_b]), created_a, response_id="resp_B")
+
+
 def test_trim_websocket_previous_response_input_items_keeps_non_replay_prefix() -> None:
     items: list[JsonValue] = [
         {"role": "system", "content": [{"type": "input_text", "text": "local context"}]},
