@@ -4015,9 +4015,12 @@ The service MUST track tool-call items completed by a streamed response that may
 - **THEN** the synthetic interrupted outputs are re-injected from the failed session's pending tool-call state, so the recovered submit does not reintroduce the upstream missing-tool-output failure
 
 #### Scenario: replayed apply_patch prefix is trimmed on anchored bridge follow-ups
-- **GIVEN** an HTTP bridge follow-up that anchors via `previous_response_id` and replays a prior `apply_patch_call` item (marked as response output) followed by its `apply_patch_call_output`
-- **WHEN** the bridge trims the previous-response prefix already covered by the anchor
-- **THEN** `apply_patch_call` and `apply_patch_call_output` items are recognized by the trim exactly like the `function_call` and `custom_tool_call` variants, matching the WebSocket route's replay trim
+- **GIVEN** an HTTP bridge follow-up that anchors via `previous_response_id` and replays a prior `apply_patch_call` followed by its `apply_patch_call_output`
+- **AND** every item before the first tool output has a recognized response-output shape (`reasoning`, function/custom/apply-patch call, or assistant message) and the bridge's existing marker: a nonblank `id` after stripping whitespace or a `completed` or `in_progress` status
+- **WHEN** the bridge trims that marked previous-response prefix
+- **THEN** the bridge removes the prefix and retains the tool output, recognizing `apply_patch_call` and `apply_patch_call_output` like the function and custom-tool variants
+- **AND** any prefix item lacking that marker leaves the input unchanged
+- **AND** this bridge marker check does not establish the server-response ownership, call-id and type proof required by the WebSocket replay trim
 
 #### Scenario: owner-forward failover recovery injects from local session state when available
 - **GIVEN** a multi-instance bridge where an anchored follow-up is forwarded to the remote owner instance and the relay fails before yielding any bytes
@@ -10826,3 +10829,90 @@ SDK parser failure.
 - **THEN** it emits one terminal `response.failed` event
 - **AND** that terminal event includes a stable `response.id`
 
+### Requirement: Replayed function_call arguments above the upstream string limit fail fast
+
+When a Responses request's `input` contains a `function_call` item whose
+`arguments` string is longer than 1,048,576 characters, the service MUST reject
+the request locally. The rejection MUST happen before opportunistic admission,
+API-key reservation, account selection, bridge session allocation, and any
+upstream connection.
+
+- HTTP routes MUST return status `400` with `error.type = "invalid_request_error"`,
+  `error.code = "string_above_max_length"`, and
+  `error.param = "input[<index>].arguments"`. `<index>` is the item's position
+  in the request's normalized `input`, after applicable system-message lifting
+  into `instructions`; developer messages remain in `input`. It can differ from
+  the client's own index and from the position on the wire.
+- WebSocket routes MUST send the same envelope as an error event with
+  `"type": "error"` and `"status": 400`.
+- The message MUST state the limit and the actual length, and MUST NOT contain
+  the arguments.
+
+The service MUST NOT truncate, replace, or annotate the arguments. It MUST NOT
+synthesize a different tool call or tool output, and MUST NOT change any other
+input item. Arguments at or below the limit MUST be forwarded unchanged.
+
+The limit MUST be measured in code points, so the check never rejects arguments
+that upstream would accept. The following requests are exempt:
+
+- A request whose last `input` item is a `compaction_trigger` keeps the
+  existing compaction flow.
+- A request that carries `previous_response_id` is left to upstream, which can
+  hold the call server-side while the proxy trims it from the forwarded input.
+- A request eligible for routing to a configured model source under the existing
+  structural and continuity exclusions is not subject to the check. Merely using
+  a source-owned model does not exempt a request excluded from source routing.
+  On HTTP the route sends an eligible request to the source first. On WebSocket the
+  existing connect-time `503 model_source_requires_http_transport` still sends
+  the client to HTTP.
+- A full-history WebSocket turn that is eligible for source routing and belongs
+  to a thread with a live or expired source pin keeps the existing pinned-source
+  HTTP fallback while overflow is enabled or draining. An unreadable pin state
+  keeps that same bounded fallback. The arguments refusal MUST NOT preempt its
+  existing status-503 fallback or send the turn to a subscription account.
+
+#### Scenario: Oversized replayed arguments are refused before upstream
+
+- **GIVEN** an HTTP `/backend-api/codex/responses` or `/v1/responses` request whose history holds a `function_call` with 1,048,577-character `arguments`
+- **WHEN** the service receives it, streaming or not
+- **THEN** it returns HTTP `400` with code `string_above_max_length` and param `input[<index>].arguments`
+- **AND** no admission, reservation, bridge session, or upstream request happens
+- **AND** the response body does not contain the arguments
+
+#### Scenario: WebSocket requests receive a status-400 error event
+
+- **GIVEN** a WebSocket `response.create` whose history holds the same `function_call`
+- **WHEN** the service prepares the request
+- **THEN** the client receives an error event with `"status": 400` and code `string_above_max_length`
+- **AND** the service does not connect upstream
+
+#### Scenario: Arguments at the limit are forwarded unchanged
+
+- **GIVEN** a replayed `function_call` whose `arguments` is exactly 1,048,576 characters
+- **WHEN** the request is forwarded upstream
+- **THEN** upstream receives that item unchanged
+
+#### Scenario: A terminal compaction trigger keeps the compaction flow
+
+- **GIVEN** a request with an oversized replayed `function_call` whose last `input` item is a `compaction_trigger`
+- **WHEN** the service receives it
+- **THEN** the arguments limit does not reject it
+
+#### Scenario: An anchored request is left to upstream
+
+- **GIVEN** a request with `previous_response_id` whose `input` holds an oversized `function_call`
+- **WHEN** the service receives it
+- **THEN** the arguments limit does not reject it
+
+#### Scenario: A source-owned model keeps the WebSocket fallback to HTTP
+
+- **GIVEN** a WebSocket `response.create` eligible for routing to a configured model source, whose history holds an oversized `function_call`
+- **WHEN** the service prepares the request
+- **THEN** the client receives the `503 model_source_requires_http_transport` error event, not the arguments refusal
+
+#### Scenario: A pinned source thread keeps the bounded HTTP fallback
+
+- **GIVEN** a full-history WebSocket turn eligible for source routing with oversized `function_call` arguments, overflow enabled or draining, and a live or expired thread-source pin or an unreadable pin state
+- **WHEN** the service prepares the request
+- **THEN** the client receives the existing pinned-source status-503 HTTP fallback before reservation
+- **AND** the arguments refusal does not preempt it or route the history to a subscription account

@@ -17,3 +17,10 @@
 - [x] 3.2 Ruff check and format, architecture checks and `ty check`.
 - [x] 3.3 `openspec validate deliver-request-rejections-to-native-clients --strict`
   and `openspec validate --specs`.
+
+## 4. Combined delivery completion (Sol, retained author capacity recovery)
+
+- [x] 4.1 Port the selected immutable G6 boundary, no-echo, exemption and transport regression cases.
+- [x] 4.2 Add the original scoped argument-limit contract and reconcile the bridge marker wording.
+- [x] 4.3 Prove the enforcement discriminator red and the completed focused checks green; obtain independent completed-byte review.
+Delivery continues through sole Setup's existing original PR/CI/merge/installation records. Those states remain separate from the completed local checks above.
