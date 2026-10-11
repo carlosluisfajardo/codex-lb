@@ -5812,7 +5812,7 @@ def test_backend_responses_websocket_keeps_tool_call_of_unknown_previous_respons
     assert sent[0]["input"] == [replayed_call, _REPLAY_PREVIOUS_OUTPUT]
 
 
-def test_backend_responses_websocket_keeps_recorded_call_when_continuing_another_response(app_instance, monkeypatch):
+def test_backend_responses_websocket_sends_recorded_call_when_continuing_another_response(app_instance, monkeypatch):
     replayed_call = {
         "type": "function_call",
         "call_id": "call_previous",
@@ -5831,6 +5831,166 @@ def test_backend_responses_websocket_keeps_recorded_call_when_continuing_another
 
     assert sent[1]["previous_response_id"] == "resp_older"
     assert sent[1]["input"] == [replayed_call, _REPLAY_PREVIOUS_OUTPUT]
+
+
+class _ToolPairValidatingUpstreamWebSocket(_FakeUpstreamWebSocket):
+    """Answers each ``response.create`` the way the Responses API treats tool outputs.
+
+    An output is accepted only when its call is in the same input or in the
+    conversation stored under ``previous_response_id``; otherwise the turn is
+    rejected with the upstream's 400 ``invalid_request_error``.
+    """
+
+    def __init__(self, turns: list[tuple[str, list[dict[str, Any]]]]) -> None:
+        super().__init__([])
+        self._turns = deque(turns)
+        self._known_call_ids: dict[str, frozenset[str]] = {}
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        self._messages.put_nowait(_FakeUpstreamMessage("text", text=json.dumps(event, separators=(",", ":"))))
+
+    async def send_text(self, text: str) -> None:
+        await super().send_text(text)
+        payload = json.loads(text)
+        if payload.get("type") != "response.create":
+            return
+        response_id, output_items = self._turns.popleft()
+        known = set(self._known_call_ids.get(payload.get("previous_response_id") or "", frozenset()))
+        for item in payload.get("input") or []:
+            item_type = item.get("type") if isinstance(item, dict) else None
+            if item_type in {"function_call", "custom_tool_call"}:
+                known.add(item["call_id"])
+            elif item_type in {"function_call_output", "custom_tool_call_output"} and item["call_id"] not in known:
+                self._emit(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": f"No tool call found for function call output with call_id {item['call_id']}.",
+                        },
+                    }
+                )
+                return
+        known.update(item["call_id"] for item in output_items if "call_id" in item)
+        self._known_call_ids[response_id] = frozenset(known)
+        self._emit({"type": "response.created", "response": {"id": response_id, "status": "in_progress"}})
+        for index, item in enumerate(output_items):
+            self._emit({"type": "response.output_item.done", "item": item, "output_index": index})
+        self._emit(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "status": "completed",
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                },
+            }
+        )
+
+
+def _run_tool_pair_validating_turns(
+    app_instance,
+    monkeypatch,
+    *,
+    turns: list[tuple[str, list[dict[str, Any]]]],
+    requests: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    fake_upstream = _ToolPairValidatingUpstreamWebSocket(turns)
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fake_connect_proxy_websocket(self, headers, **kwargs):
+        del self, headers, kwargs
+        return SimpleNamespace(id="acct_ws_tool_pairs"), fake_upstream
+
+    async def fake_write_request_log(self, **kwargs):
+        del self, kwargs
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_write_request_log", fake_write_request_log)
+
+    terminal_events: list[dict[str, Any]] = []
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={"session_id": "thread-ws-tool-pairs-1"},
+        ) as websocket:
+            for request in requests:
+                websocket.send_text(json.dumps(request))
+                while True:
+                    event = json.loads(websocket.receive_text())
+                    if event["type"] in {"response.completed", "response.failed", "error"}:
+                        terminal_events.append(event)
+                        break
+    return terminal_events, [json.loads(text) for text in fake_upstream.sent_text]
+
+
+def _tool_pair_assistant_message(item_id: str, text: str) -> dict[str, Any]:
+    return {
+        "id": item_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": text}],
+    }
+
+
+def _tool_pair_request(input_items: list[dict[str, Any]], *, previous_response_id: str | None = None) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": input_items,
+        "stream": True,
+    }
+    if previous_response_id is not None:
+        request["previous_response_id"] = previous_response_id
+    return request
+
+
+def test_backend_responses_websocket_keeps_recorded_call_when_continuing_another_response(
+    app_instance,
+    monkeypatch,
+):
+    # The record belongs to resp_tool_turn_1; a continuation that names another
+    # response must not use it to drop a call, or the call's output is orphaned.
+    call = {
+        "id": "fc_previous",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "call_previous",
+        "name": "exec_command",
+        "arguments": "{}",
+    }
+    output = {"type": "function_call_output", "call_id": "call_previous", "output": "ok"}
+
+    terminal_events, sent_payloads = _run_tool_pair_validating_turns(
+        app_instance,
+        monkeypatch,
+        turns=[
+            ("resp_tool_turn_1", [call]),
+            ("resp_other_turn", [_tool_pair_assistant_message("msg_other_turn", "Done.")]),
+        ],
+        requests=[
+            _tool_pair_request([{"role": "user", "content": [{"type": "input_text", "text": "go"}]}]),
+            _tool_pair_request([call, output], previous_response_id="resp_older"),
+        ],
+    )
+
+    assert [event["type"] for event in terminal_events] == ["response.completed", "response.completed"], terminal_events
+    assert sent_payloads[1]["input"] == [call, output]
 
 
 def _run_multiplexed_tool_replay(

@@ -2258,6 +2258,21 @@ def test_trim_websocket_previous_response_input_items_keeps_call_the_previous_re
 
 def test_trim_websocket_previous_response_input_items_requires_the_recorded_call_type() -> None:
     items: list[JsonValue] = [
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+    ]
+
+    assert (
+        proxy_service._trim_websocket_previous_response_input_items(
+            items,
+            previous_response_tool_calls={"call_1": "custom_tool_call"},
+        )
+        == items
+    )
+
+
+def test_trim_websocket_previous_response_input_items_keeps_a_custom_call_recorded_with_another_type() -> None:
+    items: list[JsonValue] = [
         {"type": "custom_tool_call", "call_id": "call_shared", "name": "shell", "input": "pwd"},
         {"type": "custom_tool_call_output", "call_id": "call_shared", "output": "/tmp"},
     ]
