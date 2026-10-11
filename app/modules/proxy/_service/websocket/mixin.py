@@ -397,6 +397,7 @@ from app.modules.proxy._service.warmup import (
 from app.modules.proxy._service.warmup import (
     _WarmupUsageSnapshot as _WarmupUsageSnapshot,
 )
+from app.modules.proxy._service.websocket import overflow as _ws_overflow
 from app.modules.proxy._service.websocket.helpers import (
     _app_error_to_websocket_event,
     _assign_websocket_response_id,
@@ -507,6 +508,7 @@ from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_enforced_service_tier_model_fallback,
     apply_keyless_priority_service_tier,
+    enforce_function_call_arguments_limit,
     model_alias_requests_fast_mode,
     normalize_responses_request_payload,
     openai_client_payload_error,
@@ -1357,6 +1359,34 @@ async def _process_upstream_websocket_transport_end(
             downstream_activity,
         )
     return True
+
+
+async def _full_history_turn_bounces_to_pinned_source(
+    proxy: _WebSocketServiceProtocol,
+    headers: Mapping[str, str],
+) -> bool:
+    """Whether this full-history turn's thread is bounced to the source it is pinned to.
+
+    Mirrors the thread-key branch of ``bounce_pinned_or_anchored_websocket_turn``;
+    a full-history turn carries no anchor. With overflow on or draining, a live
+    or tombstoned thread pin, or a pin state that cannot be read, sends the turn
+    to HTTP, where the pinned source serves it.
+    """
+    if await _ws_overflow._overflow_window(proxy) is None:
+        return False
+    thread_key = _ws_overflow.overflow_thread_key(headers)
+    if thread_key is None:
+        return False
+    try:
+        pin = await _ws_overflow.lookup_pin_bounded(
+            _ws_overflow.thread_pin_key(thread_key),
+            cache=None,
+            scheduler=scheduler_for(proxy),
+            clock=clock_for(proxy),
+        )
+    except Exception:
+        return True
+    return pin.state in ("live", "expired") and pin.record is not None
 
 
 class _WebSocketMixin:
@@ -3229,6 +3259,33 @@ class _WebSocketMixin:
             # parse failure keeps the source guards active instead of
             # changing that behavior here.
             source_route_excluded = False
+        try:
+            enforce_function_call_arguments_limit(responses_payload)
+        except ClientPayloadError:
+            # A source-owned model is served over HTTP by its source; the connect
+            # guard's 503 sends the client there, so leave the request to it.
+            if source_route_excluded or not await responses_model_is_source_owned(
+                responses_payload.model,
+                refreshed_api_key,
+                raw_model=raw_source_model,
+            ):
+                # A thread pinned to a source is served there too. Its bounce is
+                # decided here, from this one pin read and before any reservation:
+                # the later bounce reads the pin again, and a pin gone by then must
+                # not send the oversized turn on to a subscription account. An
+                # unpinned thread is refused even with overflow on: a fresh overflow
+                # decision comes only after account selection, so no source owns
+                # the turn here.
+                if not source_route_excluded and await _full_history_turn_bounces_to_pinned_source(proxy, headers):
+                    raise ProxyResponseError(
+                        503,
+                        openai_error(
+                            _ws_overflow.WS_BOUNCE_CODE,
+                            _ws_overflow.WS_BOUNCE_PINNED_MESSAGE,
+                            error_type="server_error",
+                        ),
+                    ) from None
+                raise
         normalized_payload = responses_payload.to_payload()
         stripped_client_metadata = strip_capability_metadata(normalized_payload.get("client_metadata"))
         if stripped_client_metadata is not normalized_payload.get("client_metadata"):
