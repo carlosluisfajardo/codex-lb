@@ -1153,7 +1153,7 @@ async def _handle_stream_error(
         )
         return classified
     if classified["failure_class"] == "rate_limit":
-        await proxy._load_balancer.mark_rate_limit(account, error)
+        await proxy._load_balancer.mark_rate_limit(account, error, usage_limit_reached=code == USAGE_LIMIT_REACHED)
         if code == USAGE_LIMIT_REACHED:
             _request_usage_refresh(proxy, account.id)
     elif classified["failure_class"] == "quota":
