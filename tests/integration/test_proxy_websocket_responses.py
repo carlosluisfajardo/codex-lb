@@ -5652,28 +5652,251 @@ def test_backend_responses_websocket_injects_interrupted_custom_tool_output_afte
     )
 
 
-def test_backend_responses_websocket_trims_replayed_tool_call_items_with_previous_response_id(
+def _patch_tool_replay_websocket(monkeypatch, fake_upstream, *, account_id: str) -> None:
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fake_connect_proxy_websocket(self, headers, **kwargs):
+        del self, headers, kwargs
+        return SimpleNamespace(id=account_id), fake_upstream
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+
+
+def _tool_replay_event(event: dict[str, Any]) -> _FakeUpstreamMessage:
+    return _FakeUpstreamMessage("text", text=json.dumps(event, separators=(",", ":")))
+
+
+def _tool_replay_turn(response_id: str, *tool_calls: dict[str, Any]) -> list[_FakeUpstreamMessage]:
+    return [
+        _tool_replay_event({"type": "response.created", "response": {"id": response_id, "status": "in_progress"}}),
+        *(
+            _tool_replay_event({"type": "response.output_item.done", "item": tool_call, "output_index": index})
+            for index, tool_call in enumerate(tool_calls)
+        ),
+        _tool_replay_event(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "status": "completed",
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                },
+            }
+        ),
+    ]
+
+
+_REPLAY_PREVIOUS_FUNCTION_CALL = {
+    "id": "fc_previous",
+    "type": "function_call",
+    "status": "completed",
+    "call_id": "call_previous",
+    "name": "exec_command",
+    "arguments": '{"cmd":"date"}',
+}
+
+
+def _run_tool_replay_turns(
+    monkeypatch,
+    app_instance,
+    *,
+    turns: list[list[_FakeUpstreamMessage]],
+    requests: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    fake_upstream = _SequencedUpstreamWebSocket([], deferred_message_batches=turns)
+    _patch_tool_replay_websocket(monkeypatch, fake_upstream, account_id="acct_ws_tool_replay")
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={
+                "Authorization": "Bearer external-token",
+                "session_id": "thread-ws-tool-replay-1",
+                "openai-beta": "responses_websockets=2026-02-06",
+            },
+        ) as websocket:
+            for request, turn in zip(requests, turns, strict=True):
+                websocket.send_text(json.dumps(request))
+                events = [json.loads(websocket.receive_text()) for _ in turn]
+                assert events[-1]["type"] == "response.completed"
+    return [json.loads(message) for message in fake_upstream.sent_text]
+
+
+def _tool_replay_request(input_items: list[dict[str, Any]], *, previous_response_id: str | None) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": input_items,
+        "stream": True,
+    }
+    if previous_response_id is not None:
+        request["previous_response_id"] = previous_response_id
+    return request
+
+
+_REPLAY_FIRST_USER_MESSAGE = {"role": "user", "content": [{"type": "input_text", "text": "check the date"}]}
+_REPLAY_PREVIOUS_OUTPUT = {
+    "type": "function_call_output",
+    "call_id": "call_previous",
+    "output": "Wed May 6 16:00:00 UTC 2026",
+}
+
+
+def test_backend_responses_websocket_trims_proven_replayed_tool_call_items_with_previous_response_id(
     app_instance,
     monkeypatch,
 ):
-    fake_upstream = _FakeUpstreamWebSocket(
-        [
-            _FakeUpstreamMessage(
-                "text",
-                text=json.dumps(
-                    {"type": "response.created", "response": {"id": "resp_ws_tool_output", "status": "in_progress"}},
-                    separators=(",", ":"),
-                ),
+    sent = _run_tool_replay_turns(
+        monkeypatch,
+        app_instance,
+        turns=[_tool_replay_turn("resp_ws_tool_call", _REPLAY_PREVIOUS_FUNCTION_CALL), _tool_replay_turn("resp_next")],
+        requests=[
+            _tool_replay_request([_REPLAY_FIRST_USER_MESSAGE], previous_response_id=None),
+            _tool_replay_request(
+                [
+                    {"type": "reasoning", "summary": []},
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "running"}]},
+                    {
+                        "type": "function_call",
+                        "call_id": "call_previous",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"date"}',
+                    },
+                    _REPLAY_PREVIOUS_OUTPUT,
+                ],
+                previous_response_id="resp_ws_tool_call",
             ),
-            _FakeUpstreamMessage(
-                "text",
-                text=json.dumps(
-                    {"type": "response.completed", "response": {"id": "resp_ws_tool_output", "status": "completed"}},
-                    separators=(",", ":"),
-                ),
-            ),
-        ]
+        ],
     )
+
+    assert sent[1]["previous_response_id"] == "resp_ws_tool_call"
+    assert sent[1]["input"] == [_REPLAY_PREVIOUS_OUTPUT]
+
+
+def test_backend_responses_websocket_keeps_tool_call_of_unknown_previous_response(app_instance, monkeypatch):
+    replayed_call = {
+        "type": "function_call",
+        "call_id": "call_previous",
+        "name": "exec_command",
+        "arguments": '{"cmd":"date"}',
+    }
+    sent = _run_tool_replay_turns(
+        monkeypatch,
+        app_instance,
+        turns=[_tool_replay_turn("resp_next")],
+        requests=[
+            _tool_replay_request(
+                [
+                    {"type": "reasoning", "summary": []},
+                    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "running"}]},
+                    replayed_call,
+                    _REPLAY_PREVIOUS_OUTPUT,
+                ],
+                previous_response_id="resp_from_elsewhere",
+            ),
+        ],
+    )
+
+    assert sent[0]["previous_response_id"] == "resp_from_elsewhere"
+    assert sent[0]["input"] == [replayed_call, _REPLAY_PREVIOUS_OUTPUT]
+
+
+def test_backend_responses_websocket_sends_recorded_call_when_continuing_another_response(app_instance, monkeypatch):
+    replayed_call = {
+        "type": "function_call",
+        "call_id": "call_previous",
+        "name": "exec_command",
+        "arguments": '{"cmd":"date"}',
+    }
+    sent = _run_tool_replay_turns(
+        monkeypatch,
+        app_instance,
+        turns=[_tool_replay_turn("resp_ws_tool_call", _REPLAY_PREVIOUS_FUNCTION_CALL), _tool_replay_turn("resp_next")],
+        requests=[
+            _tool_replay_request([_REPLAY_FIRST_USER_MESSAGE], previous_response_id=None),
+            _tool_replay_request([replayed_call, _REPLAY_PREVIOUS_OUTPUT], previous_response_id="resp_older"),
+        ],
+    )
+
+    assert sent[1]["previous_response_id"] == "resp_older"
+    assert sent[1]["input"] == [replayed_call, _REPLAY_PREVIOUS_OUTPUT]
+
+
+class _ToolPairValidatingUpstreamWebSocket(_FakeUpstreamWebSocket):
+    """Answers each ``response.create`` the way the Responses API treats tool outputs.
+
+    An output is accepted only when its call is in the same input or in the
+    conversation stored under ``previous_response_id``; otherwise the turn is
+    rejected with the upstream's 400 ``invalid_request_error``.
+    """
+
+    def __init__(self, turns: list[tuple[str, list[dict[str, Any]]]]) -> None:
+        super().__init__([])
+        self._turns = deque(turns)
+        self._known_call_ids: dict[str, frozenset[str]] = {}
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        self._messages.put_nowait(_FakeUpstreamMessage("text", text=json.dumps(event, separators=(",", ":"))))
+
+    async def send_text(self, text: str) -> None:
+        await super().send_text(text)
+        payload = json.loads(text)
+        if payload.get("type") != "response.create":
+            return
+        response_id, output_items = self._turns.popleft()
+        known = set(self._known_call_ids.get(payload.get("previous_response_id") or "", frozenset()))
+        for item in payload.get("input") or []:
+            item_type = item.get("type") if isinstance(item, dict) else None
+            if item_type in {"function_call", "custom_tool_call"}:
+                known.add(item["call_id"])
+            elif item_type in {"function_call_output", "custom_tool_call_output"} and item["call_id"] not in known:
+                self._emit(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": f"No tool call found for function call output with call_id {item['call_id']}.",
+                        },
+                    }
+                )
+                return
+        known.update(item["call_id"] for item in output_items if "call_id" in item)
+        self._known_call_ids[response_id] = frozenset(known)
+        self._emit({"type": "response.created", "response": {"id": response_id, "status": "in_progress"}})
+        for index, item in enumerate(output_items):
+            self._emit({"type": "response.output_item.done", "item": item, "output_index": index})
+        self._emit(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "status": "completed",
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                },
+            }
+        )
+
+
+def _run_tool_pair_validating_turns(
+    app_instance,
+    monkeypatch,
+    *,
+    turns: list[tuple[str, list[dict[str, Any]]]],
+    requests: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    fake_upstream = _ToolPairValidatingUpstreamWebSocket(turns)
 
     class _FakeSettingsCache:
         async def get(self):
@@ -5685,26 +5908,9 @@ def test_backend_responses_websocket_trims_replayed_tool_call_items_with_previou
     async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
         return None
 
-    async def fake_connect_proxy_websocket(
-        self,
-        headers,
-        *,
-        sticky_key,
-        sticky_kind,
-        prefer_earlier_reset,
-        prefer_earlier_reset_window,
-        routing_strategy,
-        model,
-        request_state,
-        api_key,
-        client_send_lock,
-        websocket,
-        reallocate_sticky=False,
-        sticky_max_age_seconds=None,
-    ):
-        del self, headers, sticky_key, sticky_kind, prefer_earlier_reset, routing_strategy, model
-        del request_state, api_key, client_send_lock, websocket, reallocate_sticky, sticky_max_age_seconds
-        return SimpleNamespace(id="acct_ws_tool_output"), fake_upstream
+    async def fake_connect_proxy_websocket(self, headers, **kwargs):
+        del self, headers, kwargs
+        return SimpleNamespace(id="acct_ws_tool_pairs"), fake_upstream
 
     async def fake_write_request_log(self, **kwargs):
         del self, kwargs
@@ -5715,50 +5921,232 @@ def test_backend_responses_websocket_trims_replayed_tool_call_items_with_previou
     monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
     monkeypatch.setattr(proxy_module.ProxyService, "_write_request_log", fake_write_request_log)
 
-    request_payload = {
+    terminal_events: list[dict[str, Any]] = []
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={"session_id": "thread-ws-tool-pairs-1"},
+        ) as websocket:
+            for request in requests:
+                websocket.send_text(json.dumps(request))
+                while True:
+                    event = json.loads(websocket.receive_text())
+                    if event["type"] in {"response.completed", "response.failed", "error"}:
+                        terminal_events.append(event)
+                        break
+    return terminal_events, [json.loads(text) for text in fake_upstream.sent_text]
+
+
+def _tool_pair_assistant_message(item_id: str, text: str) -> dict[str, Any]:
+    return {
+        "id": item_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": text}],
+    }
+
+
+def _tool_pair_request(input_items: list[dict[str, Any]], *, previous_response_id: str | None = None) -> dict[str, Any]:
+    request: dict[str, Any] = {
         "type": "response.create",
         "model": "gpt-5.4",
         "instructions": "",
-        "previous_response_id": "resp_prev_tool_call",
-        "input": [
-            {"type": "reasoning", "summary": []},
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "running command"}],
-            },
-            {
-                "type": "function_call",
-                "call_id": "call_repeat",
-                "name": "exec_command",
-                "arguments": '{"cmd":"date"}',
-            },
-            {
-                "type": "function_call_output",
-                "call_id": "call_repeat",
-                "output": "Wed May 6 16:00:00 UTC 2026",
-            },
-        ],
+        "input": input_items,
         "stream": True,
     }
+    if previous_response_id is not None:
+        request["previous_response_id"] = previous_response_id
+    return request
 
-    with TestClient(app_instance) as client:
-        with client.websocket_connect("/backend-api/codex/responses") as websocket:
-            websocket.send_text(json.dumps(request_payload))
-            first = json.loads(websocket.receive_text())
-            second = json.loads(websocket.receive_text())
 
-    assert first["type"] == "response.created"
-    assert second["type"] == "response.completed"
-    sent_payload = json.loads(fake_upstream.sent_text[0])
-    assert sent_payload["previous_response_id"] == "resp_prev_tool_call"
-    assert sent_payload["input"] == [
-        {
-            "type": "function_call_output",
-            "call_id": "call_repeat",
-            "output": "Wed May 6 16:00:00 UTC 2026",
-        }
+def test_backend_responses_websocket_keeps_recorded_call_when_continuing_another_response(
+    app_instance,
+    monkeypatch,
+):
+    # The record belongs to resp_tool_turn_1; a continuation that names another
+    # response must not use it to drop a call, or the call's output is orphaned.
+    call = {
+        "id": "fc_previous",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "call_previous",
+        "name": "exec_command",
+        "arguments": "{}",
+    }
+    output = {"type": "function_call_output", "call_id": "call_previous", "output": "ok"}
+
+    terminal_events, sent_payloads = _run_tool_pair_validating_turns(
+        app_instance,
+        monkeypatch,
+        turns=[
+            ("resp_tool_turn_1", [call]),
+            ("resp_other_turn", [_tool_pair_assistant_message("msg_other_turn", "Done.")]),
+        ],
+        requests=[
+            _tool_pair_request([{"role": "user", "content": [{"type": "input_text", "text": "go"}]}]),
+            _tool_pair_request([call, output], previous_response_id="resp_older"),
+        ],
+    )
+
+    assert [event["type"] for event in terminal_events] == ["response.completed", "response.completed"], terminal_events
+    assert sent_payloads[1]["input"] == [call, output]
+
+
+def _run_multiplexed_tool_replay(
+    monkeypatch,
+    app_instance,
+    *,
+    third_turn: list[_FakeUpstreamMessage],
+    continuation_input: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Pipeline A, B and C on one socket so A and B are created while C is not, then continue from C."""
+    turns = [
+        [_tool_replay_event({"type": "response.created", "response": {"id": "resp_A", "status": "in_progress"}})],
+        [_tool_replay_event({"type": "response.created", "response": {"id": "resp_B", "status": "in_progress"}})],
+        third_turn,
+        _tool_replay_turn("resp_D"),
     ]
+    fake_upstream = _SequencedUpstreamWebSocket([], deferred_message_batches=turns)
+    _patch_tool_replay_websocket(monkeypatch, fake_upstream, account_id="acct_ws_multiplexed_replay")
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={
+                "Authorization": "Bearer external-token",
+                "session_id": "thread-ws-multiplexed-replay-1",
+                "openai-beta": "responses_websockets=2026-02-06",
+            },
+        ) as websocket:
+            for text in ("first", "second", "third"):
+                user_message = {"role": "user", "content": [{"type": "input_text", "text": text}]}
+                websocket.send_text(json.dumps(_tool_replay_request([user_message], previous_response_id=None)))
+                if text != "third":
+                    assert json.loads(websocket.receive_text())["type"] == "response.created"
+            third_events = [json.loads(websocket.receive_text()) for _ in third_turn]
+            assert third_events[-1]["type"] == "response.completed"
+            assert third_events[-1]["response"]["id"] == "resp_C"
+            websocket.send_text(json.dumps(_tool_replay_request(continuation_input, previous_response_id="resp_C")))
+            continuation_events = [json.loads(websocket.receive_text()) for _ in turns[3]]
+            assert continuation_events[-1]["type"] == "response.completed"
+    sent = [json.loads(message) for message in fake_upstream.sent_text]
+    assert sent[3]["previous_response_id"] == "resp_C"
+    return sent[3]
+
+
+def _multiplexed_completed(response_id: str) -> _FakeUpstreamMessage:
+    return _tool_replay_event(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+    )
+
+
+def test_backend_responses_websocket_ambiguous_anonymous_tool_call_does_not_prove_replay(app_instance, monkeypatch):
+    # With A and B created and C still uncreated, an anonymous done event carrying A's call is
+    # attributed to C by the pipelined-socket fallback. It must not prove that resp_C emitted it.
+    call_from_a = {
+        "id": "fc_from_A",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "call_from_A",
+        "name": "visualization_state",
+        "arguments": "{}",
+    }
+    continuation_call = {k: v for k, v in call_from_a.items() if k not in {"id", "status"}}
+    continuation_output = {"type": "function_call_output", "call_id": "call_from_A", "output": "{}"}
+    upstream_continuation = _run_multiplexed_tool_replay(
+        monkeypatch,
+        app_instance,
+        third_turn=[
+            _tool_replay_event({"type": "response.output_item.done", "item": call_from_a, "output_index": 0}),
+            _multiplexed_completed("resp_A"),
+            _multiplexed_completed("resp_B"),
+            _tool_replay_event({"type": "response.created", "response": {"id": "resp_C", "status": "in_progress"}}),
+            _multiplexed_completed("resp_C"),
+        ],
+        continuation_input=[continuation_call, continuation_output],
+    )
+
+    assert upstream_continuation["input"] == [continuation_call, continuation_output]
+
+
+def test_backend_responses_websocket_explicit_response_id_proves_replay_on_multiplexed_socket(
+    app_instance,
+    monkeypatch,
+):
+    call_from_c = {
+        "id": "fc_from_C",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "call_from_C",
+        "name": "exec_command",
+        "arguments": "{}",
+    }
+    replayed_call = {k: v for k, v in call_from_c.items() if k not in {"id", "status"}}
+    continuation_output = {"type": "function_call_output", "call_id": "call_from_C", "output": "ok"}
+    upstream_continuation = _run_multiplexed_tool_replay(
+        monkeypatch,
+        app_instance,
+        third_turn=[
+            _tool_replay_event({"type": "response.created", "response": {"id": "resp_C", "status": "in_progress"}}),
+            _tool_replay_event(
+                {"type": "response.output_item.done", "response_id": "resp_C", "item": call_from_c, "output_index": 0}
+            ),
+            _multiplexed_completed("resp_A"),
+            _multiplexed_completed("resp_B"),
+            _multiplexed_completed("resp_C"),
+        ],
+        continuation_input=[replayed_call, continuation_output],
+    )
+
+    assert upstream_continuation["input"] == [continuation_output]
+
+
+@pytest.mark.parametrize(
+    ("new_call", "new_output"),
+    [
+        pytest.param(
+            {"type": "function_call", "call_id": "call_injected", "name": "visualization_state", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_injected", "output": "{}"},
+            id="function_call",
+        ),
+        pytest.param(
+            {"type": "custom_tool_call", "call_id": "call_injected", "name": "visualization_state", "input": "{}"},
+            {"type": "custom_tool_call_output", "call_id": "call_injected", "output": "{}"},
+            id="custom_tool_call",
+        ),
+        pytest.param(
+            {"type": "apply_patch_call", "call_id": "call_injected", "input": "*** Begin Patch\n*** End Patch\n"},
+            {"type": "apply_patch_call_output", "call_id": "call_injected", "output": "Success"},
+            id="apply_patch_call",
+        ),
+    ],
+)
+def test_backend_responses_websocket_keeps_new_call_result_pair_on_continuation(
+    app_instance,
+    monkeypatch,
+    new_call,
+    new_output,
+):
+    continuation_input = [new_call, new_output, _REPLAY_PREVIOUS_OUTPUT]
+    sent = _run_tool_replay_turns(
+        monkeypatch,
+        app_instance,
+        turns=[_tool_replay_turn("resp_ws_tool_call", _REPLAY_PREVIOUS_FUNCTION_CALL), _tool_replay_turn("resp_next")],
+        requests=[
+            _tool_replay_request([_REPLAY_FIRST_USER_MESSAGE], previous_response_id=None),
+            _tool_replay_request(continuation_input, previous_response_id="resp_ws_tool_call"),
+        ],
+    )
+
+    assert sent[1]["previous_response_id"] == "resp_ws_tool_call"
+    assert sent[1]["input"] == continuation_input
 
 
 def test_v1_responses_websocket_forwards_previous_response_id(app_instance, monkeypatch):
@@ -14400,3 +14788,115 @@ def test_backend_responses_websocket_re_sends_an_anchored_accepted_failure_in_a_
     assert "previous_response_id" not in replayed_payload
     assert replayed_payload["input"] == [failover.HISTORICAL_INPUT, failover.FOLLOW_UP_INPUT]
     assert other_account_upstream.sent_text == []
+
+
+def test_backend_responses_websocket_rejects_oversized_function_call_arguments_before_upstream(
+    app_instance,
+    monkeypatch,
+):
+    """A replayed function_call whose arguments exceed upstream's string limit
+    fails locally with the status-400 error event the Codex client surfaces as
+    a non-retryable invalid request, before any upstream connect."""
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fail_connect_proxy_websocket(self, headers, **kwargs):
+        del self, headers, kwargs
+        raise AssertionError("oversized function_call arguments must fail before upstream websocket connect")
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fail_connect_proxy_websocket)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "ask me something"}]},
+            {
+                "type": "function_call",
+                "name": "request_user_input",
+                "call_id": "call_oversized_history",
+                "arguments": "x" * 1_048_577,
+            },
+            {"type": "function_call_output", "call_id": "call_oversized_history", "output": "invalid arguments"},
+            {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            error_event = json.loads(websocket.receive_text())
+
+    assert error_event["type"] == "error"
+    assert error_event["status"] == 400
+    assert error_event["error"]["type"] == "invalid_request_error"
+    assert error_event["error"]["code"] == "string_above_max_length"
+    assert error_event["error"]["param"] == "input[1].arguments"
+    assert "length 1048577" in error_event["error"]["message"]
+    assert "x" * 64 not in json.dumps(error_event)
+
+
+def test_backend_responses_websocket_leaves_oversized_history_of_a_source_owned_model_to_the_http_fallback(
+    app_instance,
+    monkeypatch,
+):
+    """A source-owned model is served over HTTP by its source. The oversized
+    arguments refusal must not preempt the 503 that sends the Codex client
+    there; the HTTP route routes to the source before the refusal applies."""
+    model = "external-ws-source-oversized-history"
+    source_checks: list[str | None] = []
+
+    async def configured_source(source_model, api_key, *, raw_model=None):
+        del api_key, raw_model
+        source_checks.append(source_model)
+        return source_model == model
+
+    async def fail_before_subscription_selection(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("a source-owned model must not select a subscription account")
+
+    monkeypatch.setattr(websocket_mixin_module, "responses_model_is_source_owned", configured_source)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_select_websocket_connect_account",
+        fail_before_subscription_selection,
+    )
+    response_create = _websocket_response_create("unused")
+    response_create.update(
+        {
+            "model": model,
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "ask me something"}]},
+                {
+                    "type": "function_call",
+                    "name": "request_user_input",
+                    "call_id": "call_oversized_history",
+                    "arguments": "x" * 1_048_577,
+                },
+                {"type": "function_call_output", "call_id": "call_oversized_history", "output": "invalid arguments"},
+            ],
+        }
+    )
+
+    with TestClient(app_instance, client=("127.0.0.1", 50000)) as client:
+        with client.websocket_connect("ws://localhost/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(response_create))
+            event = json.loads(websocket.receive_text())
+
+    assert event["type"] == "error"
+    assert event["status"] == 503
+    assert event["error"]["code"] == "model_source_requires_http_transport"
+    assert model in source_checks

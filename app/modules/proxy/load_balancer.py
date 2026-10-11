@@ -1707,11 +1707,17 @@ class LoadBalancer:
     _persist_sticky_mutation = staticmethod(_persist_sticky_mutation)
     _restore_sticky_mutation = staticmethod(_restore_sticky_mutation)
 
-    async def mark_rate_limit(self, account: Account, error: UpstreamError) -> None:
+    async def mark_rate_limit(
+        self, account: Account, error: UpstreamError, *, usage_limit_reached: bool = False
+    ) -> None:
         lock = await self._get_account_lock(account.id)
         async with lock:
+            exhausted_window_reset_at = None
+            if usage_limit_reached:
+                async with self._repo_factory() as repos:
+                    exhausted_window_reset_at = await repos.usage.exhausted_window_reset_at(account.id)
             state = self._state_for(account)
-            handle_rate_limit(state, error)
+            handle_rate_limit(state, error, exhausted_window_reset_at=exhausted_window_reset_at)
             self._sync_runtime_state(account, state)
             async with self._repo_factory() as repos:
                 await self._persist_state(repos.accounts, account, state)
