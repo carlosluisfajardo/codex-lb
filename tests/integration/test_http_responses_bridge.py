@@ -18433,18 +18433,14 @@ async def test_backend_responses_http_bridge_fails_a_self_excluded_hard_owner_re
         return
     # The model-fallback replay surfaces the upstream rejection that started
     # it, which is the actionable error for a hard owner that cannot serve the
-    # requested model.
-    assert response.status_code == 200
-    events = [
-        event
-        for line in body.splitlines()
-        if line.startswith("data: ") and line[6:] != "[DONE]"
-        if (event := json.loads(line[6:])).get("type") != "codex.keepalive"
-    ]
-    assert [event["type"] for event in events] == ["error"]
-    assert events[0]["error"]["code"] == "invalid_request_error"
-    assert events[0]["error"]["message"] == (
-        f"The '{model}' model is not supported when using Codex with a ChatGPT account."
+    # requested model. It is a request rejection, so the native client gets the
+    # HTTP 400 an HTTP upstream returns instead of a bare ``error`` frame.
+    assert response.status_code == 400
+    error = json.loads(body)["error"]
+    assert error["code"] == "invalid_request_error"
+    assert error["message"] == (
+        "The requested model is not supported when using Codex with a ChatGPT account. "
+        "Retrying the same request fails the same way; choose a different model."
     )
 
 
