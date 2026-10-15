@@ -27,7 +27,6 @@ from app.core.balancer import (
 )
 from app.core.balancer.logic import DRAIN_PRIMARY_THRESHOLD_PCT, PROBE_QUIET_SECONDS
 from app.core.usage.quota import apply_usage_quota
-from app.core.usage.refresh_policy import usage_freshness_horizon_seconds
 from app.db.models import Account, AccountStatus, UsageHistory
 from app.modules.proxy._load_balancer.tunables import RoutingTunables
 from app.modules.proxy.load_balancer import (
@@ -4339,29 +4338,25 @@ def test_background_recovery_state_keeps_rate_limited_without_persisted_reset(mo
 
 
 _POST_BLOCK_WEEK_SECONDS = 7 * 24 * 3600
+_NOW = 1_700_000_000.0
 
 
-def _post_block_window_reset_inputs(now: float, **overrides):
+def _post_block_rate_limit_inputs(**overrides):
     case = {
-        "blocked_at": int(now - 3 * 3600),
-        "stored_reset_at": int(now + 2 * 24 * 3600),
+        "blocked_at": int(_NOW - 3 * 3600),
+        "stored_reset_at": int(_NOW + 2 * 24 * 3600),
         "secondary_used": 3.0,
-        "secondary_reset_at": int(now - 600 + _POST_BLOCK_WEEK_SECONDS),
-        "secondary_recorded_at": now - 30,
-        "window_minutes": 10080,
+        "secondary_reset_at": int(_NOW - 600 + _POST_BLOCK_WEEK_SECONDS),
+        "secondary_recorded_at": _NOW - 30,
         "primary_used": 5.0,
-        "primary_reset_at": int(now + 3600),
-        "primary_recorded_at": now - 30,
-        "status": AccountStatus.RATE_LIMITED,
-        "plan_type": "plus",
-        "long_window": "secondary",
+        "primary_reset_at": int(_NOW + 3600),
+        "primary_recorded_at": _NOW - 30,
     }
     case.update(overrides)
     account = _make_test_account(
-        status=case["status"],
+        status=AccountStatus.RATE_LIMITED,
         reset_at=case["stored_reset_at"],
         blocked_at=case["blocked_at"],
-        plan_type=case["plan_type"],
     )
     primary = _make_test_usage(
         window="primary",
@@ -4370,64 +4365,12 @@ def _post_block_window_reset_inputs(now: float, **overrides):
         recorded_at=_epoch_to_naive_utc(case["primary_recorded_at"]),
     )
     secondary = _make_test_usage(
-        window=case["long_window"],
+        window="secondary",
         used_percent=case["secondary_used"],
         reset_at=case["secondary_reset_at"],
         recorded_at=_epoch_to_naive_utc(case["secondary_recorded_at"]),
     )
-    secondary.window_minutes = case["window_minutes"]
     return account, primary, secondary
-
-
-@pytest.mark.parametrize("marking_replica", [False, True])
-def test_state_from_account_recovers_rate_limit_from_post_block_long_window_reset(monkeypatch, marking_replica):
-    now = 1_700_000_000.0
-    monkeypatch.setattr("time.time", lambda: now)
-    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
-    account, primary, secondary = _post_block_window_reset_inputs(now)
-    runtime = RuntimeState()
-    if marking_replica:
-        # The replica that saw the 429 holds its parsed Retry-After until the stored deadline.
-        runtime = RuntimeState(
-            blocked_at=float(account.blocked_at),
-            cooldown_until=float(account.reset_at),
-            reset_at=float(account.reset_at),
-        )
-
-    state = _state_from_account(
-        account=account,
-        primary_entry=primary,
-        secondary_entry=secondary,
-        runtime=runtime,
-        now=now,
-    )
-
-    assert state.status == AccountStatus.ACTIVE
-    assert state.reset_at is None
-    assert state.blocked_at is None
-    assert state.cooldown_until is None
-    assert select_account([state], now=now).account is state
-
-
-def test_background_recovery_state_recovers_rate_limit_from_post_block_long_window_reset(monkeypatch):
-    now = 1_700_000_000.0
-    monkeypatch.setattr("time.time", lambda: now)
-    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
-    account, primary, secondary = _post_block_window_reset_inputs(now)
-
-    state = background_recovery_state_from_account(
-        account=account,
-        primary_entry=primary,
-        secondary_entry=secondary,
-    )
-
-    assert state.status == AccountStatus.ACTIVE
-    assert state.reset_at is None
-    assert state.blocked_at is None
-
-
-_NOW = 1_700_000_000.0
-_STALE_AGE = usage_freshness_horizon_seconds() + 60
 
 
 @pytest.mark.parametrize("path", ["runtime", "marking-replica", "background"])
@@ -4436,85 +4379,39 @@ _STALE_AGE = usage_freshness_horizon_seconds() + 60
     [
         pytest.param(
             {
-                "blocked_at": int(_NOW - _STALE_AGE - 7200),
-                "secondary_reset_at": int(_NOW - _STALE_AGE - 600 + _POST_BLOCK_WEEK_SECONDS),
-                "secondary_recorded_at": _NOW - _STALE_AGE,
-                "primary_recorded_at": _NOW - _STALE_AGE,
+                "blocked_at": int(_NOW - 120),
+                "stored_reset_at": int(_NOW + 1200),
+                "secondary_used": 0.0,
+                "secondary_reset_at": int(_NOW) + _POST_BLOCK_WEEK_SECONDS,
+                "secondary_recorded_at": _NOW,
+                "primary_recorded_at": _NOW,
             },
-            id="stale-sample",
-        ),
-        pytest.param(
-            {"blocked_at": int(_NOW - 60), "secondary_recorded_at": _NOW - 3600, "primary_recorded_at": _NOW - 3600},
-            id="pre-block-sample",
-        ),
-        pytest.param(
-            {"secondary_reset_at": int(_NOW + 2 * 24 * 3600), "secondary_used": 40.0},
-            id="unchanged-reset",
-        ),
-        pytest.param(
-            {
-                "blocked_at": int(_NOW - 600),
-                "stored_reset_at": int(_NOW - 600 + 1200),
-                "secondary_reset_at": int(_NOW + 3 * 24 * 3600),
-                "secondary_used": 40.0,
-            },
-            id="retry-after-throttle-on-unchanged-window",
-        ),
-        pytest.param({"stored_reset_at": int(_NOW + 8 * 24 * 3600)}, id="stored-deadline-beyond-new-window"),
-        pytest.param(
-            {"stored_reset_at": int(_NOW - 600 + _POST_BLOCK_WEEK_SECONDS) - 30},
-            id="reset-moved-within-jitter",
+            id="unstarted-sliding-window",
         ),
         pytest.param(
             {
                 "blocked_at": int(_NOW - 600),
                 "stored_reset_at": int(_NOW + 600),
-                "secondary_reset_at": int(_NOW - 570) + _POST_BLOCK_WEEK_SECONDS,
+                "secondary_used": 2.0,
+                "secondary_reset_at": int(_NOW - 300) + _POST_BLOCK_WEEK_SECONDS,
             },
-            id="window-began-within-jitter-of-block",
-        ),
-        pytest.param({"secondary_reset_at": None}, id="unknown-long-reset"),
-        pytest.param({"window_minutes": None}, id="unknown-window-length"),
-        pytest.param({"window_minutes": 1}, id="window-starting-after-sample"),
-        pytest.param({"secondary_reset_at": 15_023_672_358}, id="implausible-long-reset"),
-        pytest.param({"secondary_used": float("-inf")}, id="malformed-usage"),
-        pytest.param({"secondary_used": 100.0}, id="exhausted-new-window"),
-        pytest.param({"primary_used": 100.0}, id="primary-current-exhaustion"),
-        pytest.param({"primary_used": 100.0, "primary_reset_at": None}, id="primary-exhaustion-unknown-reset"),
-        pytest.param(
-            {
-                "blocked_at": int(_NOW - 10),
-                "secondary_reset_at": int(_NOW + 55) + _POST_BLOCK_WEEK_SECONDS,
-                "secondary_recorded_at": _NOW - 1,
-                "primary_recorded_at": _NOW - 1,
-            },
-            id="post-429-minimum-floor",
-        ),
-        pytest.param(
-            {
-                "status": AccountStatus.QUOTA_EXCEEDED,
-                "blocked_at": int(_NOW - 100),
-                "secondary_reset_at": int(_NOW - 30) + _POST_BLOCK_WEEK_SECONDS,
-                "secondary_recorded_at": _NOW - 5,
-                "primary_recorded_at": _NOW - 5,
-            },
-            id="quota-exceeded-keeps-own-recovery",
-        ),
-        pytest.param(
-            {
-                "plan_type": "free",
-                "long_window": "monthly",
-                "window_minutes": 43_200,
-                "secondary_reset_at": int(_NOW - 600) + 43_200 * 60,
-            },
-            id="free-monthly-sliding-window",
+            id="window-started-by-account-use",
         ),
     ],
 )
-def test_post_block_long_window_reset_keeps_block_without_proof(monkeypatch, path, overrides):
+def test_latest_long_window_sample_keeps_running_retry_after_hold(monkeypatch, path, overrides):
+    # Neither sample proves the blocked window reset: an unstarted window slides with every sample, and direct
+    # account use can start a window after an unrelated Retry-After 429.
     monkeypatch.setattr("time.time", lambda: _NOW)
     monkeypatch.setattr("app.core.usage.quota.time.time", lambda: _NOW)
-    account, primary, secondary = _post_block_window_reset_inputs(_NOW, **overrides)
+    account, primary, secondary = _post_block_rate_limit_inputs(**overrides)
+    runtime = RuntimeState()
+    if path == "marking-replica":
+        runtime = RuntimeState(
+            blocked_at=float(account.blocked_at),
+            cooldown_until=float(account.reset_at),
+            reset_at=float(account.reset_at),
+        )
 
     if path == "background":
         state = background_recovery_state_from_account(
@@ -4523,13 +4420,6 @@ def test_post_block_long_window_reset_keeps_block_without_proof(monkeypatch, pat
             secondary_entry=secondary,
         )
     else:
-        runtime = RuntimeState()
-        if path == "marking-replica":
-            runtime = RuntimeState(
-                blocked_at=float(account.blocked_at),
-                cooldown_until=float(account.reset_at),
-                reset_at=float(account.reset_at),
-            )
         state = _state_from_account(
             account=account,
             primary_entry=primary,
@@ -4537,31 +4427,116 @@ def test_post_block_long_window_reset_keeps_block_without_proof(monkeypatch, pat
             runtime=runtime,
             now=_NOW,
         )
-        assert state.cooldown_until == runtime.cooldown_until
 
-    assert state.status == account.status
+    assert state.status == AccountStatus.RATE_LIMITED
     assert state.reset_at == pytest.approx(account.reset_at)
     assert state.blocked_at == pytest.approx(account.blocked_at)
+    if path != "background":
+        assert state.cooldown_until == runtime.cooldown_until
 
 
-def test_post_block_long_window_reset_requires_window_after_newer_runtime_block(monkeypatch):
+@pytest.mark.parametrize("cooldown_left", [900.0, -1.0], ids=["runtime-cooldown-running", "runtime-cooldown-elapsed"])
+def test_newer_runtime_block_needs_primary_evidence_after_it(monkeypatch, cooldown_left):
+    # This replica's newer 429 never reached the database: primary usage recorded between the persisted and the
+    # runtime block cannot end that block, even beside a weekly window that began after both markers.
     monkeypatch.setattr("time.time", lambda: _NOW)
     monkeypatch.setattr("app.core.usage.quota.time.time", lambda: _NOW)
-    account, primary, secondary = _post_block_window_reset_inputs(_NOW)
-    # This replica observed a newer 429 after the long window began.
-    newer_block = _NOW - 300
+    account, primary, secondary = _post_block_rate_limit_inputs(
+        primary_recorded_at=_NOW - 360,
+        secondary_reset_at=int(_NOW - 120) + _POST_BLOCK_WEEK_SECONDS,
+    )
 
     state = _state_from_account(
         account=account,
         primary_entry=primary,
         secondary_entry=secondary,
-        runtime=RuntimeState(blocked_at=newer_block, cooldown_until=_NOW + 900),
+        runtime=RuntimeState(blocked_at=_NOW - 300, cooldown_until=_NOW + cooldown_left),
         now=_NOW,
     )
 
     assert state.status == AccountStatus.RATE_LIMITED
     assert state.reset_at == pytest.approx(account.reset_at)
-    assert state.cooldown_until == pytest.approx(_NOW + 900)
+    assert state.blocked_at == pytest.approx(account.blocked_at)
+    assert state.cooldown_until == pytest.approx(_NOW + cooldown_left)
+
+
+def test_newer_runtime_block_keeps_free_account_without_monthly_evidence_after_it(monkeypatch):
+    # Zero-primary plans recover through fresh long-window evidence, which must also postdate the newest block.
+    monkeypatch.setattr("time.time", lambda: _NOW)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: _NOW)
+    account = _make_test_account(
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=int(_NOW + 2 * 24 * 3600),
+        blocked_at=int(_NOW - 3 * 3600),
+        plan_type="free",
+    )
+    monthly = _make_test_usage(
+        window="monthly",
+        used_percent=10.0,
+        reset_at=int(_NOW + 20 * 24 * 3600),
+        recorded_at=_epoch_to_naive_utc(_NOW - 120),
+        window_minutes=43_200,
+    )
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=None,
+        secondary_entry=monthly,
+        runtime=RuntimeState(blocked_at=_NOW - 60, cooldown_until=_NOW - 1),
+        now=_NOW,
+    )
+
+    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.reset_at == pytest.approx(account.reset_at)
+    assert state.blocked_at == pytest.approx(account.blocked_at)
+
+
+def test_background_recovery_state_recovers_after_confirmed_blocked_window_reset(monkeypatch):
+    monkeypatch.setattr("time.time", lambda: _NOW)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: _NOW)
+    account, primary, secondary = _post_block_rate_limit_inputs()
+
+    state = background_recovery_state_from_account(
+        account=account,
+        primary_entry=primary,
+        secondary_entry=secondary,
+        blocked_window_reset=True,
+    )
+
+    assert state.status == AccountStatus.ACTIVE
+    assert state.reset_at is None
+    assert state.blocked_at is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"primary_used": 100.0}, id="primary-current-exhaustion"),
+        pytest.param({"primary_used": 100.0, "primary_reset_at": None}, id="primary-exhaustion-unknown-reset"),
+        pytest.param({"secondary_used": 100.0}, id="exhausted-long-window"),
+        pytest.param({"primary_recorded_at": _NOW - 4 * 3600}, id="unexpired-primary-predates-block"),
+        pytest.param({"primary_recorded_at": _NOW - 3 * 3600 + 0.5}, id="primary-in-block-second"),
+        pytest.param(
+            {"blocked_at": int(_NOW - 10), "primary_recorded_at": _NOW - 1, "secondary_recorded_at": _NOW - 1},
+            id="post-429-minimum-floor",
+        ),
+    ],
+)
+def test_background_recovery_state_keeps_block_when_evidence_gate_rejects_confirmed_reset(monkeypatch, overrides):
+    monkeypatch.setattr("time.time", lambda: _NOW)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: _NOW)
+    account, primary, secondary = _post_block_rate_limit_inputs(**overrides)
+
+    state = background_recovery_state_from_account(
+        account=account,
+        primary_entry=primary,
+        secondary_entry=secondary,
+        blocked_window_reset=True,
+    )
+
+    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.reset_at == pytest.approx(account.reset_at)
+    assert state.blocked_at == pytest.approx(account.blocked_at)
 
 
 def test_state_from_account_drains_at_fixed_primary_threshold(monkeypatch):

@@ -4,7 +4,7 @@
 
 Background usage refresh SHALL reconcile persisted `rate_limited` and `quota_exceeded` accounts back to `active` after it writes fresh usage snapshots that prove the blocked window has recovered. This reconciliation SHALL be recovery-only and SHALL NOT promote `active` accounts into blocked statuses. For `rate_limited` accounts, recovery evidence SHALL come from the most recently recorded main-window row: when a post-block refresh no longer reports a short primary window and the last primary sample's own reset deadline has elapsed (or no primary sample exists), a fresh long-window row recorded after the block that still reports usage below `100%` proves recovery. While the last primary sample still claims an unexpired window (or omits reset metadata), or the newer long-window row is itself exhausted, primary freshness SHALL keep gating recovery.
 
-A future persisted `reset_at` SHALL continue to block ordinary recovery except for a `rate_limited` account whose fresh post-block long-window sample proves a new window under the `account-routing` window-reset exception, or a `rate_limited` Free account whose monthly usage history proves that the specific monthly window associated with the current block reset. This exception MUST require `blocked_at` and a future persisted `reset_at`, at least 30 seconds elapsed after `blocked_at`, a monthly baseline recorded strictly after `blocked_at` whose `reset_at` matches the persisted marker within five seconds, a real temporal reset in an adjacent monthly pair at or after that baseline, and both the transition's after sample and the latest monthly sample recorded after `blocked_at` with usage below `100%`. The reset pair MAY come from the current refresh or be selected from adjacent persisted post-block samples so recovery survives a process restart and tolerates sliding reset deadlines without comparing non-neighboring rows. Availability without that matching anchored transition or a qualifying window reset, reset timestamp jitter, an exhausted latest window, or evidence for a non-Free account MUST NOT override the persisted cooldown.
+A future persisted `reset_at` SHALL continue to block ordinary recovery except for a `rate_limited` Free account whose monthly usage history proves that the specific monthly window associated with the current block reset, or a `rate_limited` account whose long-window usage history proves the same for its blocked long window under the `account-routing` long-window exception. The monthly exception MUST require `blocked_at` and a future persisted `reset_at`, at least 30 seconds elapsed after `blocked_at`, a monthly baseline recorded strictly after `blocked_at` whose `reset_at` matches the persisted marker within five seconds, a real temporal reset in an adjacent monthly pair at or after that baseline, and both the transition's after sample and the latest monthly sample recorded after `blocked_at` with usage below `100%`. The reset pair MAY come from the current refresh or be selected from adjacent persisted post-block samples so recovery survives a process restart and tolerates sliding reset deadlines without comparing non-neighboring rows. The long-window exception MUST read persisted post-block history of the account's routing long window (the weekly secondary window, or the weekly window a weekly-only account reports in the primary slot; never a monthly window) and require a persisted deadline less than one long-window length after `blocked_at`, a baseline recorded strictly after `blocked_at` whose `reset_at` matches the persisted marker within five seconds, a real temporal reset in an adjacent pair at or after that baseline, and a latest long-window sample that still resets more than five seconds after the persisted marker. That proof MUST release the persisted deadline only into the 30-second minimum floor and the post-block primary and long-window evidence gate measured from `blocked_at`, so current primary exhaustion, an unexpired primary sample that predates the block, and an exhausted latest long window keep the account blocked. Availability without a matching anchored transition, reset timestamp jitter, an exhausted latest window, or monthly evidence for a non-Free account MUST NOT override the persisted cooldown.
 
 Every recovery write MUST compare the current status, deactivation reason, `reset_at`, and `blocked_at`. A successful write SHALL set the account to `active` and clear the deactivation reason and both block markers. A compare-and-set miss MUST preserve the newer row and MUST NOT make the stale account snapshot eligible for warm-up.
 
@@ -59,7 +59,7 @@ Every recovery write MUST compare the current status, deactivation reason, `rese
 - **WHEN** an account is persisted as `rate_limited`
 - **AND** its persisted rate-limit reset deadline is still in the future
 - **AND** a later background usage refresh writes fresh available usage
-- **AND** no qualifying reset-confirmed Free monthly transition matches the current block
+- **AND** no qualifying reset-confirmed Free monthly or long-window transition matches the current block
 - **THEN** the scheduler leaves the account `rate_limited`
 
 #### Scenario: Confirmed Free monthly reset recovers before a stale deadline
@@ -143,10 +143,25 @@ Every recovery write MUST compare the current status, deactivation reason, `rese
 - **WHEN** background usage refresh recovers a `rate_limited` or `quota_exceeded` account to `active`
 - **THEN** the scheduler writes `deactivation_reason` as `NULL`
 
-#### Scenario: Scheduler recovers a rate-limited account whose long window reset after the block
-- **WHEN** an account is persisted as `rate_limited` with `blocked_at` and a future persisted `reset_at`
-- **AND** a fresh weekly row recorded after the block reports usage below `100%` for a window that began after the block and resets after the persisted deadline
-- **AND** the fresh primary row recorded after the block reports usage below `100%`
-- **THEN** the scheduler marks the account `active` through the compare-and-set write
-- **AND** it clears persisted `reset_at` and `blocked_at`
+#### Scenario: Scheduler recovers a rate-limited account whose blocked long window reset
+- **GIVEN** an account is persisted as `rate_limited` with `blocked_at` three hours ago and a future `reset_at` equal to its weekly reset
+- **AND** a weekly row recorded strictly after `blocked_at` reports that reset within five seconds
+- **WHEN** a later adjacent weekly pair shows usage dropping below `100%` while the window re-anchors between the two samples, or the previous reset crossing
+- **AND** the latest weekly row still resets after the persisted marker and the fresh post-block primary row reports usage below `100%`
+- **THEN** the scheduler marks the account `active` through the compare-and-set write and clears `reset_at` and `blocked_at`
 - **AND** a compare-and-set miss leaves the newer row untouched
+
+#### Scenario: Weekly-only account recovers from its primary-slot history
+- **GIVEN** a weekly-only account reports its weekly window in the primary slot
+- **WHEN** that primary-slot weekly history proves a confirmed reset of the window matching the persisted marker
+- **THEN** the scheduler recovers the account exactly as it would from secondary-slot weekly history
+
+#### Scenario: Unanchored long-window samples keep a running Retry-After cooldown
+- **GIVEN** an account is persisted as `rate_limited` by a Retry-After hint 20 minutes in the future
+- **WHEN** post-block weekly history only shows an unstarted window whose reset slides with each sample, a window that direct account use started after the block, or a real weekly reset whose baseline does not match the persisted deadline
+- **THEN** the scheduler leaves the account `rate_limited` with both markers intact
+
+#### Scenario: Long-window reset evidence must stay anchored and adjacent
+- **GIVEN** an account is persisted as `rate_limited` with `blocked_at` and a future `reset_at`
+- **WHEN** the only weekly row matching the persisted marker was recorded before or exactly at `blocked_at`, the persisted marker lies one long window or more after `blocked_at`, the reset moved without a confirmed adjacent transition, the latest weekly row reports the persisted marker again, fewer than 30 seconds have elapsed since `blocked_at`, or the current primary row is exhausted
+- **THEN** the scheduler leaves the account `rate_limited`

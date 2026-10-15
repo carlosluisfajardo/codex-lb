@@ -224,10 +224,12 @@ class StubUsageRepository:
         primary: dict[str, UsageHistory] | None = None,
         secondary: dict[str, UsageHistory] | None = None,
         monthly: dict[str, UsageHistory] | None = None,
+        history: dict[str, list[UsageHistory]] | None = None,
     ) -> None:
         self._primary = primary or {}
         self._secondary = secondary or {}
         self._monthly = monthly or {}
+        self._history = history or {}
         self.queries: list[tuple[str | None, tuple[str, ...] | None]] = []
 
     async def latest_by_account(
@@ -248,6 +250,13 @@ class StubUsageRepository:
             return rows
         allowed = set(normalized_account_ids)
         return {account_id: entry for account_id, entry in rows.items() if account_id in allowed}
+
+    async def history_since(self, account_id: str, window: str, since: datetime) -> list[UsageHistory]:
+        return [
+            entry
+            for entry in self._history.get(account_id, [])
+            if (entry.window or "primary") == window and entry.recorded_at >= since
+        ]
 
 
 class MutatingAccountsRepository(StubAccountsRepository):
@@ -356,48 +365,74 @@ async def test_reconcile_recoverable_account_statuses_keeps_rate_limited_until_r
     assert accounts_repo.status_updates == []
 
 
+_NOW = 1_700_000_000.0
+_WEEK_SECONDS = 7 * 24 * 60 * 60
+_STORED_WEEKLY_RESET = int(_NOW + 2 * 24 * 60 * 60)
+_BLOCKED_HOURS_AGO = int(_NOW - 3 * 60 * 60)
+# The 429 named the weekly reset; post-block samples keep it until upstream re-anchors a fresh window.
+_CONFIRMED_WEEKLY_RESET = (
+    (100.0, _STORED_WEEKLY_RESET, _BLOCKED_HOURS_AGO + 30),
+    (100.0, _STORED_WEEKLY_RESET, _NOW - 120),
+    (3.0, int(_NOW - 90) + _WEEK_SECONDS, _NOW - 60),
+)
+
+
+def _weekly_history(
+    account_id: str,
+    samples: Collection[tuple[float, int, float]],
+    *,
+    window: str = "secondary",
+) -> list[UsageHistory]:
+    return [
+        _make_usage(
+            account_id,
+            window=window,
+            used_percent=used_percent,
+            reset_at=reset_at,
+            recorded_at=_epoch_to_naive_utc(recorded_at),
+            window_minutes=10080,
+        )
+        for used_percent, reset_at, recorded_at in samples
+    ]
+
+
+def _primary_sample(account_id: str, *, used_percent: float = 5.0, recorded_at: float = _NOW - 30) -> UsageHistory:
+    return _make_usage(
+        account_id,
+        window="primary",
+        used_percent=used_percent,
+        reset_at=int(_NOW + 3600),
+        recorded_at=_epoch_to_naive_utc(recorded_at),
+        window_minutes=300,
+    )
+
+
+def _freeze_reconcile_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("time.time", lambda: _NOW)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: _NOW)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(_NOW))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("concurrent_marker_change", [False, True])
-async def test_reconcile_recovers_rate_limited_from_post_block_long_window_reset(
+async def test_reconcile_recovers_rate_limited_after_confirmed_blocked_long_window_reset(
     monkeypatch: pytest.MonkeyPatch,
     concurrent_marker_change: bool,
 ) -> None:
-    now = 1_700_000_000.0
-    stored_reset = int(now + 2 * 24 * 60 * 60)
-    blocked_at = int(now - 3 * 60 * 60)
-    monkeypatch.setattr("time.time", lambda: now)
-    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
-    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
-
+    _freeze_reconcile_clock(monkeypatch)
     account = _make_account(
         "acc_rate_limited_window_reset",
         status=AccountStatus.RATE_LIMITED,
-        reset_at=stored_reset,
-        blocked_at=blocked_at,
+        reset_at=_STORED_WEEKLY_RESET,
+        blocked_at=_BLOCKED_HOURS_AGO,
     )
+    history = _weekly_history(account.id, _CONFIRMED_WEEKLY_RESET)
     repository_type = MutatingAccountsRepository if concurrent_marker_change else StubAccountsRepository
     accounts_repo = repository_type([account])
     usage_repo = StubUsageRepository(
-        primary={
-            account.id: _make_usage(
-                account.id,
-                window="primary",
-                used_percent=5.0,
-                reset_at=int(now + 3600),
-                recorded_at=_epoch_to_naive_utc(now - 30),
-                window_minutes=300,
-            )
-        },
-        secondary={
-            account.id: _make_usage(
-                account.id,
-                window="secondary",
-                used_percent=3.0,
-                reset_at=int(now - 600) + 7 * 24 * 60 * 60,
-                recorded_at=_epoch_to_naive_utc(now - 30),
-                window_minutes=10080,
-            )
-        },
+        primary={account.id: _primary_sample(account.id)},
+        secondary={account.id: history[-1]},
+        history={account.id: history},
     )
 
     recovered = await refresh_scheduler_module.reconcile_recoverable_account_statuses(
@@ -425,6 +460,210 @@ async def test_reconcile_recovers_rate_limited_from_post_block_long_window_reset
             "blocked_at": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_recovers_weekly_only_account_after_confirmed_long_window_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_reconcile_clock(monkeypatch)
+    account = _make_account(
+        "acc_weekly_only_window_reset",
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=_STORED_WEEKLY_RESET,
+        blocked_at=_BLOCKED_HOURS_AGO,
+    )
+    # Weekly-only payloads keep the long window in the primary slot.
+    history = _weekly_history(account.id, _CONFIRMED_WEEKLY_RESET, window="primary")
+
+    recovered = await refresh_scheduler_module.reconcile_recoverable_account_statuses(
+        accounts_repo=StubAccountsRepository([account]),
+        usage_repo=StubUsageRepository(primary={account.id: history[-1]}, history={account.id: history}),
+        accounts=[account],
+    )
+
+    assert recovered == 1
+    assert (account.status, account.reset_at, account.blocked_at) == (AccountStatus.ACTIVE, None, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocked_at", "samples"),
+    [
+        pytest.param(
+            int(_NOW - 120),
+            [(0.0, int(_NOW + offset) + _WEEK_SECONDS, _NOW + offset) for offset in (-110, -50, 0)],
+            id="unstarted-sliding-window",
+        ),
+        pytest.param(
+            int(_NOW - 600),
+            [
+                (0.0, int(_NOW - 540) + _WEEK_SECONDS, _NOW - 540),
+                (2.0, int(_NOW - 300) + _WEEK_SECONDS, _NOW - 240),
+                (2.0, int(_NOW - 300) + _WEEK_SECONDS, _NOW - 30),
+            ],
+            id="window-started-by-account-use",
+        ),
+    ],
+)
+async def test_reconcile_keeps_running_retry_after_hold_without_blocked_window_reset(
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_at: int,
+    samples: list[tuple[float, int, float]],
+) -> None:
+    _freeze_reconcile_clock(monkeypatch)
+    retry_after_deadline = int(_NOW + 1200)
+    account = _make_account(
+        "acc_retry_after_hold",
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=retry_after_deadline,
+        blocked_at=blocked_at,
+    )
+    history = _weekly_history(account.id, samples)
+    accounts_repo = StubAccountsRepository([account])
+
+    recovered = await refresh_scheduler_module.reconcile_recoverable_account_statuses(
+        accounts_repo=accounts_repo,
+        usage_repo=StubUsageRepository(
+            primary={account.id: _primary_sample(account.id, recorded_at=_NOW)},
+            secondary={account.id: history[-1]},
+            history={account.id: history},
+        ),
+        accounts=[account],
+    )
+
+    assert recovered == 0
+    assert accounts_repo.status_updates == []
+    assert (account.status, account.reset_at, account.blocked_at) == (
+        AccountStatus.RATE_LIMITED,
+        retry_after_deadline,
+        blocked_at,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            {
+                "blocked_at": int(_NOW - 600),
+                "reset_at": int(_NOW + 1200),
+                "samples": [
+                    (40.0, int(_NOW + 3 * 24 * 60 * 60), _NOW - 500),
+                    (40.0, int(_NOW + 3 * 24 * 60 * 60), _NOW - 120),
+                    (0.0, int(_NOW - 90) + _WEEK_SECONDS, _NOW - 60),
+                ],
+            },
+            id="real-reset-without-baseline-matching-retry-after-deadline",
+        ),
+        pytest.param(
+            {
+                "blocked_at": int(_NOW - 2 * 24 * 60 * 60),
+                "reset_at": int(_NOW + 6 * 24 * 60 * 60),
+                "samples": [
+                    (0.0, int(_NOW + 6 * 24 * 60 * 60), _NOW + 6 * 24 * 60 * 60 - _WEEK_SECONDS),
+                    (5.0, int(_NOW - 23 * 60 * 60) + _WEEK_SECONDS, _NOW - 22 * 60 * 60),
+                    (40.0, int(_NOW - 23 * 60 * 60) + _WEEK_SECONDS, _NOW - 90),
+                    (0.0, int(_NOW - 60) + _WEEK_SECONDS, _NOW - 30),
+                ],
+            },
+            id="sliding-baseline-for-deadline-beyond-one-window",
+        ),
+        pytest.param(
+            {
+                "blocked_at": int(_NOW - 100),
+                "samples": [
+                    (100.0, _STORED_WEEKLY_RESET, _NOW - 150),
+                    (3.0, int(_NOW - 80) + _WEEK_SECONDS, _NOW - 60),
+                ],
+            },
+            id="matching-baseline-predates-block",
+        ),
+        pytest.param(
+            {
+                "blocked_at": int(_NOW - 100),
+                "samples": [
+                    (100.0, _STORED_WEEKLY_RESET, _NOW - 100),
+                    (3.0, int(_NOW - 80) + _WEEK_SECONDS, _NOW - 60),
+                ],
+            },
+            id="matching-baseline-at-block-instant",
+        ),
+        pytest.param(
+            {
+                "samples": [
+                    (100.0, _STORED_WEEKLY_RESET, _BLOCKED_HOURS_AGO + 30),
+                    (100.0, _STORED_WEEKLY_RESET, _NOW - 120),
+                    (99.0, _STORED_WEEKLY_RESET + 3600, _NOW - 60),
+                ],
+            },
+            id="moved-reset-without-real-transition",
+        ),
+        pytest.param(
+            {
+                "samples": [
+                    (100.0, _STORED_WEEKLY_RESET, _BLOCKED_HOURS_AGO + 30),
+                    (100.0, _STORED_WEEKLY_RESET, _NOW - 180),
+                    (0.0, int(_NOW - 150) + _WEEK_SECONDS, _NOW - 120),
+                    (50.0, _STORED_WEEKLY_RESET, _NOW - 60),
+                ],
+            },
+            id="latest-sample-back-on-blocked-window",
+        ),
+        pytest.param(
+            {
+                "blocked_at": int(_NOW - 10),
+                "samples": [
+                    (100.0, _STORED_WEEKLY_RESET, _NOW - 8),
+                    (0.0, int(_NOW - 5) + _WEEK_SECONDS, _NOW - 2),
+                ],
+                "primary_recorded_at": _NOW - 1,
+            },
+            id="post-429-minimum-floor",
+        ),
+        pytest.param({"primary_used": 100.0}, id="primary-current-exhaustion"),
+    ],
+)
+async def test_reconcile_keeps_rate_limited_without_qualifying_blocked_window_reset(
+    monkeypatch: pytest.MonkeyPatch,
+    case: dict[str, Any],
+) -> None:
+    _freeze_reconcile_clock(monkeypatch)
+    blocked_at = case.get("blocked_at", _BLOCKED_HOURS_AGO)
+    stored_reset = case.get("reset_at", _STORED_WEEKLY_RESET)
+    account = _make_account(
+        "acc_unqualified_window_reset",
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=stored_reset,
+        blocked_at=blocked_at,
+    )
+    history = _weekly_history(account.id, case.get("samples", _CONFIRMED_WEEKLY_RESET))
+    accounts_repo = StubAccountsRepository([account])
+
+    recovered = await refresh_scheduler_module.reconcile_recoverable_account_statuses(
+        accounts_repo=accounts_repo,
+        usage_repo=StubUsageRepository(
+            primary={
+                account.id: _primary_sample(
+                    account.id,
+                    used_percent=case.get("primary_used", 5.0),
+                    recorded_at=case.get("primary_recorded_at", _NOW - 30),
+                )
+            },
+            secondary={account.id: history[-1]},
+            history={account.id: history},
+        ),
+        accounts=[account],
+    )
+
+    assert recovered == 0
+    assert accounts_repo.status_updates == []
+    assert (account.status, account.reset_at, account.blocked_at) == (
+        AccountStatus.RATE_LIMITED,
+        stored_reset,
+        blocked_at,
+    )
 
 
 @pytest.mark.asyncio

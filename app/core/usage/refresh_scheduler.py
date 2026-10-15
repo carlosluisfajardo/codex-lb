@@ -13,7 +13,7 @@ from app.core.balancer.logic import RATE_LIMITED_MIN_COOLDOWN_SECONDS
 from app.core.plan_types import normalize_account_plan_type
 from app.core.resilience.toggles import resolve_resilience_toggles
 from app.core.scheduling.leader_election_handle import get_leader_election as _get_leader_election
-from app.core.usage import capacity_for_plan
+from app.core.usage import capacity_for_plan, should_use_weekly_primary
 from app.core.usage.refresh_policy import USAGE_REFRESH_INTERVAL_SECONDS
 from app.core.utils.time import naive_utc_to_epoch
 from app.db.models import Account, AccountLimitWarmup, AccountStatus, UsageHistory
@@ -32,6 +32,7 @@ from app.modules.proxy.rate_limit_cache import get_rate_limit_headers_cache
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.settings.repository import SettingsRepository
 from app.modules.usage import updater as usage_updater_module
+from app.modules.usage.mappers import usage_history_to_window_row
 from app.modules.usage.repository import UsageRepository
 from app.modules.usage.updater import build_background_usage_updater
 
@@ -71,6 +72,8 @@ class _LatestUsageRepository(Protocol):
         *,
         account_ids: Collection[str] | None = None,
     ) -> dict[str, UsageHistory]: ...
+
+    async def history_since(self, account_id: str, window: str, since: datetime) -> list[UsageHistory]: ...
 
 
 class _BackgroundLimitWarmupRepository:
@@ -373,16 +376,25 @@ async def reconcile_recoverable_account_statuses(
             reset_at = None
             blocked_at = None
         else:
+            primary_entry = latest_primary.get(account.id)
+            secondary_entry = _select_long_window_entry(
+                account=account,
+                monthly_entry=monthly_entry,
+                secondary_entry=latest_secondary.get(account.id),
+            )
+            blocked_window_reset = await _blocked_long_window_reset_confirmed(
+                account=account,
+                usage_repo=usage_repo,
+                primary_entry=primary_entry,
+                secondary_entry=secondary_entry,
+            )
             state = background_recovery_state_from_account(
                 account=account,
-                primary_entry=latest_primary.get(account.id),
-                secondary_entry=_select_long_window_entry(
-                    account=account,
-                    monthly_entry=monthly_entry,
-                    secondary_entry=latest_secondary.get(account.id),
-                ),
+                primary_entry=primary_entry,
+                secondary_entry=secondary_entry,
                 routing_tunables=routing_tunables,
                 soft_drain_enabled=soft_drain_enabled,
+                blocked_window_reset=blocked_window_reset,
             )
             if state.status != AccountStatus.ACTIVE:
                 continue
@@ -498,6 +510,50 @@ async def _resolve_monthly_reset_evidence(
         if persisted is not None:
             evidence[account.id] = persisted
     return evidence
+
+
+async def _blocked_long_window_reset_confirmed(
+    *,
+    account: Account,
+    usage_repo: _LatestUsageRepository,
+    primary_entry: UsageHistory | None,
+    secondary_entry: UsageHistory | None,
+) -> bool:
+    """Whether post-block history proves the long window named by the stored 429 deadline reset.
+
+    The deadline does not record its window, and an unstarted window reports a
+    sliding reset, so no single sample proves a reset. Like the Free monthly
+    exception, require a post-block baseline matching the deadline and a later
+    adjacent pair that confirms a real temporal reset.
+    """
+    long_window_entry = secondary_entry
+    if primary_entry is not None and should_use_weekly_primary(
+        usage_history_to_window_row(primary_entry),
+        usage_history_to_window_row(secondary_entry) if secondary_entry is not None else None,
+    ):
+        long_window_entry = primary_entry
+    if (
+        account.status != AccountStatus.RATE_LIMITED
+        or account.reset_at is None
+        or account.blocked_at is None
+        or long_window_entry is None
+        or long_window_entry.window == "monthly"
+        or long_window_entry.reset_at is None
+        or long_window_entry.window_minutes is None
+        # The latest sample must still describe a window that resets after the stored deadline.
+        or long_window_entry.reset_at <= account.reset_at + _BLOCK_RESET_MATCH_TOLERANCE_SECONDS
+        # Only a window already running at the block can be the one its deadline names.
+        or account.reset_at - long_window_entry.window_minutes * 60 >= account.blocked_at
+    ):
+        return False
+    since = datetime.fromtimestamp(account.blocked_at, timezone.utc).replace(tzinfo=None)
+    history = await usage_repo.history_since(account.id, long_window_entry.window or "primary", since)
+    evidence = _latest_confirmed_reset_transition_after_baseline(
+        [entry for entry in history if entry.recorded_at > since],
+        expected_reset_at=account.reset_at,
+        reset_at_tolerance_seconds=_BLOCK_RESET_MATCH_TOLERANCE_SECONDS,
+    )
+    return evidence is not None
 
 
 def _latest_confirmed_reset_transition_after_baseline(

@@ -2,21 +2,31 @@
 
 ## Purpose
 
-Stop a stale 429 deadline from benching an account after upstream has already started a new long quota window, without weakening the protections for throttles, jitter, stale data, or primary exhaustion.
+Stop a stale 429 deadline from benching an account after upstream has actually reset the blocked long quota window. Protections for throttles, jitter, stale data, and primary exhaustion stay intact.
 
-## Why the proof ignores which window the deadline came from
+## Why the proof needs history
 
-`UpstreamError` carries only `message`, `resets_at`, and `resets_in_seconds`; `handle_rate_limit` stores one deadline. The persisted `reset_at` therefore does not record whether it was a weekly reset, a primary reset, or a Retry-After throttle. Comparing a sample's reset to that deadline ("did it move?") would be a guess: a 20-minute throttle or a 5-hour primary block always "differs" from the weekly reset. The proof instead asks the sample itself: did its window begin after the block? A window that was already running at the block can never satisfy it, so throttles and primary blocks on an unchanged long window keep their original semantics. Requiring the new window to end past the stored deadline keeps longer holds intact.
+`UpstreamError` carries only `message`, `resets_at`, and `resets_in_seconds`. `handle_rate_limit` stores one deadline, so the persisted `reset_at` does not record whether it was a weekly reset, a primary reset, or a Retry-After throttle. A single latest sample cannot settle it either:
+
+- An unstarted long window reports `reset_at` = sample time + window length. Every fresh sample therefore looks like a window that began after the block.
+- Direct use of the account outside the balancer can start a window after an unrelated Retry-After 429. That window is anchored and post-block, but nothing reset.
+
+The first version of this change trusted such a sample. On every replica and on background reconcile, it cleared a running Retry-After hold that had 20 minutes left (review P1). Persisted usage history is the only evidence that separates a real reset from these shapes. A post-block row whose reset matches the stored deadline ties the 429 to that window. A later adjacent pair accepted by `usage_reset_confirmed` (the previous reset crossed, or usage dropped while the window re-anchored between the two samples) proves a transition, which a sliding 0% window can never produce. The Free monthly exception already works this way, so the long-window exception reuses its helpers on the reconcile path. That path is the only one that loads post-block history.
+
+## Why the selection path takes no reset proof
+
+Request-time selection receives only the latest rows, so it cannot prove a reset. It keeps the original semantics: peers hold a stored deadline, and the observing replica recovers only after its own runtime cooldown elapses, using post-block evidence. Once reconcile writes the recovered row through compare-and-set, every replica and restarted process follows it. The first version also let a newer runtime block (one whose database write failed) end early on primary evidence recorded before that block (review P2). With the selection-path proof gone, that runtime cooldown holds as it did before. The observing replica's early-recovery gate, which the reconcile proof reuses, now measures evidence from the newest block marker it knows. After that runtime cooldown elapses, evidence recorded between the persisted and the newer marker no longer ends the block, for either the primary gate or the zero-primary path. In normal operation the runtime marker equals the persisted one in integer seconds, so nothing else changes.
 
 ## Example
 
-Blocked at 07:57 on day 0 with a stored deadline on day 5. On day 2 upstream resets the weekly window; the 08:10 sample reports `0%` with `reset_at` = 08:10 on day 9 and a 10080-minute window. Window start is 08:10 on day 2 (after the block, not after the sample) and day 9 is past day 5, so with a non-exhausted primary the account becomes `ACTIVE` on every replica and on background reconcile. These are the row shapes recorded in Soju06/codex-lb#2404.
+At 07:57 on day 0 the weekly window is exhausted, and the 429 stores the weekly reset (day 2, 07:57) as `reset_at`. The post-429 refresh at 07:58 records `100%` with that reset, which becomes the baseline. On day 1 at 08:09, upstream resets weekly limits early. The 08:10 sample reports `0%` with a reset 7 days after a start between the two samples, and `usage_reset_confirmed` accepts the 08:09 → 08:10 pair. With a fresh post-block primary sample below `100%`, reconcile writes `ACTIVE` and clears both markers, and replicas route to the account. A Retry-After hold with 20 minutes left has no post-block weekly row whose reset matches its deadline, so it stays blocked whether the weekly window is unstarted, newly started, or even genuinely reset.
 
-## Known limitation
+## Failure modes covered by pins
 
-An unstarted long window reports a sliding reset (`recorded_at` + window length). After a Retry-After throttle on an account whose long window had not started, the next fresh sample therefore looks like a new window and the throttle can end early. With only the latest sample and a deadline that does not name its window, that case is indistinguishable from the early-reset shape above. A history-anchored proof (a pre-reset sample whose reset matches the stored deadline, as the Free monthly exception does) would separate them but needs reconcile-side history outside this change. A throttle that persists re-marks the account on its next 429.
+Unstarted sliding window, a window started by account use, a real reset without a baseline matching a Retry-After deadline, a baseline before or at the block instant, a deadline one window or more after the block (a sliding row can match it by coincidence), a reset moved without a confirmed transition, a latest sample back on the blocked deadline, the 30-second floor, primary exhaustion (current or unknown reset), an unexpired pre-block primary sample, a same-second primary sample, an exhausted long window, compare-and-set misses, and a newer unpersisted runtime block.
 
 ## Constants
 
-- 60 s jitter: matches the limit warm-up threshold for a real reset jump; smaller reset differences are timestamp jitter.
-- 30 s floor: `RATE_LIMITED_MIN_COOLDOWN_SECONDS`, unchanged.
+- Five-second baseline match: `_BLOCK_RESET_MATCH_TOLERANCE_SECONDS`, shared with the Free monthly exception.
+- 60-second minimum reset jump: `usage_reset_confirmed`, shared with limit warm-up.
+- 30-second floor: `RATE_LIMITED_MIN_COOLDOWN_SECONDS`, unchanged.

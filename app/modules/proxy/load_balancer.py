@@ -36,7 +36,6 @@ from app.core.balancer import (
 from app.core.balancer import (
     select_account as select_account,
 )
-from app.core.balancer.logic import long_window_reset_after_block
 from app.core.balancer.types import UpstreamError
 from app.core.clock import REAL_CLOCK, Clock
 from app.core.config.dashboard_overrides import with_dashboard_overrides
@@ -2343,14 +2342,14 @@ def _state_from_account(
             and runtime.blocked_at is not None
             and runtime.blocked_at >= effective_blocked_at
         ):
-            # Only the replica that observed this block may recover before its persisted deadline.
+            # Only the replica that observed this block may recover early, from evidence after its newest marker.
             early_freshness_entry = _rate_limited_freshness_entry(
                 account=account,
                 primary_entry=primary_entry,
                 long_window_entry=effective_secondary_entry,
                 now=now,
             )
-            if _usage_entry_recorded_after_block(early_freshness_entry, effective_blocked_at):
+            if _usage_entry_recorded_after_block(early_freshness_entry, runtime.blocked_at):
                 rate_limited_cooldown_deadline = None
 
     if usage_core.capacity_for_plan(account.plan_type, "primary") == 0.0 and (
@@ -2439,12 +2438,8 @@ def _state_from_account(
         and runtime.blocked_at >= effective_blocked_at
     ):
         cooldown_ready = True
-    # A long window that began after the block replaces the stored deadline on every replica.
-    window_reset_ready = effective_blocked_at is not None and long_window_reset_after_block(
-        account, effective_secondary_entry, max(effective_blocked_at, runtime.blocked_at or 0), now
-    )
 
-    if (cooldown_ready or window_reset_ready) and effective_blocked_at is not None:
+    if cooldown_ready and effective_blocked_at is not None:
         if account.status == AccountStatus.QUOTA_EXCEEDED:
             freshness_entry = (
                 effective_secondary_entry if secondary_used is not None and secondary_used < 100.0 else None
@@ -2458,7 +2453,8 @@ def _state_from_account(
             )
         else:
             freshness_entry = None
-        if _usage_entry_recorded_after_block(freshness_entry, effective_blocked_at):
+        # Evidence must postdate the newest block this replica knows, even one whose write failed.
+        if _usage_entry_recorded_after_block(freshness_entry, max(effective_blocked_at, runtime.blocked_at or 0.0)):
             effective_runtime_reset = None
 
     rejected_reset_recovery_evidence = False
@@ -2576,7 +2572,7 @@ def _state_from_account(
         primary_reset_at=primary_reset,
         primary_window_minutes=primary_window_minutes,
         blocked_at=next_blocked_at,
-        cooldown_until=None if window_reset_ready and status == AccountStatus.ACTIVE else runtime.cooldown_until,
+        cooldown_until=runtime.cooldown_until,
         secondary_used_percent=effective_secondary_used_percent,
         secondary_reset_at=secondary_reset,
         last_error_at=runtime.last_error_at,
@@ -2736,12 +2732,15 @@ def background_recovery_state_from_account(
     secondary_entry: UsageHistory | None,
     routing_tunables: RoutingTunables | None = None,
     soft_drain_enabled: bool | None = None,
+    blocked_window_reset: bool = False,
 ) -> AccountState:
     """Evaluate recovery without live runtime state.
 
     Seed a throwaway runtime from the persisted block marker so post-block usage
     can clear stale reset guards after a balancer restart. ``routing_tunables`` and
     ``soft_drain_enabled`` are the caller's dashboard-snapshot values (health tier follows the dashboard).
+    ``blocked_window_reset`` is history proof that the window named by the stored deadline reset: the
+    deadline then yields to the post-429 floor and the observing replica's post-block evidence gate.
     """
 
     runtime = RuntimeState()
@@ -2754,7 +2753,9 @@ def background_recovery_state_from_account(
         runtime.blocked_at = blocked_at
 
     if account.status == AccountStatus.RATE_LIMITED and blocked_at is not None and valid_reset_at is not None:
-        runtime.cooldown_until = valid_reset_at
+        runtime.cooldown_until = (
+            blocked_at + RATE_LIMITED_MIN_COOLDOWN_SECONDS if blocked_window_reset else valid_reset_at
+        )
     state = _state_from_account(
         account=account,
         primary_entry=primary_entry,
