@@ -4,8 +4,9 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AccountList } from "@/features/dashboard/components/account-list";
+import { accountLifecycleEntry, type AccountLifecycleEntry } from "@/features/dashboard/lifecycle";
 import { usePrivacyStore } from "@/hooks/use-privacy";
-import { createAccountSummary } from "@/test/mocks/factories";
+import { createAccountLifecycle, createAccountSummary } from "@/test/mocks/factories";
 
 afterEach(() => {
   act(() => {
@@ -349,6 +350,53 @@ describe("AccountList", () => {
 
     const resetButton = screen.getByRole("button", { name: "Redeem reset credit for Many Reset Account" });
     expect(within(resetButton).getByText("99+")).toBeInTheDocument();
+  });
+
+  it("adds a subscription dates column next to Plan when the dates may be read", () => {
+    vi.stubEnv("TZ", "UTC");
+    const lifecycle = new Map<string, AccountLifecycleEntry>([
+      [
+        "acc-1",
+        accountLifecycleEntry(
+          "acc-1",
+          {
+            data: createAccountLifecycle({
+              accountId: "acc-1",
+              endsOn: { precision: "datetime", date: "2026-10-12", time: "09:30", timezone: "America/Argentina/ComodRivadavia" },
+              renewsOn: { precision: "date", date: "2026-10-31", time: null, timezone: null },
+            }),
+            failed: false,
+          },
+          new Date("2026-10-10T12:00:00Z"),
+        ),
+      ],
+    ]);
+    render(
+      <AccountList
+        accounts={[createAccountSummary({ accountId: "acc-1", displayName: "Primary Account" })]}
+        lifecycle={lifecycle}
+      />,
+    );
+    vi.unstubAllEnvs();
+
+    const list = screen.getByTestId("dashboard-account-list");
+    const headers = Array.from(list.querySelector(".sticky")?.children ?? []).map((header) => header.textContent);
+    expect(headers.indexOf("Subscription dates")).toBe(headers.indexOf("Plan") + 1);
+    expect(list.firstElementChild).toHaveClass("min-w-[86rem]");
+    const row = within(screen.getByTestId("account-list-row"));
+    expect(row.getByText("Oct 12, 2026")).toBeInTheDocument();
+    expect(row.getByText("09:30 America/Argentina/ComodRivadavia")).toBeInTheDocument();
+    expect(row.getByText("in 2 days")).toBeInTheDocument();
+    expect(row.getByText("Oct 31, 2026")).toBeInTheDocument();
+    expect(row.getByText("Date only")).toBeInTheDocument();
+    expect(row.getByText("in 21 days")).toBeInTheDocument();
+  });
+
+  it("keeps the original columns without a lifecycle map", () => {
+    render(<AccountList accounts={[createAccountSummary({ accountId: "acc-1" })]} lifecycle={null} />);
+
+    expect(screen.queryByText("Subscription dates")).not.toBeInTheDocument();
+    expect(screen.getByTestId("dashboard-account-list").firstElementChild).toHaveClass("min-w-[76rem]");
   });
 
   it("links the empty-account state to the Accounts page", () => {

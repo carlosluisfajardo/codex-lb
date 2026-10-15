@@ -5,6 +5,7 @@ import { Link } from "react-router-dom";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
 import { AccountCard, type AccountCardProps } from "@/features/dashboard/components/account-card";
+import type { AccountLifecycleMap } from "@/features/dashboard/hooks/use-account-lifecycle-map";
 import type { AccountSummary } from "@/features/dashboard/schemas";
 
 const ACCOUNT_CARD_VISIBLE_ROWS = 2;
@@ -15,10 +16,12 @@ const ACCOUNT_CARD_ROW_GAP_REM = 1;
 export type AccountCardsProps = {
   accounts: AccountSummary[];
   readOnly?: boolean;
+  /** Saved subscription dates by account id; `null` or omitted when the session may not read them. */
+  lifecycle?: AccountLifecycleMap | null;
   onAction?: AccountCardProps["onAction"];
 };
 
-export function AccountCards({ accounts, readOnly = false, onAction }: AccountCardsProps) {
+export function AccountCards({ accounts, readOnly = false, lifecycle, onAction }: AccountCardsProps) {
   const { t } = useTranslation();
 
   if (accounts.length === 0) {
@@ -50,6 +53,7 @@ export function AccountCards({ accounts, readOnly = false, onAction }: AccountCa
             account={account}
             showAccountId={account.isEmailDuplicate === true}
             readOnly={readOnly}
+            lifecycle={lifecycle ? (lifecycle.get(account.accountId) ?? { status: "loading" }) : undefined}
             onAction={onAction}
           />
         </div>

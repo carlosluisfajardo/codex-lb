@@ -3,11 +3,18 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
 import { BrowserRouter } from "react-router-dom";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import App from "@/App";
+import type { AccountLifecycle } from "@/features/accounts/schemas";
+import { useAuthStore } from "@/features/auth/hooks/use-auth";
+import { useDashboardPreferencesStore } from "@/hooks/use-dashboard-preferences";
 import {
+  ADMIN_PERMISSIONS,
+  VIEWER_PERMISSIONS,
+  createAccountLifecycle,
   createAccountSummary,
+  createDashboardAuthSession,
   createDashboardOverview,
   createDashboardProjections,
   createConversationEntry,
@@ -395,6 +402,182 @@ describe("dashboard flow integration", () => {
     expect(window.location.search).toContain("conversationSearch=opencode");
     expect(window.location.search).toContain("conversationLimit=15");
     expect(window.location.search).toContain("conversationOffset=7");
+  });
+
+  it("shows saved subscription dates with calendar-day countdowns in the cards, the list and the summary without writing", async () => {
+    vi.stubEnv("TZ", "UTC");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-10T12:00:00Z"));
+    try {
+      const user = userEvent.setup({ delay: null });
+      const renewing = createAccountSummary({
+        accountId: "acc_renewing",
+        email: "renewing@example.com",
+        displayName: "Renewing account",
+      });
+      const lapsed = createAccountSummary({
+        accountId: "acc_lapsed",
+        email: "lapsed@example.com",
+        displayName: "Lapsed account",
+        usage: { primaryRemainingPercent: 82, secondaryRemainingPercent: 64, monthlyRemainingPercent: null },
+      });
+      const lifecycles: Record<string, AccountLifecycle> = {
+        acc_renewing: createAccountLifecycle({
+          accountId: "acc_renewing",
+          renewsOn: { precision: "date", date: "2026-10-31", time: null, timezone: null },
+        }),
+        acc_lapsed: createAccountLifecycle({
+          accountId: "acc_lapsed",
+          endsOn: { precision: "datetime", date: "2026-10-12", time: "09:30", timezone: "America/New_York" },
+          renewsOn: { precision: "date", date: "2026-10-07", time: null, timezone: null },
+        }),
+      };
+      const lifecycleReads: string[] = [];
+      const lifecycleWrites: string[] = [];
+      server.use(
+        http.get("/api/dashboard/overview", () =>
+          HttpResponse.json(createDashboardOverview({ accounts: [renewing, lapsed] })),
+        ),
+        http.get("/api/accounts/:accountId/lifecycle", ({ params }) => {
+          const accountId = String(params.accountId);
+          lifecycleReads.push(accountId);
+          return HttpResponse.json(lifecycles[accountId]);
+        }),
+        http.put("/api/accounts/:accountId/lifecycle", ({ params }) => {
+          lifecycleWrites.push(String(params.accountId));
+          return HttpResponse.json({ error: { code: "unexpected", message: "unexpected write" } }, { status: 500 });
+        }),
+      );
+
+      window.history.pushState({}, "", "/dashboard");
+      renderWithProviders(<App />);
+
+      const cards = await screen.findByTestId("dashboard-account-cards");
+      const cardFor = (name: string) => {
+        const card = Array.from(cards.children).find((element) =>
+          within(element as HTMLElement).queryByText(name),
+        );
+        if (!card) {
+          throw new Error(`No dashboard card for ${name}`);
+        }
+        return within(card as HTMLElement);
+      };
+
+      const renewingCard = cardFor("Renewing account");
+      expect(await renewingCard.findByText("in 21 days")).toBeInTheDocument();
+      expect(renewingCard.getByText("Renews on")).toBeInTheDocument();
+      expect(renewingCard.getByText("Oct 31, 2026")).toBeInTheDocument();
+      expect(renewingCard.getByText("Date only")).toBeInTheDocument();
+      expect(renewingCard.getByText("Ends on")).toBeInTheDocument();
+      expect(renewingCard.getByText("Not set")).toBeInTheDocument();
+
+      const lapsedCard = cardFor("Lapsed account");
+      expect(lapsedCard.getByText("Oct 12, 2026")).toBeInTheDocument();
+      expect(lapsedCard.getByText("09:30 America/New_York")).toBeInTheDocument();
+      expect(lapsedCard.getByText("in 2 days")).toBeInTheDocument();
+      expect(lapsedCard.getByText("Oct 7, 2026")).toBeInTheDocument();
+      expect(lapsedCard.getByText("passed 3 days ago · needs confirmation")).toBeInTheDocument();
+      expect(lapsedCard.getByText("64%")).toBeInTheDocument();
+      expect(lapsedCard.getByText("Active")).toBeInTheDocument();
+      expect(cards).not.toHaveTextContent(/expired/i);
+
+      expect(screen.getByTestId("dashboard-account-summary-line")).toHaveTextContent(
+        /2.*registered.*2.*active.*0.*unavailable/,
+      );
+      const dateSummary = screen.getByTestId("dashboard-account-date-summary");
+      expect(dateSummary).toHaveTextContent(/Subscription dates/);
+      expect(dateSummary).toHaveTextContent(/1\s*passed/);
+      expect(dateSummary).not.toHaveTextContent(/due/);
+
+      await user.click(screen.getByRole("radio", { name: "View accounts as list" }));
+      const list = await screen.findByTestId("dashboard-account-list");
+      expect(within(list).getByText("Subscription dates")).toBeInTheDocument();
+      const lapsedRow = within(
+        within(list).getAllByTestId("account-list-row").find((row) => within(row).queryByText("Lapsed account"))!,
+      );
+      expect(lapsedRow.getByText("09:30 America/New_York")).toBeInTheDocument();
+      expect(lapsedRow.getByText("in 2 days")).toBeInTheDocument();
+      expect(lapsedRow.getByText("passed 3 days ago · needs confirmation")).toBeInTheDocument();
+
+      expect([...lifecycleReads].sort()).toEqual(["acc_lapsed", "acc_renewing"]);
+      expect(lifecycleWrites).toEqual([]);
+    } finally {
+      act(() => {
+        useDashboardPreferencesStore.setState({ accountViewMode: "cards" });
+      });
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  describe("subscription date access", () => {
+    const account = createAccountSummary({
+      accountId: "acc_noted",
+      email: "noted@example.com",
+      displayName: "Noted account",
+    });
+
+    function serveSession(permissions: string[]): string[] {
+      const lifecycleReads: string[] = [];
+      server.use(
+        http.get("/api/dashboard-auth/session", () =>
+          HttpResponse.json(
+            createDashboardAuthSession({
+              authenticated: true,
+              passwordRequired: false,
+              totpConfigured: false,
+              role: "guest",
+              permissions,
+              guestAccessEnabled: true,
+              guestPasswordRequired: false,
+            }),
+          ),
+        ),
+        http.get("/api/dashboard/overview", () => HttpResponse.json(createDashboardOverview({ accounts: [account] }))),
+        http.get("/api/accounts/:accountId/lifecycle", ({ params }) => {
+          lifecycleReads.push(String(params.accountId));
+          return HttpResponse.json(
+            createAccountLifecycle({
+              accountId: String(params.accountId),
+              renewsOn: { precision: "date", date: "2026-10-31", time: null, timezone: null },
+            }),
+          );
+        }),
+      );
+      return lifecycleReads;
+    }
+
+    afterEach(() => {
+      useAuthStore.setState({ role: "admin", permissions: ADMIN_PERMISSIONS, canWrite: true, initialized: false });
+    });
+
+    it("shows subscription dates to a viewer with accounts:read but no write access", async () => {
+      const lifecycleReads = serveSession(VIEWER_PERMISSIONS);
+
+      window.history.pushState({}, "", "/dashboard");
+      renderWithProviders(<App />);
+
+      const cards = await screen.findByTestId("dashboard-account-cards");
+      expect(await within(cards).findByText("Oct 31, 2026")).toBeInTheDocument();
+      expect(within(cards).getByText("Renews on")).toBeInTheDocument();
+      expect(lifecycleReads).toEqual(["acc_noted"]);
+    });
+
+    it("neither reads nor shows subscription dates without accounts:read", async () => {
+      const lifecycleReads = serveSession(["read", "dashboard:read:all"]);
+
+      window.history.pushState({}, "", "/dashboard");
+      renderWithProviders(<App />);
+
+      const cards = await screen.findByTestId("dashboard-account-cards");
+      expect(within(cards).getByText("Noted account")).toBeInTheDocument();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(within(cards).queryByText("Renews on")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("dashboard-account-date-summary")).not.toBeInTheDocument();
+      expect(lifecycleReads).toEqual([]);
+    });
   });
 
   it("refetches the overview (stat boxes) when the conversation timeframe changes", async () => {

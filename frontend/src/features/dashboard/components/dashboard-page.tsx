@@ -33,6 +33,7 @@ import { StatsGrid } from "@/features/dashboard/components/stats-grid";
 import { UsageDonuts } from "@/features/dashboard/components/usage-donuts";
 import { WeeklyCreditsPaceCard } from "@/features/dashboard/components/weekly-credits-pace-card";
 import { useAuthStore, usePermission } from "@/features/auth/hooks/use-auth";
+import { useAccountLifecycleMap } from "@/features/dashboard/hooks/use-account-lifecycle-map";
 import { useDashboard, useDashboardProjections } from "@/features/dashboard/hooks/use-dashboard";
 import { useConversations } from "@/features/dashboard/hooks/use-conversations";
 import { useRequestLogTablePreferences } from "@/features/dashboard/hooks/use-request-log-table-preferences";
@@ -229,6 +230,7 @@ export function DashboardPage() {
 
   const overview = dashboardQuery.data;
   const logPage = logsQuery.data;
+  const accountLifecycle = useAccountLifecycleMap((overview?.accounts ?? []).map((account) => account.accountId));
 
   const view = useMemo(() => {
     void resolvedLanguage;
@@ -521,7 +523,7 @@ export function DashboardPage() {
             <div className="flex flex-wrap items-center gap-3">
               <div className="flex min-w-0 flex-wrap items-center gap-3">
                 <h2 className="text-[13px] font-medium uppercase tracking-wider text-muted-foreground">{t("accounts.page.title")}</h2>
-                <AccountSummaryLine accounts={overview?.accounts ?? []} />
+                <AccountSummaryLine accounts={overview?.accounts ?? []} lifecycle={accountLifecycle} />
               </div>
               <div className="h-px min-w-8 flex-1 bg-border" />
               <AccountViewModeToggle value={accountViewMode} onChange={setAccountViewMode} />
@@ -530,12 +532,18 @@ export function DashboardPage() {
               <AccountList
                 accounts={overview?.accounts ?? []}
                 readOnly={!canWriteAccounts}
+                lifecycle={accountLifecycle}
                 sort={accountListSort}
                 onSortChange={setAccountListSort}
                 onAction={handleAccountAction}
               />
             ) : (
-              <AccountCards accounts={overview?.accounts ?? []} readOnly={!canWriteAccounts} onAction={handleAccountAction} />
+              <AccountCards
+                accounts={overview?.accounts ?? []}
+                readOnly={!canWriteAccounts}
+                lifecycle={accountLifecycle}
+                onAction={handleAccountAction}
+              />
             )}
           </section>
 

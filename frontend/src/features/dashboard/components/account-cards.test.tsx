@@ -1,8 +1,9 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 
 import { AccountCards } from "@/features/dashboard/components/account-cards";
+import type { AccountLifecycleEntry } from "@/features/dashboard/lifecycle";
 import { createAccountSummary } from "@/test/mocks/factories";
 
 describe("AccountCards", () => {
@@ -87,6 +88,39 @@ describe("AccountCards", () => {
 
     expect(screen.queryByText((_content, el) => el?.tagName === "P" && !!el.textContent?.match(/dup@example\.com .* ID d48f0bfc\.\.\.12b5d5/))).not.toBeInTheDocument();
     expect(screen.getByText((_content, el) => el?.tagName === "P" && !!el.textContent?.match(/dup@example\.com .* ID 7f9de2ad\.\.\.a95cee/))).toBeInTheDocument();
+  });
+
+  it("gives each card the subscription dates read for its own account id", () => {
+    const lifecycle = new Map<string, AccountLifecycleEntry>([
+      ["acc-1", { status: "unavailable" }],
+      ["acc-2", { status: "ready", endsOn: null, renewsOn: null }],
+    ]);
+    render(
+      <AccountCards
+        accounts={[
+          createAccountSummary({ accountId: "acc-1", email: "one@example.com", displayName: "One Account" }),
+          createAccountSummary({ accountId: "acc-2", email: "two@example.com", displayName: "Two Account" }),
+          createAccountSummary({ accountId: "acc-3", email: "three@example.com", displayName: "Three Account" }),
+        ]}
+        lifecycle={lifecycle}
+      />,
+    );
+
+    const card = (name: string) =>
+      within(
+        Array.from(screen.getByTestId("dashboard-account-cards").children).find((element) =>
+          within(element as HTMLElement).queryByText(name),
+        ) as HTMLElement,
+      );
+    expect(card("One Account").getAllByText("Unavailable")).toHaveLength(2);
+    expect(card("Two Account").getAllByText("Not set")).toHaveLength(2);
+    expect(card("Three Account").getAllByText("Loading…")).toHaveLength(2);
+  });
+
+  it("shows no subscription dates without a lifecycle map", () => {
+    render(<AccountCards accounts={[createAccountSummary()]} lifecycle={null} />);
+
+    expect(screen.queryByLabelText("Subscription dates")).not.toBeInTheDocument();
   });
 
   it("links the empty-account state to the Accounts page", () => {

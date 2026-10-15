@@ -6,11 +6,13 @@ import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
 import { useSmoothPercent } from "@/hooks/use-smooth-percent";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/status-badge";
+import { formatLifecycleDate } from "@/features/accounts/lifecycle";
 import {
   accountSubscriptionCredits,
   formatCreditValue,
   formatPurchasedCredits,
 } from "@/features/dashboard/account-credit-display";
+import type { AccountLifecycleEntry, LifecycleDateView } from "@/features/dashboard/lifecycle";
 import { cn } from "@/lib/utils";
 import type { AccountSummary } from "@/features/dashboard/schemas";
 import { formatCompactAccountId } from "@/utils/account-identifiers";
@@ -33,11 +35,88 @@ export type AccountCardProps = {
   account: AccountSummary;
   showAccountId?: boolean;
   readOnly?: boolean;
+  /** Saved subscription dates; omitted when the session may not read them. */
+  lifecycle?: AccountLifecycleEntry;
   onAction?: (account: AccountSummary, action: AccountAction) => void;
 };
 
 function formatWarmupWindow(window: string): string {
   return window === "primary" || window === "primary_idle" ? "5h" : "weekly";
+}
+
+const ATTENTION_CLASS = {
+  passed: "text-red-600 dark:text-red-400",
+  today: "font-medium text-amber-600 dark:text-amber-400",
+  dueSoon: "text-amber-600 dark:text-amber-400",
+} as const;
+
+function LifecycleDateValue({ field, view }: { field: "endsOn" | "renewsOn"; view: LifecycleDateView }) {
+  const { t, i18n } = useTranslation();
+  const dateDisplayFormat = useDateDisplayFormatStore((s) => s.dateDisplayFormat);
+  const locale = i18n.resolvedLanguage ?? i18n.language ?? "en";
+  const { value, count } = view;
+  const civilDate = formatLifecycleDate(
+    { precision: "date", date: value.date, time: null, timezone: null },
+    dateDisplayFormat,
+    locale,
+  );
+  const countLabel = !count.known
+    ? t("dashboard.accounts.lifecycle.daysUnknown")
+    : count.days > 0
+      ? t("dashboard.accounts.lifecycle.inDays", { count: count.days })
+      : count.days === 0
+        ? t("dashboard.accounts.lifecycle.today")
+        : t(field === "renewsOn" ? "dashboard.accounts.lifecycle.renewalPassed" : "dashboard.accounts.lifecycle.endPassed", {
+            count: -count.days,
+          });
+  return (
+    <span className="inline-flex min-w-0 max-w-full flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+      <span className="font-mono tabular-nums text-foreground">{civilDate}</span>
+      {value.precision === "date" ? (
+        <span className="rounded border px-1 text-[10px] text-muted-foreground">{t("accounts.lifecycle.dateOnly")}</span>
+      ) : (
+        <span className="min-w-0 font-mono tabular-nums text-foreground">{`${value.time} ${value.timezone}`}</span>
+      )}
+      <span className={count.known && count.attention ? ATTENTION_CLASS[count.attention] : "text-muted-foreground"}>
+        {countLabel}
+      </span>
+    </span>
+  );
+}
+
+/** `Ends on` and `Renews on` as saved; shared by the account card and the account list. */
+export function AccountLifecycleDates({ entry, className }: { entry: AccountLifecycleEntry; className?: string }) {
+  const { t } = useTranslation();
+  const fields = [
+    { field: "endsOn", label: t("accounts.lifecycle.endsOn") },
+    { field: "renewsOn", label: t("accounts.lifecycle.renewsOn") },
+  ] as const;
+  return (
+    <dl
+      aria-label={t("dashboard.accounts.lifecycle.title")}
+      className={cn("grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs", className)}
+    >
+      {fields.map(({ field, label }) => {
+        const view = entry.status === "ready" ? entry[field] : null;
+        return (
+          <div key={field} className="contents">
+            <dt className="text-muted-foreground">{label}</dt>
+            <dd className="min-w-0 break-words">
+              {entry.status === "loading" ? (
+                <span className="text-muted-foreground">{t("dashboard.accounts.lifecycle.loading")}</span>
+              ) : entry.status === "unavailable" ? (
+                <span className="text-muted-foreground">{t("dashboard.accounts.lifecycle.unavailable")}</span>
+              ) : view ? (
+                <LifecycleDateValue field={field} view={view} />
+              ) : (
+                <span className="text-muted-foreground">{t("accounts.lifecycle.notSet")}</span>
+              )}
+            </dd>
+          </div>
+        );
+      })}
+    </dl>
+  );
 }
 
 function QuotaBar({
@@ -84,7 +163,7 @@ function QuotaBar({
   );
 }
 
-export function AccountCard({ account, showAccountId = false, readOnly = false, onAction }: AccountCardProps) {
+export function AccountCard({ account, showAccountId = false, readOnly = false, lifecycle, onAction }: AccountCardProps) {
   const { t } = useTranslation();
   const blurred = usePrivacyStore((s) => s.blurred);
   const dateDisplayFormat = useDateDisplayFormatStore((s) => s.dateDisplayFormat);
@@ -164,6 +243,8 @@ export function AccountCard({ account, showAccountId = false, readOnly = false, 
         </div>
         <StatusBadge status={status} />
       </div>
+
+      {lifecycle ? <AccountLifecycleDates entry={lifecycle} className="mt-3" /> : null}
 
       {/* Quota bars */}
       <div className={cn("mt-3.5 grid gap-3", weeklyOnly || monthlyOnly ? "grid-cols-1" : "grid-cols-2")}>

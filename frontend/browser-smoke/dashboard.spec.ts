@@ -1,8 +1,10 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
+import type { AccountLifecycle } from "../src/features/accounts/schemas";
 import { AuthSessionSchema } from "../src/features/auth/schemas";
 import { DashboardProjectionsSchema } from "../src/features/dashboard/schemas";
 import {
+  createAccountLifecycle,
   createAccountSummary,
   createDashboardAuthSession,
   createDashboardOverview,
@@ -36,7 +38,7 @@ async function installMobileContainmentFixtures(page: Page, accounts = [
       displayName: "secondary-operator@northstar",
       usage: { primaryRemainingPercent: 45, secondaryRemainingPercent: 12 },
     }),
-  ]): Promise<void> {
+  ], lifecycles: AccountLifecycle[] = accounts.map((account) => createAccountLifecycle({ accountId: account.accountId }))): Promise<void> {
   const fixtures: Record<string, unknown> = {
     "/api/dashboard-auth/session": createDashboardAuthSession({ authenticated: true, passwordRequired: true }),
     "/api/dashboard/overview": createDashboardOverview({ accounts }),
@@ -46,6 +48,9 @@ async function installMobileContainmentFixtures(page: Page, accounts = [
     "/api/settings/telemetry": createTelemetryConsent({ state: "enabled", source: "persisted", active: true }),
     "/api/settings": createDashboardSettings(),
     "/api/accounts": { accounts },
+    ...Object.fromEntries(
+      lifecycles.map((lifecycle) => [`/api/accounts/${encodeURIComponent(lifecycle.accountId)}/lifecycle`, lifecycle]),
+    ),
   };
 
   await page.route("**/api/**", async (route) => {
@@ -188,6 +193,11 @@ test("dashboard usage donuts stay within supported viewports", async ({ page }) 
 
   for (const viewportCase of viewportCases) {
     await page.setViewportSize(viewportCase.size);
+    // Recharts' ResponsiveContainer keeps its previous width for a frame after a resize;
+    // measure the settled layout. A lasting overflow still fails this poll.
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.scrollWidth))
+      .toBeLessThanOrEqual(viewportCase.size.width);
 
     const usageMetrics = await usageHeadings.evaluateAll((headings) =>
       headings.map((heading) => {
@@ -416,6 +426,95 @@ test("deactivated account actions stay inside list cells and responsive cards", 
       });
     })).toBe(true);
   }
+});
+
+test.describe("subscription dates", () => {
+  test.use({ timezoneId: "UTC" });
+
+  test("stay inside account cards, list cells and the summary at supported widths", async ({ page }) => {
+    const accounts = [
+      createAccountSummary({ accountId: "acc_renewing", email: "renewing@northstar", displayName: "Renewing account" }),
+      createAccountSummary({
+        accountId: "acc_lapsed",
+        email: "lapsed@northstar",
+        displayName: "Lapsed account with a long operator label",
+        usage: { primaryRemainingPercent: 45, secondaryRemainingPercent: 12 },
+      }),
+      createAccountSummary({ accountId: "acc_unread", email: "unread@northstar", displayName: "Unread account" }),
+    ];
+    const lifecycles = [
+      createAccountLifecycle({
+        accountId: "acc_renewing",
+        renewsOn: { precision: "date", date: "2026-10-31", time: null, timezone: null },
+      }),
+      createAccountLifecycle({
+        accountId: "acc_lapsed",
+        endsOn: { precision: "datetime", date: "2026-10-12", time: "09:30:15", timezone: "America/Argentina/ComodRivadavia" },
+        renewsOn: { precision: "date", date: "2026-09-28", time: null, timezone: null },
+      }),
+    ];
+    const lifecycleWrites: string[] = [];
+    page.on("request", (request) => {
+      if (request.method() !== "GET" && new URL(request.url()).pathname.endsWith("/lifecycle")) {
+        lifecycleWrites.push(`${request.method()} ${new URL(request.url()).pathname}`);
+      }
+    });
+    await page.clock.setFixedTime(new Date("2026-10-10T12:00:00Z"));
+    await installMobileContainmentFixtures(page, accounts, lifecycles);
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.goto("/dashboard", { waitUntil: "domcontentloaded" });
+
+    const summary = page.getByTestId("dashboard-account-date-summary");
+    await expect(summary).toHaveText(/Subscription dates:\s*1\s*passed\s*·\s*1\s*unknown/);
+
+    // Every rendered date box stays inside its card or cell and no text overflows its term or
+    // value (the `display: contents` row wrappers have no box to measure).
+    const datesContained = (container: Locator) =>
+      container.evaluate((element) => {
+        const box = element.getBoundingClientRect();
+        const boxes = Array.from(element.querySelectorAll("dl dt, dl dd, dl dd *")).every((inner) => {
+          const rect = inner.getBoundingClientRect();
+          return rect.left >= box.left - 1 && rect.right <= box.right + 1;
+        });
+        const text = Array.from(element.querySelectorAll("dl dt, dl dd")).every(
+          (cell) => cell.scrollWidth <= cell.clientWidth + 1,
+        );
+        return boxes && text;
+      });
+    const documentFits = () =>
+      page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth);
+
+    for (const size of [
+      { width: 320, height: 568 },
+      { width: 390, height: 844 },
+      { width: 1440, height: 900 },
+    ]) {
+      await page.setViewportSize(size);
+
+      await page.getByRole("radio", { name: "View accounts as cards" }).click();
+      const cards = page.getByTestId("dashboard-account-cards").locator(":scope > div");
+      const lapsedCard = cards.filter({ hasText: "Lapsed account" });
+      await expect(lapsedCard.getByText("09:30:15 America/Argentina/ComodRivadavia")).toBeVisible();
+      await expect(lapsedCard.getByText("in 2 days")).toBeVisible();
+      await expect(lapsedCard.getByText("passed 12 days ago · needs confirmation")).toBeVisible();
+      await expect(cards.filter({ hasText: "Renewing account" }).getByText("in 21 days")).toBeVisible();
+      await expect(cards.filter({ hasText: "Unread account" }).getByText("Unavailable")).toHaveCount(2);
+      for (const card of await cards.all()) {
+        expect(await datesContained(card)).toBe(true);
+      }
+      await expect.poll(documentFits).toBe(true);
+      expect(await summary.evaluate((element) => element.getBoundingClientRect().right)).toBeLessThanOrEqual(size.width);
+
+      await page.getByRole("radio", { name: "View accounts as list" }).click();
+      const lapsedRow = page.getByTestId("account-list-row").filter({ hasText: "Lapsed account" });
+      await expect(lapsedRow.getByText("09:30:15 America/Argentina/ComodRivadavia")).toBeVisible();
+      for (const dates of await page.getByTestId("account-list-row").locator("dl").all()) {
+        expect(await datesContained(dates)).toBe(true);
+      }
+      await expect.poll(documentFits).toBe(true);
+    }
+    expect(lifecycleWrites).toEqual([]);
+  });
 });
 
 test("the model source dialogs stay inside supported viewports", async ({ page }) => {
