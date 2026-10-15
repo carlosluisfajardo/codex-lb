@@ -1,4 +1,5 @@
 import { Users } from "lucide-react";
+import { useLayoutEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 
@@ -9,9 +10,6 @@ import type { AccountLifecycleMap } from "@/features/dashboard/hooks/use-account
 import type { AccountSummary } from "@/features/dashboard/schemas";
 
 const ACCOUNT_CARD_VISIBLE_ROWS = 2;
-// Account cards can grow when the optional email row is rendered.
-const ACCOUNT_CARD_ROW_HEIGHT_REM = 11.5;
-const ACCOUNT_CARD_ROW_GAP_REM = 1;
 
 export type AccountCardsProps = {
   accounts: AccountSummary[];
@@ -23,6 +21,32 @@ export type AccountCardsProps = {
 
 export function AccountCards({ accounts, readOnly = false, lifecycle, onAction }: AccountCardsProps) {
   const { t } = useTranslation();
+  const gridRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const grid = gridRef.current;
+    if (!grid) return;
+    const cards = Array.from(grid.children) as HTMLElement[];
+    const measureRows = () => {
+      let rowTop = -1;
+      let rows = 0;
+      let height = 0;
+      for (const card of cards) {
+        // Offset geometry ignores the staggered fade-in transforms.
+        if (card.offsetTop !== rowTop) {
+          if (++rows > ACCOUNT_CARD_VISIBLE_ROWS) break;
+          rowTop = card.offsetTop;
+        }
+        height = Math.max(height, card.offsetTop - cards[0].offsetTop + card.offsetHeight);
+      }
+      if (height > 0) grid.style.maxHeight = `${height}px`;
+    };
+    measureRows();
+    const observer = new ResizeObserver(measureRows);
+    observer.observe(grid);
+    for (const card of cards) observer.observe(card);
+    return () => observer.disconnect();
+  }, [accounts]);
 
   if (accounts.length === 0) {
     return (
@@ -41,11 +65,12 @@ export function AccountCards({ accounts, readOnly = false, lifecycle, onAction }
 
   return (
     <div
+      ref={gridRef}
       data-testid="dashboard-account-cards"
-      className="grid gap-4 overflow-y-auto pr-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden sm:grid-cols-2 lg:grid-cols-3"
-      style={{
-        maxHeight: `calc(${ACCOUNT_CARD_VISIBLE_ROWS} * ${ACCOUNT_CARD_ROW_HEIGHT_REM}rem + ${(ACCOUNT_CARD_VISIBLE_ROWS - 1) * ACCOUNT_CARD_ROW_GAP_REM}rem)`,
-      }}
+      role="region"
+      aria-label={t("accounts.page.title")}
+      tabIndex={0}
+      className="relative grid gap-4 overflow-y-auto pr-1 focus-visible:outline-2 focus-visible:outline-ring sm:grid-cols-2 lg:grid-cols-3"
     >
       {accounts.map((account, index) => (
         <div key={account.accountId} className="animate-fade-in-up" style={{ animationDelay: `${index * 75}ms` }}>

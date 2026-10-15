@@ -439,8 +439,14 @@ test.describe("subscription dates", () => {
         email: "lapsed@northstar",
         displayName: "Lapsed account with a long operator label",
         usage: { primaryRemainingPercent: 45, secondaryRemainingPercent: 12 },
+        availableResetCredits: 1,
       }),
       createAccountSummary({ accountId: "acc_unread", email: "unread@northstar", displayName: "Unread account" }),
+      ...Array.from({ length: 4 }, (_, index) => createAccountSummary({
+        accountId: `acc_later_${index}`,
+        email: `later-${index}@northstar`,
+        displayName: `Later account ${index}`,
+      })),
     ];
     const lifecycles = [
       createAccountLifecycle({
@@ -450,8 +456,9 @@ test.describe("subscription dates", () => {
       createAccountLifecycle({
         accountId: "acc_lapsed",
         endsOn: { precision: "datetime", date: "2026-10-12", time: "09:30:15", timezone: "America/Argentina/ComodRivadavia" },
-        renewsOn: { precision: "date", date: "2026-09-28", time: null, timezone: null },
+        renewsOn: { precision: "datetime", date: "2026-09-28", time: "09:30:15", timezone: "America/Argentina/ComodRivadavia" },
       }),
+      ...accounts.slice(3).map((account) => createAccountLifecycle({ accountId: account.accountId })),
     ];
     const lifecycleWrites: string[] = [];
     page.on("request", (request) => {
@@ -492,9 +499,11 @@ test.describe("subscription dates", () => {
       await page.setViewportSize(size);
 
       await page.getByRole("radio", { name: "View accounts as cards" }).click();
-      const cards = page.getByTestId("dashboard-account-cards").locator(":scope > div");
+      const grid = page.getByTestId("dashboard-account-cards");
+      const cards = grid.locator(":scope > div");
       const lapsedCard = cards.filter({ hasText: "Lapsed account" });
-      await expect(lapsedCard.getByText("09:30:15 America/Argentina/ComodRivadavia")).toBeVisible();
+      await expect(lapsedCard.getByText("09:30:15 America/Argentina/ComodRivadavia")).toHaveCount(2);
+      await expect(lapsedCard.getByText("09:30:15 America/Argentina/ComodRivadavia").first()).toBeVisible();
       await expect(lapsedCard.getByText("in 2 days")).toBeVisible();
       await expect(lapsedCard.getByText("passed 12 days ago · needs confirmation")).toBeVisible();
       await expect(cards.filter({ hasText: "Renewing account" }).getByText("in 21 days")).toBeVisible();
@@ -505,13 +514,61 @@ test.describe("subscription dates", () => {
       await expect.poll(documentFits).toBe(true);
       expect(await summary.evaluate((element) => element.getBoundingClientRect().right)).toBeLessThanOrEqual(size.width);
 
+      if (size.width === 1440) {
+        // Check the untouched scroll position before focus can reveal clipped actions.
+        await expect.poll(() => grid.evaluate((element) => {
+          const children = Array.from(element.children) as HTMLElement[];
+          const tops = [...new Set(children.map((child) => child.offsetTop))];
+          const viewport = element.getBoundingClientRect();
+          const bottom = viewport.top + element.clientTop + element.clientHeight;
+          const firstRow = children.filter((child) => child.offsetTop === tops[0]);
+          const secondRow = children.filter((child) => child.offsetTop === tops[1]);
+          return {
+            atStart: element.scrollTop === 0,
+            rows: tops.length,
+            actionsFit: firstRow.every((child) => Array.from(child.querySelectorAll("button")).every((button) => {
+              const rect = button.getBoundingClientRect();
+              return rect.top >= viewport.top && rect.bottom <= bottom + 1;
+            })),
+            secondRowVisible: secondRow.length === 3 && secondRow.every((child) => child.getBoundingClientRect().bottom <= bottom + 1),
+            overflows: element.scrollHeight > element.clientHeight,
+          };
+        })).toEqual({ atStart: true, rows: 3, actionsFit: true, secondRowVisible: true, overflows: true });
+        await expect(grid).toHaveCSS("scrollbar-width", "auto");
+        await grid.focus();
+        const lastAction = cards.last().getByRole("button", { name: "Details", exact: true });
+        for (let index = 0; index < await grid.getByRole("button").count(); index++) {
+          await page.keyboard.press("Tab");
+          if (await lastAction.evaluate((element) => element === document.activeElement)) break;
+        }
+        await expect(lastAction).toBeFocused();
+        await expect(lastAction).toBeInViewport({ ratio: 1 });
+        expect(await grid.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+      }
+
       await page.getByRole("radio", { name: "View accounts as list" }).click();
       const lapsedRow = page.getByTestId("account-list-row").filter({ hasText: "Lapsed account" });
-      await expect(lapsedRow.getByText("09:30:15 America/Argentina/ComodRivadavia")).toBeVisible();
+      await expect(lapsedRow.getByText("09:30:15 America/Argentina/ComodRivadavia")).toHaveCount(2);
+      await expect(lapsedRow.getByText("09:30:15 America/Argentina/ComodRivadavia").first()).toBeVisible();
       for (const dates of await page.getByTestId("account-list-row").locator("dl").all()) {
         expect(await datesContained(dates)).toBe(true);
       }
       await expect.poll(documentFits).toBe(true);
+      if (size.width === 1440) {
+        const list = page.getByTestId("dashboard-account-list");
+        await expect(list).toHaveCSS("overflow-y", "auto");
+        await expect(list).toHaveCSS("scrollbar-width", "auto");
+        expect(await list.evaluate((element) => element.scrollLeft)).toBe(0);
+        await list.focus();
+        const lastAction = page.getByTestId("account-list-row").last().getByRole("button", { name: /View details/ });
+        for (let index = 0; index < await list.getByRole("button").count(); index++) {
+          await page.keyboard.press("Tab");
+          if (await lastAction.evaluate((element) => element === document.activeElement)) break;
+        }
+        await expect(lastAction).toBeFocused();
+        await expect(lastAction).toBeInViewport({ ratio: 1 });
+        expect(await list.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+      }
     }
     expect(lifecycleWrites).toEqual([]);
   });
