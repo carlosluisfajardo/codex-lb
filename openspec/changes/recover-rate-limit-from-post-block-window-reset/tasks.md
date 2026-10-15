@@ -1,0 +1,13 @@
+# Tasks
+
+## 1. Recovery
+
+- [x] 1.1 `app/core/usage/refresh_scheduler.py`: `_blocked_long_window_reset_confirmed` resolves the routing long window (weekly secondary, or the weekly primary slot via `usage_core.should_use_weekly_primary`; never monthly). It requires `RATE_LIMITED` with both markers, a latest sample that still resets more than five seconds after the deadline, and a deadline less than one window after the block. It then reads post-block history and requires a strictly post-block baseline matching the deadline within five seconds plus a confirmed adjacent transition (`_latest_confirmed_reset_transition_after_baseline`).
+- [x] 1.2 The reconcile passes the result to `background_recovery_state_from_account(blocked_window_reset=...)`. That function then seeds the post-429 floor instead of the stored deadline, so the existing post-block evidence gate and compare-and-set write decide.
+- [x] 1.3 `app/core/balancer/logic.py` returns to its original bytes, and selection-path `_state_from_account` loses the single-sample proof, so no single sample ends a stored deadline or a runtime cooldown. The observing replica's evidence gate (primary and zero-primary paths) measures post-block evidence from the newest block marker it knows.
+
+## 2. Verification
+
+- [x] 2.1 `tests/unit/test_load_balancer.py`: a running Retry-After hold survives an unstarted sliding window and a window started by account use (runtime, observing replica, background); a newer unpersisted runtime block needs evidence recorded after it, whether its cooldown is running or elapsed, including the zero-primary Free path; background recovery with the proof, plus gate rejections for primary exhaustion (current or unknown reset), an exhausted long window, an unexpired pre-block primary sample, a same-second primary sample, and the 30-second floor.
+- [x] 2.2 `tests/unit/test_usage_refresh_scheduler_recovery.py` (the stub gains `history_since`): reconcile recovery from confirmed weekly history and weekly-only primary-slot history, plus a compare-and-set miss. Rejections: unstarted or account-started windows under a Retry-After hold, a real reset without a matching baseline, a sliding baseline for a deadline beyond one window, a baseline before or at the block instant, a move without a confirmed transition, a latest sample back on the deadline, the floor, and primary exhaustion.
+- [x] 2.3 Red on PR8 head `d43ac6df` for the review counterexamples, red on base `38ea82a8` for the recovery pins, one production mutation per protective guard (assertion failures, exact-byte restore), focused files, `ruff check`, `ruff format --check`, `ty check`, architecture scripts, `openspec validate --specs`, and strict change validation.
