@@ -1229,7 +1229,12 @@ def _select_fill_first(available: list[AccountState]) -> AccountState:
 RATE_LIMITED_MIN_COOLDOWN_SECONDS = 30.0
 
 
-def handle_rate_limit(state: AccountState, error: UpstreamError) -> None:
+def handle_rate_limit(
+    state: AccountState,
+    error: UpstreamError,
+    *,
+    exhausted_window_reset_at: float | None = None,
+) -> None:
     now = time.time()
     state.status = AccountStatus.RATE_LIMITED
     state.error_count += 1
@@ -1249,6 +1254,11 @@ def handle_rate_limit(state: AccountState, error: UpstreamError) -> None:
 
     if reset_at is not None:
         state.reset_at = reset_at
+    elif exhausted_window_reset_at is not None and exhausted_window_reset_at > now:
+        # A usage limit without reset metadata on an account whose own latest
+        # usage sample shows the window exhausted: the account returns when
+        # that window resets, not after a backoff measured in seconds.
+        state.reset_at = float(math.ceil(max(now + persisted_delay, exhausted_window_reset_at)))
     else:
         # Persist the resolved cooldown deadline so replicas sharing the
         # database honor it instead of flipping the account back to ACTIVE

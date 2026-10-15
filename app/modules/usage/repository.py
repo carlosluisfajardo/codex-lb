@@ -581,6 +581,15 @@ class UsageRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def exhausted_window_reset_at(self, account_id: str) -> float | None:
+        """When the account's exhausted usage windows reset, judged by each window's latest sample."""
+        resets: list[float] = []
+        for window in ("primary", "secondary", "monthly"):
+            entry = await self.latest_entry_for_account(account_id, window=window)
+            if entry is not None and entry.reset_at is not None and entry.used_percent >= 100.0:
+                resets.append(float(entry.reset_at))
+        return max(resets, default=None)
+
     async def add_entry(
         self,
         account_id: str,

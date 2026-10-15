@@ -12,8 +12,10 @@ from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.types import JsonValue
 from app.modules.api_keys.service import ApiKeyData
 from app.modules.proxy.request_policy import (
+    UPSTREAM_FUNCTION_CALL_ARGUMENTS_MAX_CHARS,
     apply_api_key_enforcement,
     apply_api_key_enforcement_to_chat_payload,
+    enforce_function_call_arguments_limit,
     normalize_source_reasoning_aliases,
     responses_source_route_excluded,
     validate_model_access,
@@ -998,3 +1000,106 @@ def test_source_route_excluded_raises_for_malformed_compaction_trigger() -> None
 
     with pytest.raises(ClientPayloadError):
         responses_source_route_excluded(request)
+
+
+def _replayed_tool_call_request(*items: dict[str, JsonValue]) -> ResponsesRequest:
+    return ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}, *items],
+        }
+    )
+
+
+def test_function_call_arguments_at_the_upstream_limit_are_accepted() -> None:
+    request = _replayed_tool_call_request(
+        {
+            "type": "function_call",
+            "name": "shell",
+            "call_id": "call_1",
+            "arguments": "a" * UPSTREAM_FUNCTION_CALL_ARGUMENTS_MAX_CHARS,
+        },
+    )
+
+    enforce_function_call_arguments_limit(request)
+
+
+def test_function_call_arguments_above_the_upstream_limit_are_rejected_without_echo() -> None:
+    request = _replayed_tool_call_request(
+        {"type": "function_call", "name": "shell", "call_id": "call_ok", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_ok", "output": "ok"},
+        {
+            "type": "function_call",
+            "name": "request_user_input",
+            "call_id": "call_98d6b0f3e9bf",
+            "arguments": "\u00e9" * (UPSTREAM_FUNCTION_CALL_ARGUMENTS_MAX_CHARS + 1),
+        },
+    )
+
+    with pytest.raises(ClientPayloadError) as exc_info:
+        enforce_function_call_arguments_limit(request)
+
+    error = exc_info.value
+    assert error.param == "input[3].arguments"
+    assert error.code == "string_above_max_length"
+    assert error.error_type == "invalid_request_error"
+    message = str(error)
+    assert f"length {UPSTREAM_FUNCTION_CALL_ARGUMENTS_MAX_CHARS + 1} instead" in message
+    assert "call_id call_98d6b0f3e9bf" in message
+    assert "\u00e9" * 8 not in message
+
+
+def test_function_call_arguments_limit_omits_an_unsafe_call_id_from_the_message() -> None:
+    request = _replayed_tool_call_request(
+        {
+            "type": "function_call",
+            "name": "shell",
+            "call_id": "call with spaces and 'quotes'",
+            "arguments": "a" * (UPSTREAM_FUNCTION_CALL_ARGUMENTS_MAX_CHARS + 1),
+        },
+    )
+
+    with pytest.raises(ClientPayloadError) as exc_info:
+        enforce_function_call_arguments_limit(request)
+
+    assert "quotes" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "custom_tool_call", "name": "apply_patch", "call_id": "c", "input": "a" * 1_048_577},
+        {"type": "function_call_output", "call_id": "c", "output": "a" * 1_048_577},
+        {"type": "function_call", "name": "shell", "call_id": "c", "arguments": None},
+    ],
+)
+def test_function_call_arguments_limit_only_applies_to_function_call_argument_strings(
+    item: dict[str, JsonValue],
+) -> None:
+    enforce_function_call_arguments_limit(_replayed_tool_call_request(item))
+
+
+def test_function_call_arguments_limit_leaves_a_terminal_compaction_trigger_to_upstream() -> None:
+    request = _replayed_tool_call_request(
+        {"type": "function_call", "name": "shell", "call_id": "c", "arguments": "a" * 1_048_577},
+        {"type": "compaction_trigger"},
+    )
+
+    enforce_function_call_arguments_limit(request)
+
+
+def test_function_call_arguments_limit_leaves_an_anchored_request_to_upstream() -> None:
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "",
+            "previous_response_id": "resp_anchor",
+            "input": [
+                {"type": "function_call", "name": "shell", "call_id": "c", "arguments": "a" * 1_048_577},
+                {"type": "function_call_output", "call_id": "c", "output": "ok"},
+            ],
+        }
+    )
+
+    enforce_function_call_arguments_limit(request)

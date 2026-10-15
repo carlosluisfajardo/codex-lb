@@ -229,6 +229,141 @@ async def test_rate_limit_deadline_expires_without_usage_refresh(db_setup, monke
 
 
 @pytest.mark.asyncio
+async def test_resetless_usage_limit_benches_an_exhausted_window_until_it_resets(db_setup, monkeypatch):
+    """#1707: a usage limit without reset metadata must not re-admit the account in seconds.
+
+    Upstream often answers an exhausted account with ``usage_limit_reached`` and
+    no reset. The rate-limit write then persisted its metadata-free backoff as the
+    account's reset, so the account was selected again as soon as the backoff
+    lapsed while its own latest usage sample showed its only (weekly) window
+    exhausted for days. Each re-selection was another failed turn.
+    """
+    blocked_at = float(int(time.time()))
+    now = blocked_at
+    monkeypatch.setattr("time.time", lambda: now)
+    exhausted = _make_account("weekly_exhausted", plan_type="prolite")
+    window_reset_at = int(blocked_at) + 4 * 24 * 3600
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(exhausted)
+        await UsageRepository(session).add_entry(
+            account_id=exhausted.id,
+            used_percent=100.0,
+            window="primary",
+            reset_at=window_reset_at,
+            window_minutes=10080,
+            recorded_at=datetime.fromtimestamp(blocked_at - 60, timezone.utc).replace(tzinfo=None),
+        )
+
+    service = ProxyService(_repo_factory)
+    classified = await service._handle_stream_error(
+        exhausted,
+        {"message": "The usage limit has been reached"},
+        "usage_limit_reached",
+    )
+    assert classified["failure_class"] == "rate_limit"
+    row = await _fetch_account(exhausted.id)
+    assert row.status == AccountStatus.RATE_LIMITED
+    assert row.reset_at == window_reset_at
+
+    # An hour later, far past any metadata-free backoff, the window is still exhausted.
+    now = blocked_at + 3600
+    selection = await service._load_balancer.select_account(account_ids={exhausted.id})
+    assert selection.account is None
+    row = await _fetch_account(exhausted.id)
+    assert row.status == AccountStatus.RATE_LIMITED
+    assert row.reset_at == window_reset_at
+
+
+async def _seed_account_with_usage_samples(suffix: str, *samples: tuple[str, float, int, int, float]) -> Account:
+    """Insert an account and its samples, each ``(window, used_percent, reset_at, window_minutes, recorded_at)``."""
+    account = _make_account(suffix, plan_type="prolite")
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(account)
+        for window, used_percent, reset_at, window_minutes, recorded_at in samples:
+            await UsageRepository(session).add_entry(
+                account_id=account.id,
+                used_percent=used_percent,
+                window=window,
+                reset_at=reset_at,
+                window_minutes=window_minutes,
+                recorded_at=datetime.fromtimestamp(recorded_at, timezone.utc).replace(tzinfo=None),
+            )
+    return account
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_exceeded_keeps_the_backoff_on_an_exhausted_window(db_setup, monkeypatch):
+    """#1707: only a usage limit takes the exhausted window's reset; any other 429 keeps the backoff."""
+    blocked_at = float(int(time.time()))
+    monkeypatch.setattr("time.time", lambda: blocked_at)
+    monkeypatch.setattr("app.core.balancer.logic.backoff_seconds", lambda _: 0.2)
+    account = await _seed_account_with_usage_samples(
+        "rate_limit_on_exhausted_window",
+        ("primary", 100.0, int(blocked_at) + 4 * 24 * 3600, 10080, blocked_at - 60),
+    )
+
+    classified = await ProxyService(_repo_factory)._handle_stream_error(
+        account,
+        {"message": "Rate limit exceeded."},
+        "rate_limit_exceeded",
+    )
+
+    assert classified["failure_class"] == "rate_limit"
+    row = await _fetch_account(account.id)
+    assert row.status == AccountStatus.RATE_LIMITED
+    assert row.reset_at == int(blocked_at + RATE_LIMITED_MIN_COOLDOWN_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_resetless_usage_limit_ignores_a_window_whose_latest_sample_has_quota(db_setup, monkeypatch):
+    """#1707: a window counts as exhausted only when its latest sample is exhausted."""
+    blocked_at = float(int(time.time()))
+    monkeypatch.setattr("time.time", lambda: blocked_at)
+    monkeypatch.setattr("app.core.balancer.logic.backoff_seconds", lambda _: 0.2)
+    window_reset_at = int(blocked_at) + 4 * 24 * 3600
+    account = await _seed_account_with_usage_samples(
+        "latest_sample_has_quota",
+        ("primary", 100.0, window_reset_at, 10080, blocked_at - 600),
+        ("primary", 60.0, window_reset_at, 10080, blocked_at - 60),
+        ("secondary", 40.0, window_reset_at, 10080, blocked_at - 60),
+    )
+
+    await ProxyService(_repo_factory)._handle_stream_error(
+        account,
+        {"message": "The usage limit has been reached"},
+        "usage_limit_reached",
+    )
+
+    row = await _fetch_account(account.id)
+    assert row.status == AccountStatus.RATE_LIMITED
+    assert row.reset_at == int(blocked_at + RATE_LIMITED_MIN_COOLDOWN_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_resetless_usage_limit_holds_until_the_latest_exhausted_window_resets(db_setup, monkeypatch):
+    """#1707: with several exhausted windows the account returns when the last of them resets."""
+    blocked_at = float(int(time.time()))
+    monkeypatch.setattr("time.time", lambda: blocked_at)
+    short_window_reset_at = int(blocked_at) + 3 * 3600
+    weekly_window_reset_at = int(blocked_at) + 6 * 24 * 3600
+    account = await _seed_account_with_usage_samples(
+        "several_exhausted_windows",
+        ("primary", 100.0, short_window_reset_at, 300, blocked_at - 60),
+        ("secondary", 100.0, weekly_window_reset_at, 10080, blocked_at - 60),
+    )
+
+    await ProxyService(_repo_factory)._handle_stream_error(
+        account,
+        {"message": "The usage limit has been reached"},
+        "usage_limit_reached",
+    )
+
+    row = await _fetch_account(account.id)
+    assert row.status == AccountStatus.RATE_LIMITED
+    assert row.reset_at == weekly_window_reset_at
+
+
+@pytest.mark.asyncio
 async def test_peer_replica_honors_metadata_free_rate_limit_cooldown(db_setup):
     """Regression: on main the peer flips the row back to ACTIVE and selects it.
 

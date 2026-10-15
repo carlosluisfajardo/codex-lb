@@ -65,7 +65,7 @@ from app.modules.proxy.load_balancer import (
     CatalogOmissionQuotaAdmission,
 )
 from app.modules.proxy.sticky_repository import StickySessionsRepository
-from app.modules.usage.repository import AdditionalUsageRepository
+from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
 pytestmark = pytest.mark.integration
 _TEST_SYNC_TIMEOUT_SECONDS = 5.0
@@ -8959,6 +8959,297 @@ async def test_v1_responses_http_bridge_rebinds_immediately_when_the_owner_canno
     assert any(row.account_id == healthy_account.id for row in rows)
     assert all(row.continuity_abandoned_at is None for row in rows)
     assert all(row.continuity_abandonment_scope is None for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_rebinds_when_a_usage_exhausted_owner_reports_no_reset(
+    async_client,
+    app_instance,
+    monkeypatch,
+    caplog,
+):
+    """#1707 on a usage-exhausted owner: a reset-less 429 must not read as "back soon".
+
+    Upstream answered the exhausted owner with ``usage_limit_reached`` and no
+    reset metadata, so the owner's ``reset_at`` became a seconds-long backoff.
+    The request-path retirement compared that backoff with the request budget,
+    judged the owner back in time and declined, and every resume failed 502
+    while the owner's own usage sample showed its only window exhausted for days.
+    """
+    _install_bridge_settings(monkeypatch, enabled=True)
+    owner_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_exhausted_owner",
+        "http-bridge-exhausted-owner@example.com",
+    )
+    healthy_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_exhausted_replacement",
+        "http-bridge-exhausted-replacement@example.com",
+    )
+    owner_account = await _get_account(owner_account_id)
+    healthy_account = await _get_account(healthy_account_id)
+    upstream = _ClosingBridgeUpstreamWebSocket()
+    served_account_ids: list[str] = []
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline
+        preferred_account_id = cast(str | None, kwargs.get("preferred_account_id"))
+        if preferred_account_id == owner_account.id:
+            return AccountSelection(
+                account=None,
+                error_message="No available accounts",
+                error_code=CONTINUITY_OWNER_UNAVAILABLE,
+            )
+        account = owner_account if not served_account_ids else healthy_account
+        served_account_ids.append(account.id)
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    thread_headers = {"session_id": "session-exhausted-owner", "thread-id": "thread-exhausted-owner"}
+    first = await asyncio.wait_for(
+        async_client.post(
+            "/backend-api/codex/responses",
+            headers=thread_headers,
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": "hello",
+                "prompt_cache_key": "http-bridge-exhausted-owner",
+            },
+        ),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+    assert first.status_code == 200
+
+    service = get_proxy_service_for_app(app_instance)
+    deadline = time.monotonic() + _TEST_SYNC_TIMEOUT_SECONDS
+    owned: list[HttpBridgeSessionRecord] = []
+    while time.monotonic() < deadline:
+        async with SessionLocal() as session:
+            owned = list(
+                (
+                    await session.execute(
+                        select(HttpBridgeSessionRecord).where(HttpBridgeSessionRecord.account_id == owner_account.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        if owned:
+            break
+        await asyncio.sleep(0.05)
+    assert owned, "the first turn did not persist a durable bridge row"
+    async with service._http_bridge_lock:
+        service._http_bridge_sessions.clear()
+
+    # The owner's only window is exhausted for days, as its usage poll reports,
+    # and upstream rejects it with a usage limit that carries no reset.
+    window_reset_at = int(time.time()) + 4 * 24 * 3600
+    async with SessionLocal() as session:
+        await UsageRepository(session).add_entry(
+            owner_account.id,
+            100.0,
+            window="primary",
+            reset_at=window_reset_at,
+            window_minutes=10080,
+        )
+    await service._handle_stream_error(
+        owner_account,
+        {"message": "The usage limit has been reached"},
+        "usage_limit_reached",
+    )
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.service")
+    second = await asyncio.wait_for(
+        async_client.post(
+            "/backend-api/codex/responses",
+            headers=thread_headers,
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": "continue",
+                "prompt_cache_key": "http-bridge-exhausted-owner",
+            },
+        ),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+
+    assert second.status_code == 200
+    assert served_account_ids[-1] == healthy_account.id
+    retired = [record.getMessage() for record in caplog.records if "owner_retired_on_request" in record.getMessage()]
+    assert len(retired) == 1
+    owner_row = await _get_account(owner_account_id)
+    assert owner_row.status == AccountStatus.RATE_LIMITED
+    assert owner_row.reset_at == window_reset_at
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_keeps_an_explicit_previous_response_on_its_usage_exhausted_owner(
+    async_client,
+    app_instance,
+    monkeypatch,
+    caplog,
+):
+    """#1707: a client-supplied previous_response_id never moves to another account.
+
+    A usage-exhausted owner is now held until its window resets, which the
+    request-path retirement reads as unable to return. A client that named its
+    own previous_response_id still gets the owner-unavailable 502: no other
+    account is selected or connected, the owner is not retired, and nothing is
+    sent upstream again.
+    """
+    _install_bridge_settings(monkeypatch, enabled=True)
+    owner_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_explicit_owner",
+        "http-bridge-explicit-owner@example.com",
+    )
+    healthy_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_explicit_alternate",
+        "http-bridge-explicit-alternate@example.com",
+    )
+    owner_account = await _get_account(owner_account_id)
+    healthy_account = await _get_account(healthy_account_id)
+    upstream = _ClosingBridgeUpstreamWebSocket()
+    served_account_ids: list[str] = []
+    connected_account_headers: list[str] = []
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline
+        preferred_account_id = cast(str | None, kwargs.get("preferred_account_id"))
+        if preferred_account_id == owner_account.id:
+            return AccountSelection(
+                account=None,
+                error_message="No available accounts",
+                error_code=CONTINUITY_OWNER_UNAVAILABLE,
+            )
+        account = owner_account if not served_account_ids else healthy_account
+        served_account_ids.append(account.id)
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, base_url, session
+        connected_account_headers.append(account_id_header)
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    thread_headers = {"session_id": "session-explicit-owner", "thread-id": "thread-explicit-owner"}
+    first = await asyncio.wait_for(
+        async_client.post(
+            "/backend-api/codex/responses",
+            headers=thread_headers,
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": "hello",
+                "prompt_cache_key": "http-bridge-explicit-owner",
+            },
+        ),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+    assert first.status_code == 200
+    previous_response_id = next(
+        event["response"]["id"]
+        for line in first.text.splitlines()
+        if line.startswith("data: ") and line[6:] != "[DONE]"
+        if (event := json.loads(line[6:])).get("type") == "response.completed"
+    )
+
+    service = get_proxy_service_for_app(app_instance)
+    deadline = time.monotonic() + _TEST_SYNC_TIMEOUT_SECONDS
+    owned: list[HttpBridgeSessionRecord] = []
+    while time.monotonic() < deadline:
+        async with SessionLocal() as session:
+            owned = list(
+                (
+                    await session.execute(
+                        select(HttpBridgeSessionRecord).where(HttpBridgeSessionRecord.account_id == owner_account.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        if owned:
+            break
+        await asyncio.sleep(0.05)
+    assert owned, "the first turn did not persist a durable bridge row"
+    async with service._http_bridge_lock:
+        service._http_bridge_sessions.clear()
+
+    window_reset_at = int(time.time()) + 4 * 24 * 3600
+    async with SessionLocal() as session:
+        await UsageRepository(session).add_entry(
+            owner_account.id,
+            100.0,
+            window="primary",
+            reset_at=window_reset_at,
+            window_minutes=10080,
+        )
+    await service._handle_stream_error(
+        owner_account,
+        {"message": "The usage limit has been reached"},
+        "usage_limit_reached",
+    )
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.service")
+    second = await asyncio.wait_for(
+        async_client.post(
+            "/backend-api/codex/responses",
+            headers=thread_headers,
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "input": "continue",
+                "previous_response_id": previous_response_id,
+                "prompt_cache_key": "http-bridge-explicit-owner",
+            },
+        ),
+        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+    )
+
+    assert second.status_code == 502
+    assert second.json()["error"]["code"] == "previous_response_owner_unavailable"
+    assert healthy_account.id not in served_account_ids
+    assert connected_account_headers == ["acc_http_bridge_explicit_owner"]
+    assert len(upstream.sent_text) == 1
+    assert not [record for record in caplog.records if "owner_retired_on_request" in record.getMessage()]
+    owner_row = await _get_account(owner_account_id)
+    assert owner_row.status == AccountStatus.RATE_LIMITED
+    assert owner_row.reset_at == window_reset_at
 
 
 @pytest.mark.asyncio
@@ -18433,18 +18724,14 @@ async def test_backend_responses_http_bridge_fails_a_self_excluded_hard_owner_re
         return
     # The model-fallback replay surfaces the upstream rejection that started
     # it, which is the actionable error for a hard owner that cannot serve the
-    # requested model.
-    assert response.status_code == 200
-    events = [
-        event
-        for line in body.splitlines()
-        if line.startswith("data: ") and line[6:] != "[DONE]"
-        if (event := json.loads(line[6:])).get("type") != "codex.keepalive"
-    ]
-    assert [event["type"] for event in events] == ["error"]
-    assert events[0]["error"]["code"] == "invalid_request_error"
-    assert events[0]["error"]["message"] == (
-        f"The '{model}' model is not supported when using Codex with a ChatGPT account."
+    # requested model. It is a request rejection, so the native client gets the
+    # HTTP 400 an HTTP upstream returns instead of a bare ``error`` frame.
+    assert response.status_code == 400
+    error = json.loads(body)["error"]
+    assert error["code"] == "invalid_request_error"
+    assert error["message"] == (
+        "The requested model is not supported when using Codex with a ChatGPT account. "
+        "Retrying the same request fails the same way; choose a different model."
     )
 
 

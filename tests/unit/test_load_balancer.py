@@ -1404,6 +1404,48 @@ def test_handle_rate_limit_persists_floored_deadline_without_reset_metadata(monk
     assert state.cooldown_until == pytest.approx(now + 0.2)
 
 
+def test_handle_rate_limit_without_reset_metadata_returns_with_the_exhausted_window(monkeypatch):
+    # #1707: the backoff is not a return horizon for an account whose usage
+    # window is exhausted for days; the window's own reset is.
+    now = 1_700_000_000.0
+    window_reset_at = now + 4 * 24 * 3600
+    monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now)
+    monkeypatch.setattr("app.core.balancer.logic.backoff_seconds", lambda _: 0.2)
+    state = AccountState("a", AccountStatus.ACTIVE, used_percent=100.0)
+    handle_rate_limit(
+        state,
+        {"message": "The usage limit has been reached"},
+        exhausted_window_reset_at=window_reset_at,
+    )
+    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.reset_at == window_reset_at
+    assert state.cooldown_until == pytest.approx(now + 0.2, abs=1e-6)
+
+
+def test_handle_rate_limit_exhausted_window_never_shortens_the_cooldown(monkeypatch):
+    now = 1_700_000_000.0
+    monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now)
+    monkeypatch.setattr("app.core.balancer.logic.backoff_seconds", lambda _: 0.2)
+    resetting_soon = AccountState("a", AccountStatus.ACTIVE, used_percent=100.0)
+    handle_rate_limit(resetting_soon, {"message": "Rate limit exceeded."}, exhausted_window_reset_at=now + 5)
+    assert resetting_soon.reset_at == now + RATE_LIMITED_MIN_COOLDOWN_SECONDS
+    already_reset = AccountState("b", AccountStatus.ACTIVE, used_percent=100.0)
+    handle_rate_limit(already_reset, {"message": "Rate limit exceeded."}, exhausted_window_reset_at=now - 60)
+    assert already_reset.reset_at == now + RATE_LIMITED_MIN_COOLDOWN_SECONDS
+
+
+def test_handle_rate_limit_upstream_reset_metadata_wins_over_the_exhausted_window(monkeypatch):
+    now = 1_700_000_000.0
+    monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now)
+    state = AccountState("a", AccountStatus.ACTIVE, used_percent=100.0)
+    handle_rate_limit(
+        state,
+        {"message": "The usage limit has been reached", "resets_in_seconds": 600},
+        exhausted_window_reset_at=now + 4 * 24 * 3600,
+    )
+    assert state.reset_at == now + 600.0
+
+
 def test_handle_rate_limit_persists_retry_after_deadline_verbatim(monkeypatch):
     now = 1_700_000_000.0
     monkeypatch.setattr("app.core.balancer.logic.time.time", lambda: now)
