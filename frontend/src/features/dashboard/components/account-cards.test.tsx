@@ -54,11 +54,17 @@ describe("AccountCards", () => {
       act(() => resize?.([], {} as ResizeObserver));
       expect(grid.style.maxHeight).toBe("846px");
 
-      // A narrow grid has one card per row, with different intrinsic heights.
+      // One-column cards flow in the page rather than creating a tall internal scroller.
       columns = 1;
       heights = [520, 460, 400, 400, 400, 400, 400];
       act(() => resize?.([], {} as ResizeObserver));
-      expect(grid.style.maxHeight).toBe("996px");
+      expect(grid.style.maxHeight).toBe("none");
+
+      // Widening again must restore the original measured two-row protection.
+      columns = 3;
+      heights = [411, 356, 300];
+      act(() => resize?.([], {} as ResizeObserver));
+      expect(grid.style.maxHeight).toBe("783px");
 
       unmount();
       expect(disconnect).toHaveBeenCalledOnce();

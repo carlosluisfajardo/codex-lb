@@ -39,7 +39,11 @@ export function AccountCards({ accounts, readOnly = false, lifecycle, onAction }
         }
         height = Math.max(height, card.offsetTop - cards[0].offsetTop + card.offsetHeight);
       }
-      if (height > 0) grid.style.maxHeight = `${height}px`;
+      if (height > 0) {
+        // A single column flows in the page instead of trapping scroll inside two tall cards.
+        const multipleColumns = cards.length > 1 && cards[0].offsetTop === cards[1].offsetTop;
+        grid.style.maxHeight = multipleColumns ? `${height}px` : "none";
+      }
     };
     measureRows();
     const observer = new ResizeObserver(measureRows);
