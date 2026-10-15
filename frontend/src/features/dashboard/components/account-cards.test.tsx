@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 
@@ -7,25 +7,69 @@ import type { AccountLifecycleEntry } from "@/features/dashboard/lifecycle";
 import { createAccountSummary } from "@/test/mocks/factories";
 
 describe("AccountCards", () => {
-  it("caps the dashboard account grid at two visible rows without clipping taller cards", () => {
-    render(
-      <AccountCards
-        accounts={Array.from({ length: 7 }, (_, index) =>
-          createAccountSummary({
-            accountId: `acc-${index + 1}`,
-            email: `account-${index + 1}@example.com`,
-            displayName: `Account ${index + 1}`,
-          }),
-        )}
-        onAction={vi.fn()}
-      />,
-    );
+  it("fits two measured rows and remeasures when content or columns change", () => {
+    let resize: ResizeObserverCallback | undefined;
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    let columns = 3;
+    let heights = [411, 356, 300, 300];
+    const childIndex = (element: HTMLElement) =>
+      Array.from(element.parentElement?.children ?? []).indexOf(element);
+    const offsetTop = vi.spyOn(HTMLElement.prototype, "offsetTop", "get").mockImplementation(function (this: HTMLElement) {
+      const row = Math.floor(childIndex(this) / columns);
+      return heights.slice(0, row).reduce((sum, height) => sum + height + 16, 0);
+    });
+    const offsetHeight = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return heights[Math.floor(childIndex(this) / columns)] ?? 0;
+    });
+    const observer = vi.spyOn(globalThis, "ResizeObserver").mockImplementation(class {
+      constructor(callback: ResizeObserverCallback) {
+        resize = callback;
+      }
+      observe = observe;
+      unobserve = vi.fn();
+      disconnect = disconnect;
+    });
 
-    // jsdom 30 simplifies calc() during serialization; authored: calc(2 * 11.5rem + 1rem)
-    expect(screen.getByTestId("dashboard-account-cards").style.maxHeight).toBe("calc(24rem)");
+    try {
+      const { unmount } = render(
+        <AccountCards
+          accounts={Array.from({ length: 7 }, (_, index) =>
+            createAccountSummary({
+              accountId: `acc-${index + 1}`,
+              email: `account-${index + 1}@example.com`,
+              displayName: `Account ${index + 1}`,
+            }),
+          )}
+          onAction={vi.fn()}
+        />,
+      );
+      const grid = screen.getByTestId("dashboard-account-cards");
+      expect(grid.style.maxHeight).toBe("783px");
+      expect(observe).toHaveBeenCalledWith(grid);
+      for (const child of grid.children) expect(observe).toHaveBeenCalledWith(child);
+
+      // A late lifecycle response grows one row without changing the account count.
+      heights = [450, 380, 300, 300];
+      act(() => resize?.([], {} as ResizeObserver));
+      expect(grid.style.maxHeight).toBe("846px");
+
+      // A narrow grid has one card per row, with different intrinsic heights.
+      columns = 1;
+      heights = [520, 460, 400, 400, 400, 400, 400];
+      act(() => resize?.([], {} as ResizeObserver));
+      expect(grid.style.maxHeight).toBe("996px");
+
+      unmount();
+      expect(disconnect).toHaveBeenCalledOnce();
+    } finally {
+      observer.mockRestore();
+      offsetTop.mockRestore();
+      offsetHeight.mockRestore();
+    }
   });
 
-  it("keeps the scrollbar hidden on the dashboard account grid", () => {
+  it("names a keyboard-focusable scroll region without suppressing native scrollbars", () => {
     render(
       <AccountCards
         accounts={[createAccountSummary(), createAccountSummary({ accountId: "acc-2", email: "two@example.com" })]}
@@ -33,11 +77,11 @@ describe("AccountCards", () => {
       />,
     );
 
-    expect(screen.getByTestId("dashboard-account-cards")).toHaveClass(
-      "overflow-y-auto",
-      "[scrollbar-width:none]",
-      "[&::-webkit-scrollbar]:hidden",
-    );
+    const grid = screen.getByRole("region", { name: "Accounts" });
+    expect(grid).toHaveAttribute("tabindex", "0");
+    expect(grid).toHaveClass("overflow-y-auto");
+    expect(grid).not.toHaveClass("[scrollbar-width:none]");
+    expect(grid).not.toHaveClass("[&::-webkit-scrollbar]:hidden");
   });
 
   it("gives each warm-up toggle a descriptive account-specific name", () => {

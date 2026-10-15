@@ -343,14 +343,17 @@ export function AccountList({
   return (
     <div
       data-testid="dashboard-account-list"
-      className="overflow-x-auto rounded-lg border bg-card"
+      role="region"
+      aria-label={t("accounts.page.title")}
+      tabIndex={0}
+      className="overflow-auto rounded-lg border bg-card focus-visible:outline-2 focus-visible:outline-ring"
+      style={{ maxHeight: `${ACCOUNT_LIST_VISIBLE_ROWS * ACCOUNT_LIST_ROW_HEIGHT_REM}rem` }}
     >
       <div
         className={cn(
-          "divide-y overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+          "divide-y",
           lifecycle ? "min-w-[86rem]" : "min-w-[76rem]",
         )}
-        style={{ maxHeight: `${ACCOUNT_LIST_VISIBLE_ROWS * ACCOUNT_LIST_ROW_HEIGHT_REM}rem` }}
       >
         <div
           className="sticky top-0 z-10 grid gap-3 border-b bg-card/95 px-3 py-2 text-[11px] font-medium uppercase tracking-wider text-muted-foreground backdrop-blur supports-[backdrop-filter]:bg-card/85"
