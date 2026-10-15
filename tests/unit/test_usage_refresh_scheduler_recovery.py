@@ -357,6 +357,77 @@ async def test_reconcile_recoverable_account_statuses_keeps_rate_limited_until_r
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("concurrent_marker_change", [False, True])
+async def test_reconcile_recovers_rate_limited_from_post_block_long_window_reset(
+    monkeypatch: pytest.MonkeyPatch,
+    concurrent_marker_change: bool,
+) -> None:
+    now = 1_700_000_000.0
+    stored_reset = int(now + 2 * 24 * 60 * 60)
+    blocked_at = int(now - 3 * 60 * 60)
+    monkeypatch.setattr("time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
+
+    account = _make_account(
+        "acc_rate_limited_window_reset",
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=stored_reset,
+        blocked_at=blocked_at,
+    )
+    repository_type = MutatingAccountsRepository if concurrent_marker_change else StubAccountsRepository
+    accounts_repo = repository_type([account])
+    usage_repo = StubUsageRepository(
+        primary={
+            account.id: _make_usage(
+                account.id,
+                window="primary",
+                used_percent=5.0,
+                reset_at=int(now + 3600),
+                recorded_at=_epoch_to_naive_utc(now - 30),
+                window_minutes=300,
+            )
+        },
+        secondary={
+            account.id: _make_usage(
+                account.id,
+                window="secondary",
+                used_percent=3.0,
+                reset_at=int(now - 600) + 7 * 24 * 60 * 60,
+                recorded_at=_epoch_to_naive_utc(now - 30),
+                window_minutes=10080,
+            )
+        },
+    )
+
+    recovered = await refresh_scheduler_module.reconcile_recoverable_account_statuses(
+        accounts_repo=accounts_repo,
+        usage_repo=usage_repo,
+        accounts=[account],
+    )
+
+    if concurrent_marker_change:
+        assert recovered == 0
+        assert accounts_repo.status_updates == []
+        assert account.status == AccountStatus.RATE_LIMITED
+        assert account.reset_at == 42
+        return
+    assert recovered == 1
+    assert account.status == AccountStatus.ACTIVE
+    assert account.reset_at is None
+    assert account.blocked_at is None
+    assert accounts_repo.status_updates == [
+        {
+            "account_id": account.id,
+            "status": AccountStatus.ACTIVE,
+            "deactivation_reason": None,
+            "reset_at": None,
+            "blocked_at": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_reconcile_recovers_free_after_confirmed_monthly_reset_before_legacy_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -7,12 +7,14 @@ import random
 import socket
 import time
 from dataclasses import dataclass
+from datetime import timezone
 from typing import Collection, Iterable, Literal
 
 from app.core.balancer.types import FailureClass, UpstreamError
 from app.core.usage import PLAN_CAPACITY_CREDITS_SECONDARY
+from app.core.usage.refresh_policy import usage_freshness_horizon_seconds
 from app.core.utils.retry import backoff_seconds, parse_retry_after
-from app.db.models import AccountStatus
+from app.db.models import Account, AccountStatus, AdditionalUsageHistory, UsageHistory
 
 PERMANENT_FAILURE_CODES = {
     "refresh_token_expired": "Refresh token expired - re-login required",
@@ -1399,6 +1401,45 @@ def plausible_rate_limit_reset_at(
     if reset_at <= current or reset_at > current + horizon:
         return None
     return float(reset_at)
+
+
+# Upstream reset timestamps jitter; a smaller difference never proves a new window.
+RESET_JITTER_SECONDS = 60
+
+
+def long_window_reset_after_block(
+    account: Account,
+    entry: UsageHistory | AdditionalUsageHistory | None,
+    blocked_at: float,
+    now: float,
+) -> bool:
+    """Whether a fresh long-window sample proves its window replaced a stored rate-limit deadline.
+
+    A persisted 429 deadline does not record which window it described, so the
+    sample must prove novelty itself: its window began after the block (which
+    also places the sample in a later second than the block) and resets past
+    the stored deadline. Monthly windows slide and keep their own reset proof;
+    callers still require available post-block evidence before clearing the block.
+    """
+    stored_deadline = plausible_rate_limit_reset_at(account.reset_at, now=now)
+    if (
+        account.status != AccountStatus.RATE_LIMITED
+        or stored_deadline is None
+        or now < blocked_at + RATE_LIMITED_MIN_COOLDOWN_SECONDS
+        or entry is None
+        or entry.window == "monthly"
+        or entry.reset_at is None
+        or entry.window_minutes is None
+        or not math.isfinite(entry.used_percent)
+    ):
+        return False
+    recorded_at = entry.recorded_at.replace(tzinfo=entry.recorded_at.tzinfo or timezone.utc).timestamp()
+    window_started_at = entry.reset_at - entry.window_minutes * 60
+    return (
+        recorded_at >= now - usage_freshness_horizon_seconds()
+        and int(blocked_at) + RESET_JITTER_SECONDS < window_started_at <= recorded_at + RESET_JITTER_SECONDS
+        and entry.reset_at >= stored_deadline + RESET_JITTER_SECONDS
+    )
 
 
 def _extract_reset_at(error: UpstreamError, *, now: float) -> int | None:

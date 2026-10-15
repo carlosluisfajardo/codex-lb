@@ -36,6 +36,7 @@ from app.core.balancer import (
 from app.core.balancer import (
     select_account as select_account,
 )
+from app.core.balancer.logic import long_window_reset_after_block
 from app.core.balancer.types import UpstreamError
 from app.core.clock import REAL_CLOCK, Clock
 from app.core.config.dashboard_overrides import with_dashboard_overrides
@@ -2438,8 +2439,12 @@ def _state_from_account(
         and runtime.blocked_at >= effective_blocked_at
     ):
         cooldown_ready = True
+    # A long window that began after the block replaces the stored deadline on every replica.
+    window_reset_ready = effective_blocked_at is not None and long_window_reset_after_block(
+        account, effective_secondary_entry, max(effective_blocked_at, runtime.blocked_at or 0), now
+    )
 
-    if cooldown_ready and effective_blocked_at is not None:
+    if (cooldown_ready or window_reset_ready) and effective_blocked_at is not None:
         if account.status == AccountStatus.QUOTA_EXCEEDED:
             freshness_entry = (
                 effective_secondary_entry if secondary_used is not None and secondary_used < 100.0 else None
@@ -2571,7 +2576,7 @@ def _state_from_account(
         primary_reset_at=primary_reset,
         primary_window_minutes=primary_window_minutes,
         blocked_at=next_blocked_at,
-        cooldown_until=runtime.cooldown_until,
+        cooldown_until=None if window_reset_ready and status == AccountStatus.ACTIVE else runtime.cooldown_until,
         secondary_used_percent=effective_secondary_used_percent,
         secondary_reset_at=secondary_reset,
         last_error_at=runtime.last_error_at,
