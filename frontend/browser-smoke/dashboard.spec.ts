@@ -495,6 +495,7 @@ test.describe("subscription dates", () => {
       { width: 320, height: 568 },
       { width: 390, height: 844 },
       { width: 1440, height: 900 },
+      { width: 1440, height: 1200 },
     ]) {
       await page.setViewportSize(size);
 
@@ -513,6 +514,30 @@ test.describe("subscription dates", () => {
       }
       await expect.poll(documentFits).toBe(true);
       expect(await summary.evaluate((element) => element.getBoundingClientRect().right)).toBeLessThanOrEqual(size.width);
+
+      if (size.width < 640) {
+        // N1 uses page flow: a tall region is safe only when it has no vertical scroll range.
+        await expect.poll(() => grid.evaluate((element) => ({
+          contentTallerThanWindow: element.clientHeight > window.innerHeight,
+          noInternalVerticalOverflow: element.scrollHeight <= element.clientHeight + 1,
+        }))).toEqual({ contentTallerThanWindow: true, noInternalVerticalOverflow: true });
+        await expect(grid).toHaveCSS("scrollbar-width", "auto");
+        await cards.first().hover();
+        const pageStart = await page.evaluate(() => window.scrollY);
+        await page.mouse.wheel(0, size.height / 2);
+        await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(pageStart);
+        expect(await grid.evaluate((element) => element.scrollTop)).toBe(0);
+
+        await grid.focus();
+        const lastAction = cards.last().getByRole("button", { name: "Details", exact: true });
+        for (let index = 0; index < await grid.getByRole("button").count(); index++) {
+          await page.keyboard.press("Tab");
+          if (await lastAction.evaluate((element) => element === document.activeElement)) break;
+        }
+        await expect(lastAction).toBeFocused();
+        await expect(lastAction).toBeInViewport({ ratio: 1 });
+        expect(await grid.evaluate((element) => element.scrollTop)).toBe(0);
+      }
 
       if (size.width === 1440) {
         // Check the untouched scroll position before focus can reveal clipped actions.
