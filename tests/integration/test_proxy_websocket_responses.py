@@ -7225,6 +7225,122 @@ def test_backend_responses_websocket_masks_short_previous_response_not_found_wit
     assert captured_preferred_accounts == [None]
 
 
+def test_backend_responses_websocket_recovers_tool_delta_miss_with_client_full_history(
+    app_instance,
+    monkeypatch,
+):
+    def response_batch(response_id, *, output=()):
+        return [
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps({"type": "response.created", "response": {"id": response_id, "status": "in_progress"}}),
+            ),
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {"id": response_id, "status": "completed", "output": list(output)},
+                    }
+                ),
+            ),
+        ]
+
+    tool_call = {"type": "function_call", "name": "wait", "call_id": "call_fixture", "arguments": "{}"}
+    tool_output = {"type": "function_call_output", "call_id": "call_fixture", "output": "fixture finished"}
+    user_input = {"role": "user", "content": [{"type": "input_text", "text": "run the fixture"}]}
+    full_history = [user_input, tool_call, tool_output]
+    first_upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            response_batch("resp_fixture_old", output=[tool_call]),
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "error",
+                            "status": 400,
+                            "error": {
+                                "type": "invalid_request_error",
+                                "code": "previous_response_not_found",
+                                "message": "Previous response with id 'resp_fixture_old' not found.",
+                                "param": "previous_response_id",
+                            },
+                        }
+                    ),
+                )
+            ],
+        ],
+    )
+    recovered_upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[response_batch("resp_fixture_recovered"), response_batch("resp_fixture_next")],
+    )
+    connected_accounts = []
+    owner_lookups = []
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def fake_connect(self, headers, **kwargs):
+        del self, headers, kwargs
+        connected_accounts.append("acct_fixture_owner")
+        assert len(connected_accounts) <= 2
+        upstream = first_upstream if len(connected_accounts) == 1 else recovered_upstream
+        return SimpleNamespace(id="acct_fixture_owner", codex_installation_id="fixture-installation"), upstream
+
+    async def fake_owner(self, *, previous_response_id, **kwargs):
+        del self, kwargs
+        owner_lookups.append(previous_response_id)
+        return "acct_fixture_owner"
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", AsyncMock(return_value=None))
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", AsyncMock(return_value=None))
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect)
+    monkeypatch.setattr(proxy_module.ProxyService, "_resolve_websocket_previous_response_owner", fake_owner)
+
+    create = {"type": "response.create", "model": "gpt-5.4", "stream": True}
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_json({**create, "input": [user_input]})
+            assert websocket.receive_json()["type"] == "response.created"
+            assert websocket.receive_json()["response"]["id"] == "resp_fixture_old"
+
+            websocket.send_json({**create, "input": [tool_output], "previous_response_id": "resp_fixture_old"})
+            failed = websocket.receive_json()
+            assert failed["type"] == "response.failed"
+            _assert_previous_response_not_found_error(failed["response"]["error"])
+            assert "resp_fixture_old" not in json.dumps(failed)
+            # A tool-output delta cannot be replayed as a fresh request: the
+            # client, which owns the complete history, supplies the next turn.
+            assert connected_accounts == ["acct_fixture_owner"]
+            assert len(first_upstream.sent_text) == 2
+            assert recovered_upstream.sent_text == []
+
+            websocket.send_json({**create, "input": full_history})
+            assert websocket.receive_json()["type"] == "response.created"
+            assert websocket.receive_json()["response"]["id"] == "resp_fixture_recovered"
+
+            websocket.send_json({**create, "input": "continue", "previous_response_id": "resp_fixture_recovered"})
+            assert websocket.receive_json()["type"] == "response.created"
+            assert websocket.receive_json()["response"]["id"] == "resp_fixture_next"
+
+    assert connected_accounts == ["acct_fixture_owner", "acct_fixture_owner"]
+    assert set(owner_lookups) == {"resp_fixture_old", "resp_fixture_recovered"}
+    delta = json.loads(first_upstream.sent_text[1])
+    assert delta["input"] == [tool_output]
+    assert delta["previous_response_id"] == "resp_fixture_old"
+    replay, followup = [json.loads(frame) for frame in recovered_upstream.sent_text]
+    assert "previous_response_id" not in replay
+    assert replay["input"] == full_history
+    assert followup["previous_response_id"] == "resp_fixture_recovered"
+    assert first_upstream.closed is True
+    assert recovered_upstream.closed is True
+
+
 def test_backend_responses_websocket_masks_anonymous_previous_response_not_found_with_inflight_request(
     app_instance,
     monkeypatch,
