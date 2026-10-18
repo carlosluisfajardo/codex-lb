@@ -11783,6 +11783,137 @@ def test_backend_responses_websocket_connect_failure_logs_client_supplied_stale_
     assert "resp_ws_prev_anchor_client" not in caplog.text
 
 
+def test_backend_responses_websocket_recovers_proxy_injected_tool_output_anchor_from_request_cache(
+    app_instance,
+    monkeypatch,
+):
+    def response_batch(response_id, *, output=()):
+        return [
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps({"type": "response.created", "response": {"id": response_id, "status": "in_progress"}}),
+            ),
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {"id": response_id, "status": "completed", "output": list(output)},
+                    }
+                ),
+            ),
+        ]
+
+    user_input = {"role": "user", "content": [{"type": "input_text", "text": "run the fixture"}]}
+    tool_call = {"type": "function_call", "name": "wait", "call_id": "call_injected_fixture", "arguments": "{}"}
+    tool_output = {"type": "function_call_output", "call_id": "call_injected_fixture", "output": "fixture finished"}
+    full_history = [user_input, tool_call, tool_output]
+    next_input = {"role": "user", "content": [{"type": "input_text", "text": "continue"}]}
+    first_upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            response_batch("resp_injected_fixture_old", output=[tool_call]),
+            [
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "error",
+                            "status": 400,
+                            "error": {
+                                "type": "invalid_request_error",
+                                "code": "previous_response_not_found",
+                                "message": "Previous response with id 'resp_injected_fixture_old' not found.",
+                                "param": "previous_response_id",
+                            },
+                        }
+                    ),
+                )
+            ],
+        ],
+    )
+    recovered_upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            response_batch("resp_injected_fixture_recovered"),
+            response_batch("resp_injected_fixture_next"),
+        ],
+    )
+    connections = []
+    log_calls = []
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def fake_connect(self, headers, **kwargs):
+        del self, headers, kwargs
+        upstream = first_upstream if not connections else recovered_upstream
+        connections.append(upstream)
+        assert len(connections) <= 2
+        return SimpleNamespace(id="acct_injected_fixture", codex_installation_id="fixture-installation"), upstream
+
+    async def capture_request_log(self, **kwargs):
+        del self
+        log_calls.append(kwargs)
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", AsyncMock(return_value=None))
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", AsyncMock(return_value=None))
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect)
+    monkeypatch.setattr(proxy_module.ProxyService, "_write_request_log", capture_request_log)
+
+    create = {"type": "response.create", "model": "gpt-5.4", "instructions": "", "stream": True}
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses", headers={"thread-id": "thread-injected-fixture"}
+        ) as websocket:
+            websocket.send_json({**create, "input": [user_input]})
+            assert websocket.receive_json()["type"] == "response.created"
+            assert websocket.receive_json()["response"]["id"] == "resp_injected_fixture_old"
+
+            # Repeating the stored input prefix allows proxy anchor injection,
+            # but the missing call item makes the retained body unsafe to replay.
+            websocket.send_json({**create, "input": [user_input, tool_output]})
+            failed = websocket.receive_json()
+            assert failed["type"] == "response.failed"
+            _assert_previous_response_not_found_error(failed["response"]["error"])
+            assert "resp_injected_fixture_old" not in json.dumps(failed)
+            assert connections == [first_upstream]
+            assert len(first_upstream.sent_text) == 2
+            assert recovered_upstream.sent_text == []
+
+            # The test client now provides the complete history explicitly.
+            websocket.send_json({**create, "input": full_history})
+            assert websocket.receive_json()["type"] == "response.created"
+            assert websocket.receive_json()["response"]["id"] == "resp_injected_fixture_recovered"
+
+            websocket.send_json({**create, "input": [*full_history, next_input]})
+            assert websocket.receive_json()["type"] == "response.created"
+            assert websocket.receive_json()["response"]["id"] == "resp_injected_fixture_next"
+
+    initial, anchored = [json.loads(frame) for frame in first_upstream.sent_text]
+    assert "previous_response_id" not in initial
+    assert anchored["previous_response_id"] == "resp_injected_fixture_old"
+    assert anchored["input"] == [tool_output]
+    replay, followup = [json.loads(frame) for frame in recovered_upstream.sent_text]
+    assert "previous_response_id" not in replay
+    assert replay["input"] == full_history
+    assert followup["previous_response_id"] == "resp_injected_fixture_recovered"
+    assert followup["input"] == [next_input]
+    error_logs = [call for call in log_calls if call.get("status") == "error"]
+    assert len(error_logs) == 1
+    assert error_logs[0]["failure_detail"] == (
+        "previous_response_not_found "
+        "previous_response_source=proxy_injected fresh_replay_available=false "
+        "owner_lookup_source=request_cache owner_lookup_outcome=hit "
+        "previous_response_age_seconds=unknown same_session=unknown"
+    )
+    assert connections == [first_upstream, recovered_upstream]
+    assert first_upstream.closed is True
+    assert recovered_upstream.closed is True
+
+
 def test_backend_responses_websocket_logs_proxy_injected_stale_anchor_metadata(
     app_instance,
     monkeypatch,
