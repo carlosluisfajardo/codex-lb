@@ -25,7 +25,7 @@ def test_settings_multi_replica_defaults():
     assert settings.compact_request_budget_seconds == 180.0
     assert settings.proxy_request_budget_seconds == 600.0
     assert settings.http_responses_session_bridge_request_budget_seconds == 7200.0
-    assert settings.stream_idle_timeout_seconds == 7200.0
+    assert settings.stream_idle_timeout_seconds == 600.0
     assert settings.proxy_downstream_websocket_idle_timeout_seconds == 120.0
     assert settings.http_responses_stream_request_budget_seconds == 7200.0
     assert settings.conversation_archive_queue_max_bytes == 256 * 1024 * 1024

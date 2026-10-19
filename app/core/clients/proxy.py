@@ -3859,6 +3859,19 @@ async def _stream_responses_with_session(
             # failure, so it joins the idle-timeout path instead of being
             # reported as an unavailable upstream.
             raise StreamIdleTimeoutError() from exc
+        except (CodexTransportError, NativeEgressTransportError) as exc:
+            # CodexClient sanitizes Python transport exceptions; native egress
+            # labels its bounded response-head wait as "timeout". Preserve the
+            # idle classification without treating arbitrary transport failures
+            # or an earlier overall deadline as evidence of upstream silence.
+            if isinstance(exc.__context__, aiohttp.SocketTimeoutError) or (
+                status_code is None
+                and exc.failure_phase == "timeout"
+                and current_timeout.sock_read is not None
+                and (current_timeout.total is None or current_timeout.sock_read < current_timeout.total)
+            ):
+                raise StreamIdleTimeoutError() from exc
+            raise
 
     async def _stream_via_http_attempt(
         current_headers: Mapping[str, str],
@@ -3877,7 +3890,7 @@ async def _stream_responses_with_session(
                     "json": payload_dict,
                     "headers": current_headers,
                     "skip_auto_headers": frozenset({aiohttp.hdrs.ACCEPT_ENCODING}),
-                    "timeout": remaining_request_timeout or request_total_timeout,
+                    "timeout": current_timeout,
                     "buffer_response": False,
                 }
                 if not non_streaming_http:

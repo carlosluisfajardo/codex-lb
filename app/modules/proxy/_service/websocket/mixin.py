@@ -5188,17 +5188,29 @@ class _WebSocketMixin:
         proxy = cast(_WebSocketServiceProtocol, self)
         clock = clock_for(proxy)
         scheduler = scheduler_for(proxy)
+        receive_deadline: float | None = None
+        receive_timeout: _WebSocketReceiveTimeout | None = None
         try:
             while True:
-                receive_timeout = await proxy._next_websocket_receive_timeout(
+                next_receive_timeout = await proxy._next_websocket_receive_timeout(
                     pending_requests,
                     pending_lock=pending_lock,
                     proxy_request_budget_seconds=proxy_request_budget_seconds,
                     stream_idle_timeout_seconds=stream_idle_timeout_seconds,
                 )
-                receive_deadline = (
-                    None if receive_timeout is None else clock.monotonic() + receive_timeout.timeout_seconds
+                next_receive_deadline = (
+                    None if next_receive_timeout is None else clock.monotonic() + next_receive_timeout.timeout_seconds
                 )
+                if (
+                    receive_deadline is None
+                    or next_receive_deadline is None
+                    or next_receive_deadline < receive_deadline
+                ):
+                    receive_deadline = next_receive_deadline
+                    receive_timeout = next_receive_timeout
+                # A local keepalive proves nothing about the upstream. Retain
+                # both deadline and failure phase until an upstream frame arrives;
+                # a shorter overall deadline may still replace the idle wait.
                 try:
                     while True:
                         wait_timeout = None if receive_deadline is None else receive_deadline - clock.monotonic()
@@ -5299,7 +5311,9 @@ class _WebSocketMixin:
                         client_send_lock=client_send_lock,
                         response_create_gate=response_create_gate,
                     )
+                    receive_deadline = None
                     continue
+                receive_deadline = None
                 if message.kind == "text" and message.text is not None:
                     downstream_activity.mark()
                     terminal_task = scheduler.create_task(

@@ -235,9 +235,12 @@ async def test_stream_overload_alias_surfaces_without_replay(async_client, monke
 
 
 @pytest.mark.asyncio
-async def test_stream_timeout_surfaces_without_replay(async_client, monkeypatch):
+@pytest.mark.parametrize("timeout_code", ["upstream_request_timeout", "stream_idle_timeout"])
+async def test_stream_timeout_surfaces_without_replay(async_client, monkeypatch, timeout_code):
     """An upstream terminal timeout is not proven pre-dispatch work."""
     await _import_account(async_client, "acc_trans_timeout", "timeout@example.com")
+
+    await _import_account(async_client, "acc_timeout_alternate", "alternate-timeout@example.com")
 
     call_count = 0
     seen_account_ids: list[str | None] = []
@@ -247,7 +250,7 @@ async def test_stream_timeout_surfaces_without_replay(async_client, monkeypatch)
         call_count += 1
         seen_account_ids.append(account_id)
         if call_count == 1:
-            yield _stream_timeout_sse_event()
+            yield _stream_timeout_sse_event().replace("upstream_request_timeout", timeout_code)
             return
         yield _success_sse_event()
 
@@ -261,8 +264,8 @@ async def test_stream_timeout_surfaces_without_replay(async_client, monkeypatch)
     events = _extract_events(lines)
     failed = [e for e in events if e.get("type") == "response.failed"]
     assert len(failed) == 1
-    assert failed[0]["response"]["error"]["code"] == "upstream_request_timeout"
-    assert seen_account_ids == ["acc_trans_timeout"]
+    assert failed[0]["response"]["error"]["code"] == timeout_code
+    assert len(seen_account_ids) == 1
 
 
 @pytest.mark.asyncio

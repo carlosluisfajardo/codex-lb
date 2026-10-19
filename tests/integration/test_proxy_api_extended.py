@@ -28,7 +28,7 @@ from app.core.upstream_proxy import (
     UpstreamProxyRouteError,
 )
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME, SSE_KEEPALIVE_FRAME
-from app.db.models import Account, AccountStatus, RequestLog, StickySession, StickySessionKind
+from app.db.models import Account, AccountStatus, ApiKeyUsageReservation, RequestLog, StickySession, StickySessionKind
 from app.db.session import SessionLocal
 from app.dependencies import ProxyContext, get_proxy_service_for_app
 from app.modules.accounts.repository import AccountsRepository
@@ -3952,20 +3952,37 @@ async def test_proxy_stream_retries_rate_limit_then_success(async_client, monkey
 
 
 @pytest.mark.asyncio
-async def test_proxy_stream_fails_over_after_first_event_stream_idle_timeout(async_client, monkeypatch):
+async def test_proxy_stream_first_event_idle_timeout_does_not_replay_ambiguous_work(async_client, monkeypatch):
     expected_account_id_1 = await _import_account(async_client, "acc_idle_1", "idle-one@example.com")
     expected_account_id_2 = await _import_account(async_client, "acc_idle_2", "idle-two@example.com")
+    settings = await async_client.put("/api/settings", json={"apiKeyAuthEnabled": True})
+    assert settings.status_code == 200
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "idle-timeout-settlement",
+            "limits": [{"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 100_000}],
+        },
+    )
+    assert created.status_code == 200
+    api_key = created.json()
+    attempts: list[str] = []
+    closed: list[str] = []
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
-        if account_id == "acc_idle_1":
-            event = {
-                "type": "response.failed",
-                "response": {"error": {"code": "stream_idle_timeout", "message": "idle"}},
-            }
+        attempts.append(account_id)
+        try:
+            if account_id == "acc_idle_1":
+                event = {
+                    "type": "response.failed",
+                    "response": {"error": {"code": "stream_idle_timeout", "message": "idle"}},
+                }
+                yield _sse_event(event)
+                return
+            event = {"type": "response.completed", "response": {"id": "resp_idle_ok", "usage": {}}}
             yield _sse_event(event)
-            return
-        event = {"type": "response.completed", "response": {"id": "resp_idle_ok", "usage": {}}}
-        yield _sse_event(event)
+        finally:
+            closed.append(account_id)
 
     monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
 
@@ -3974,25 +3991,46 @@ async def test_proxy_stream_fails_over_after_first_event_stream_idle_timeout(asy
         "POST",
         "/backend-api/codex/responses",
         json=payload,
+        headers={"authorization": f"Bearer {api_key['key']}"},
     ) as resp:
         assert resp.status_code == 200
         lines = [line async for line in resp.aiter_lines() if line]
 
     event = _extract_first_event(lines)
-    assert event["type"] == "response.completed"
-    assert event["response"]["id"] == "resp_idle_ok"
+    assert event["type"] == "response.failed"
+    assert event["response"]["error"]["code"] == "stream_idle_timeout"
+    assert not any("response.completed" in line for line in lines)
+    assert attempts == ["acc_idle_1"]
+    assert closed == attempts
+
+    service = get_proxy_service_for_app(async_client._transport.app)
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
 
     async with SessionLocal() as session:
         result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
         logs = list(result.scalars().all())
-        assert len(logs) == 2
-        by_account = {log.account_id: log for log in logs}
-        assert by_account[expected_account_id_1].error_code == "stream_idle_timeout"
-        assert by_account[expected_account_id_2].status == "success"
+        assert len(logs) == 1
+        assert logs[0].account_id == expected_account_id_1
+        assert logs[0].api_key_id == api_key["id"]
+        assert logs[0].status == "error"
+        assert logs[0].error_code == "stream_idle_timeout"
+        reservations = list(
+            (
+                await session.execute(
+                    select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == api_key["id"])
+                )
+            ).scalars()
+        )
+        assert len(reservations) == 1
+        assert reservations[0].status == "released"
+        for account_id in (expected_account_id_1, expected_account_id_2):
+            account = await session.get(Account, account_id)
+            assert account is not None
+            assert account.status == AccountStatus.ACTIVE
 
-    service = get_proxy_service_for_app(async_client._transport.app)
-    idle_runtime = service._load_balancer._runtime.get(expected_account_id_1)
-    assert idle_runtime is None or idle_runtime.error_count == 0
+    for account_id in (expected_account_id_1, expected_account_id_2):
+        runtime = service._load_balancer._runtime.get(account_id)
+        assert runtime is None or runtime.error_count == 0
 
 
 @pytest.mark.asyncio

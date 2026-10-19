@@ -170,3 +170,9 @@ conversion cannot fail the shared IPC reader or interrupt peer exchanges.
 For example, a 5,000-digit sequence is relayed as original text, while a
 640-digit negative sequence remains interpreted without precision loss.
 Strings and floating-point tokens do not use Python's integer conversion limit.
+
+## Subscription HTTP phase deadlines
+
+The [routed phase contract](spec.md#requirement-routed-subscription-http-preserves-phase-timeout-budgets) carries the existing `aiohttp.ClientTimeout` into `CodexClient`. Both the Python transport and native request adapter already understand separate total, connect and response-header budgets. A total-only scalar loses the header bound. Successful headers leave the full remaining total budget available, while body reads keep their activity-based idle timer.
+
+Typed socket read timeouts and native response-head timeouts whose idle deadline precedes the total deadline retain the existing `stream_idle_timeout` classification. Other transport errors and earlier total deadlines keep their own classifications. This does not authorize an ambiguous POST replay. An HTTP stream receiving transport comments within each idle interval can outlive the header allowance without producing model tokens.
