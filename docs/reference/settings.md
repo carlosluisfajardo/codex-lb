@@ -122,7 +122,7 @@ anything else belongs in `app/core/config/settings.py`.
 | `CODEX_LB_HTTP_CONNECTOR_LIMIT_PER_HOST` | T1 | `int` | `50` |
 | `CODEX_LB_HTTP_RESPONSES_STREAM_REQUEST_BUDGET_SECONDS` | T3 (dashboard) | `float` | `7200.0` |
 | `CODEX_LB_SSE_KEEPALIVE_INTERVAL_SECONDS` | T3 (dashboard) | `float` | `10.0` |
-| `CODEX_LB_STREAM_IDLE_TIMEOUT_SECONDS` | T3 (dashboard) | `float` | `7200.0` |
+| `CODEX_LB_STREAM_IDLE_TIMEOUT_SECONDS` | T3 (dashboard) | `float` | `600.0` |
 | `CODEX_LB_TRANSCRIPTION_REQUEST_BUDGET_SECONDS` | T3 (dashboard) | `float` | `120.0` |
 
 ## HTTP Responses session bridge

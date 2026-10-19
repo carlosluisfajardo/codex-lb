@@ -12,4 +12,4 @@
 - [x] 3.2 Run protective mutations, exact restore and final green checks.
 - [x] 3.3 Record author results and remaining manager-owned delivery checks.
 
-Manager-owned delivery remains outside this source pen: fresh eligible Sol final-byte review, normal/required CI, PR/merge, and one checked replacement. The change remains active for that verification and subsequent archive.
+Local source qualification is complete and the canonical specs are synchronized. This change is archived at the required-CI correction boundary. Manager-owned delivery remains outside this source pen: independent final delta settlement, normal/required changed-head CI, PR/merge, and one checked replacement.
