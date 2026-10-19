@@ -358,7 +358,7 @@ async def test_http_bridge_post_response_start_still_uses_stream_idle_timeout(
         http_bridge_streaming_module._stream_keepalive_max_count(),
         math.ceil(live_settings.stream_idle_timeout_seconds / live_settings.sse_keepalive_interval_seconds),
     )
-    assert post_start_count * live_settings.sse_keepalive_interval_seconds >= 7200.0
+    assert post_start_count * live_settings.sse_keepalive_interval_seconds == 600.0
 
 
 def test_http_bridge_local_resets_do_not_blame_the_upstream() -> None:

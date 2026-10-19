@@ -20148,7 +20148,7 @@ async def test_stream_with_retry_capacity_wait_keeps_original_request_deadline(m
 
 
 @pytest.mark.asyncio
-async def test_stream_responses_first_idle_timeout_fails_over_to_next_account(monkeypatch):
+async def test_stream_responses_first_idle_timeout_does_not_replay_ambiguous_work(monkeypatch):
     settings = _make_proxy_settings()
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
@@ -20192,13 +20192,13 @@ async def test_stream_responses_first_idle_timeout_fails_over_to_next_account(mo
     chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-stream"})]
 
     event = json.loads(chunks[0].split("data: ", 1)[1])
-    assert event["type"] == "response.completed"
-    assert event["response"]["id"] == "resp_ok"
-    assert seen_excluded_account_ids == [set(), {account_a.id}]
+    assert event["type"] == "response.failed"
+    assert event["response"]["error"]["code"] == "stream_idle_timeout"
+    assert seen_excluded_account_ids == [set()]
     record_error.assert_not_awaited()
-    record_success.assert_awaited_once_with(account_b)
+    record_success.assert_not_awaited()
     assert await service.drain_persistence_tasks(timeout_seconds=1)
-    assert [call["status"] for call in request_logs.calls] == ["error", "success"]
+    assert [call["status"] for call in request_logs.calls] == ["error"]
     assert request_logs.calls[0]["error_code"] == "stream_idle_timeout"
 
 
@@ -20243,7 +20243,7 @@ async def test_stream_responses_first_idle_timeout_surfaces_timeout_when_no_fail
     assert event["type"] == "response.failed"
     assert event["response"]["error"]["code"] == "stream_idle_timeout"
     assert event["response"]["error"]["message"] == "idle"
-    assert seen_excluded_account_ids == [set(), {account.id}]
+    assert seen_excluded_account_ids == [set()]
     record_error.assert_not_awaited()
     record_success.assert_not_awaited()
     assert await service.drain_persistence_tasks(timeout_seconds=1)

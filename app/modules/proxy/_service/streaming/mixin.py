@@ -717,8 +717,8 @@ class _StreamingMixin(_StreamingRetryMixin):
                             failure_phase="upstream", failure_detail="upstream_eof_before_terminal_event"
                         )
                     settlement.account_health_error = _facade()._should_penalize_stream_error(code)
-                    if allow_retry and code == "stream_idle_timeout":
-                        raise _RetryableStreamError(code, upstream_error, exclude_account=True)
+                    # Silence after dispatch does not prove the POST was not
+                    # accepted. Surface idle timeouts without account failover.
                     if allow_retry and _facade()._is_security_work_authorization_required_error(code, error_message):
                         error_code = _facade()._SECURITY_WORK_AUTHORIZATION_REQUIRED_CODE
                         raise _RetryableStreamError(
