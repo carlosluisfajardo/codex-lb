@@ -114,7 +114,6 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_should_wait_for_registration,
     _http_bridge_startup_wait_timeout_error,
     _http_bridge_turn_state_alias_key,
-    _HTTPBridgeRequiredOwnerReplayForbiddenError,
     _log_http_bridge_event,
     _log_http_bridge_startup_wait_timeout,
     _mark_http_bridge_reader_handoff_reconnect_failed,
@@ -157,7 +156,11 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _websocket_connect_deadline,
     _websocket_safe_headers_with_turn_state,
 )
-from app.modules.proxy._service.http_bridge.session_registry import _HTTPBridgeSessionRegistryMixin
+from app.modules.proxy._service.http_bridge.session_registry import (
+    _http_bridge_creation_wait_timeout,
+    _HTTPBridgeCreationFuture,
+    _HTTPBridgeSessionRegistryMixin,
+)
 from app.modules.proxy._service.http_bridge.streaming import _HTTPBridgeStreamingMixin
 from app.modules.proxy._service.http_bridge.upstream_events import _HTTPBridgeUpstreamEventsMixin
 from app.modules.proxy._service.observability import _hash_identifier
@@ -314,27 +317,6 @@ class _HTTPBridgeMixin(
                 inflight_future.set_exception(exc)
                 inflight_future.exception()
             return True
-
-    async def _evict_http_bridge_inflight_waiter(
-        self,
-        inflight_future: asyncio.Future["_HTTPBridgeSession"],
-        exc: BaseException,
-    ) -> "_HTTPBridgeSessionKey | None":
-        async with self._http_bridge_lock:
-            stale_key = None
-            for candidate_key, candidate_future in self._http_bridge_inflight_sessions.items():
-                if candidate_future is inflight_future:
-                    stale_key = candidate_key
-                    break
-            if stale_key is None:
-                return None
-            if getattr(inflight_future, "_http_bridge_handoff", False):
-                return None
-            self._http_bridge_inflight_sessions.pop(stale_key, None)
-            if not inflight_future.done():
-                inflight_future.set_exception(exc)
-                inflight_future.exception()
-            return stale_key
 
     @overload
     async def _get_or_create_http_bridge_session(
@@ -1340,7 +1322,11 @@ class _HTTPBridgeMixin(
                                 # the detached registry until unrelated cleanup.
                                 capacity_error_after_planned_closes = capacity_error
                         else:
-                            inflight_future = asyncio.get_running_loop().create_future()
+                            inflight_future = _HTTPBridgeCreationFuture(
+                                request_deadline
+                                if request_deadline is not None
+                                else clock_for(self).monotonic() + _http_bridge_request_budget_seconds(settings)
+                            )
                             setattr(
                                 inflight_future,
                                 _HTTP_BRIDGE_INFLIGHT_STARTED_AT_ATTR,
@@ -1373,7 +1359,12 @@ class _HTTPBridgeMixin(
             if continuity_error is not None:
                 raise continuity_error
             if capacity_wait_future is not None:
-                wait_timeout_seconds = _proxy_admission_wait_timeout_seconds()
+                wait_timeout_seconds = _http_bridge_creation_wait_timeout(
+                    capacity_wait_future,
+                    request_deadline=request_deadline,
+                    now=clock_for(self).monotonic(),
+                    default=_proxy_admission_wait_timeout_seconds(),
+                )
                 try:
                     await self._await_http_bridge_registry_wait(capacity_wait_future, timeout=wait_timeout_seconds)
                 except asyncio.CancelledError:
@@ -1385,11 +1376,10 @@ class _HTTPBridgeMixin(
                         "http_bridge_capacity",
                         code="capacity_exhausted_active_sessions",
                     )
-                    stale_key = await self._evict_http_bridge_inflight_waiter(capacity_wait_future, timeout_error)
                     _log_http_bridge_startup_wait_timeout(
                         stage="capacity",
                         timeout_seconds=wait_timeout_seconds,
-                        key=stale_key or key,
+                        key=key,
                         request_model=request_model,
                         pending_count=_http_bridge_session_generation_count(self),
                         inflight_count=len(self._http_bridge_inflight_sessions),
@@ -1401,12 +1391,20 @@ class _HTTPBridgeMixin(
                     pass
                 continue
             if inflight_future is not None and not owns_creation:
-                if require_preferred_account and (response_create_attempt_count or not allow_required_owner_recovery):
-                    refusal = _http_bridge_previous_response_owner_unavailable_error()
-                    raise _HTTPBridgeRequiredOwnerReplayForbiddenError(refusal.status_code, refusal.payload)
-                wait_timeout_seconds = _proxy_admission_wait_timeout_seconds()
+                wait_timeout_seconds = _http_bridge_creation_wait_timeout(
+                    inflight_future,
+                    request_deadline=request_deadline,
+                    now=clock_for(self).monotonic(),
+                    default=_proxy_admission_wait_timeout_seconds(),
+                )
                 try:
-                    session = await self._await_http_bridge_registry_wait(inflight_future, timeout=wait_timeout_seconds)
+                    session = await self._await_http_bridge_creation(
+                        inflight_future,
+                        timeout=wait_timeout_seconds,
+                        require_preferred_account=require_preferred_account,
+                        allow_recovery=allow_required_owner_recovery,
+                        response_create_attempt_count=response_create_attempt_count,
+                    )
                 except asyncio.CancelledError:
                     if inflight_future.cancelled():
                         continue
@@ -1416,7 +1414,6 @@ class _HTTPBridgeMixin(
                         "http_bridge_inflight_session",
                         code="capacity_exhausted_active_sessions",
                     )
-                    await self._fail_http_bridge_inflight_session_creation(key, inflight_future, timeout_error)
                     _log_http_bridge_startup_wait_timeout(
                         stage="inflight_session",
                         timeout_seconds=wait_timeout_seconds,
@@ -1426,8 +1423,6 @@ class _HTTPBridgeMixin(
                         inflight_count=len(self._http_bridge_inflight_sessions),
                     )
                     raise timeout_error from exc
-                except Exception:
-                    raise
                 if session is None:
                     continue
                 fork_key = _http_bridge_parallel_fork_key(
@@ -1523,6 +1518,7 @@ class _HTTPBridgeMixin(
                     "request_deadline": request_deadline,
                     "response_create_attempt_count": response_create_attempt_count,
                     "allow_required_owner_recovery": allow_required_owner_recovery,
+                    "creation_future": inflight_future,
                     "exclude_account_ids": exclude_account_ids,
                     "deferred_account_backoff_lifecycle": deferred_account_backoff_lifecycle,
                     "defer_account_health_writes": defer_account_health_writes,
@@ -1542,6 +1538,7 @@ class _HTTPBridgeMixin(
                         "request_deadline",
                         "response_create_attempt_count",
                         "allow_required_owner_recovery",
+                        "creation_future",
                         "exclude_account_ids",
                         "preferred_account_is_continuity_owner",
                         "deferred_account_backoff_lifecycle",
@@ -1701,6 +1698,7 @@ class _HTTPBridgeMixin(
         request_deadline: float | None = None,
         response_create_attempt_count: int = 0,
         allow_required_owner_recovery: bool = True,
+        creation_future: asyncio.Future[_HTTPBridgeSession] | None = None,
         exclude_account_ids: Collection[str] | None = None,
         deferred_account_backoff_lifecycle: _DeferredAccountBackoffLifecycle | None = None,
         defer_account_health_writes: bool = False,
@@ -1745,6 +1743,7 @@ class _HTTPBridgeMixin(
             allow_recovery=allow_required_owner_recovery,
             excluded_account_ids=excluded_account_ids,
             response_create_attempt_count=response_create_attempt_count,
+            creation=creation_future if isinstance(creation_future, _HTTPBridgeCreationFuture) else None,
         )
         while True:
             select_kwargs = {

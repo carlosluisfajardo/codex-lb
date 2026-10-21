@@ -234,7 +234,7 @@ async def _prompt_refusal(service: Any, owner: Any, scheduler: VirtualScheduler,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("blocked", ["cooldown", "error_backoff", "capacity"])
+@pytest.mark.parametrize("blocked", ["cooldown", "error_backoff"])
 async def test_actual_selector_to_bridge_waits_and_recovers_one_owner(
     monkeypatch: pytest.MonkeyPatch, blocked: str
 ) -> None:
@@ -244,9 +244,7 @@ async def test_actual_selector_to_bridge_waits_and_recovers_one_owner(
         await scheduler.drain()
         assert opened.await_count == 0, "no alternate owner may open while the required owner is blocked"
         assert not task.done(), "temporary required-owner failure must wait before dispatch"
-        if blocked == "capacity":
-            service._load_balancer._runtime[owner.id].inflight_streams = 0
-        elif blocked == "error_backoff":
+        if blocked == "error_backoff":
             service._load_balancer._runtime[owner.id].last_error_at = clock.time() - 31
         await scheduler.advance(4)
         session = await task
@@ -277,11 +275,12 @@ async def test_actual_selector_to_bridge_terminal_mixed_refusal_has_no_outer_wai
 async def test_actual_selector_to_bridge_one_recovery_window(
     monkeypatch: pytest.MonkeyPatch, budget: float, expiry: float
 ) -> None:
-    service, owner, scheduler, clock, opened = _bridge(monkeypatch, blocked="capacity")
+    service, owner, scheduler, clock, opened = _bridge(monkeypatch, blocked="cooldown")
+    service._load_balancer._runtime[owner.id].cooldown_until = clock.time() + 120
     task = scheduler.create_task(_create(service, owner, budget=budget))
     try:
         await scheduler.drain()
-        assert not task.done(), "temporary contention must enter the bounded window"
+        assert not task.done(), "temporary provider unavailability must enter the bounded window"
         await scheduler.advance(expiry)
         assert task.done(), "reselection must not renew the recovery window"
         with pytest.raises(ProxyResponseError) as caught:
@@ -299,7 +298,7 @@ async def test_actual_selector_to_bridge_one_recovery_window(
 async def test_reselection_itself_obeys_recovery_deadline_and_releases_lease(
     monkeypatch: pytest.MonkeyPatch, late_success: bool
 ) -> None:
-    service, owner, scheduler, clock, opened = _bridge(monkeypatch, blocked="capacity")
+    service, owner, scheduler, clock, opened = _bridge(monkeypatch, blocked="cooldown")
     balancer = service._load_balancer
     persist = balancer._persist_selection_state
     calls = 0
@@ -316,14 +315,16 @@ async def test_reselection_itself_obeys_recovery_deadline_and_releases_lease(
         return await persist(*args, **kwargs)
 
     monkeypatch.setattr(balancer, "_persist_selection_state", slow_persist)
+    balancer._runtime[owner.id].cooldown_until = clock.time() + 120
     task = scheduler.create_task(_create(service, owner))
     try:
         await scheduler.drain()
-        balancer._runtime[owner.id].inflight_streams = 0
+        balancer._runtime[owner.id].cooldown_until = None
         await scheduler.advance(2 if late_success else 30)
         assert task.done(), "the recovery deadline must bound selection, not only sleeps"
         with pytest.raises(ProxyResponseError):
             await task
+        assert calls == 2, "the regression must reach reselection after provider recovery"
         assert opened.await_count == 0
         assert balancer._runtime[owner.id].inflight_streams == 0
         assert all(not runtime.leases for runtime in balancer._runtime.values())
@@ -336,7 +337,7 @@ async def test_reselection_itself_obeys_recovery_deadline_and_releases_lease(
 async def test_late_selection_cancellation_releases_lease_while_runtime_locked(
     monkeypatch: pytest.MonkeyPatch, repeat_cancel: bool
 ) -> None:
-    service, owner, scheduler, clock, opened = _bridge(monkeypatch, blocked="capacity")
+    service, owner, scheduler, clock, opened = _bridge(monkeypatch, blocked="cooldown")
     balancer = service._load_balancer
     select = balancer.select_account
     release = balancer.release_account_lease
@@ -366,6 +367,7 @@ async def test_late_selection_cancellation_releases_lease_while_runtime_locked(
     monkeypatch.setattr(balancer, "select_account", late_selection)
     monkeypatch.setattr(balancer, "release_account_lease", observe_release)
     key = proxy._HTTPBridgeSessionKey("request", "cancel-late-owner-selection", None)
+    balancer._runtime[owner.id].cooldown_until = clock.time() + 120
     task = scheduler.create_task(
         service._get_or_create_http_bridge_session(
             key,
@@ -383,7 +385,7 @@ async def test_late_selection_cancellation_releases_lease_while_runtime_locked(
     try:
         await scheduler.drain()
         inflight = service._http_bridge_inflight_sessions[key]
-        balancer._runtime[owner.id].inflight_streams = 0
+        balancer._runtime[owner.id].cooldown_until = None
         await scheduler.advance(2)
         assert selections == 2
         assert clock.monotonic() == 33
@@ -461,8 +463,11 @@ async def test_wait_cancellation_settles_singleflight_even_while_registry_locked
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_send_retained_attempt_fences_owner_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
-    service, owner, scheduler, clock, opened = _bridge(monkeypatch)
+@pytest.mark.parametrize("blocked", ["cooldown", "capacity"])
+async def test_ambiguous_send_retained_attempt_fences_owner_recovery(
+    monkeypatch: pytest.MonkeyPatch, blocked: str
+) -> None:
+    service, owner, scheduler, clock, opened = _bridge(monkeypatch, blocked=blocked)
     session = _make_bridge_session()
     send = AsyncMock(side_effect=RuntimeError("send outcome unknown"))
     session.upstream = cast(Any, SimpleNamespace(send_text=send))
@@ -483,7 +488,11 @@ async def test_ambiguous_send_retained_attempt_fences_owner_recovery(monkeypatch
         )
     assert state.response_create_sent_at is None
     assert state.response_create_attempt_count == 1
-    await _prompt_refusal(service, owner, scheduler, response_create_attempt_count=state.response_create_attempt_count)
+    refusal = await _prompt_refusal(
+        service, owner, scheduler, response_create_attempt_count=state.response_create_attempt_count
+    )
+    assert isinstance(refusal, _HTTPBridgeRequiredOwnerReplayForbiddenError)
+    assert _http_bridge_capacity_wait_plan(refusal, request_deadline=120, now=0) is None
     assert clock.monotonic() == 0
     assert send.await_count == 1
     assert opened.await_count == 0
@@ -637,10 +646,10 @@ async def test_required_owner_final_refusal_preserves_outer_fence_and_attributio
 
 
 @pytest.mark.asyncio
-async def test_required_owner_terminal_before_expiry_keeps_existing_full_resend_recovery(
+async def test_required_owner_temporary_failure_keeps_immediate_full_resend_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    await _assert_required_owner_final_refusal(monkeypatch, "terminal_before_expiry")
+    await _assert_required_owner_final_refusal(monkeypatch, "immediate_replay")
 
 
 async def _assert_required_owner_final_refusal(monkeypatch: pytest.MonkeyPatch, scenario: str) -> None:
@@ -677,7 +686,7 @@ async def _assert_required_owner_final_refusal(monkeypatch: pytest.MonkeyPatch, 
             ],
         }
     )
-    if scenario == "mismatch_incomplete":
+    if scenario in ("mismatch_incomplete", "expired"):
         payload.input = "next question"
     lookup = proxy.DurableBridgeLookup(
         session_id="mismatched-owner",
@@ -776,17 +785,13 @@ async def _assert_required_owner_final_refusal(monkeypatch: pytest.MonkeyPatch, 
             assert not task.done()
             assert opened.await_count == 0
             await scheduler.advance(30)
-        elif scenario == "terminal_before_expiry":
-            owner.status = AccountStatus.PAUSED
-            service._load_balancer._selection_inputs_cache.invalidate(propagate=False)
-            await scheduler.advance(2)
         with pytest.raises(ProxyResponseError) as caught:
             await asyncio.wait_for(task, timeout=5)
         expected_attempts: list[tuple[str | None, str | None, set[str]]] = [(owner.id, "resp_required_anchor", set())]
-        if scenario == "terminal_before_expiry":
+        if scenario == "immediate_replay":
             expected_attempts.append((None, None, {owner.id}))
         assert attempts == expected_attempts, "only independent existing proof may change owner/anchor or replay"
-        expected_selections = 15 if scenario == "expired" else 2 if scenario == "terminal_before_expiry" else 1
+        expected_selections = 6 if scenario == "expired" else 1
         assert select.await_count == expected_selections, caught.value.payload
         assert select.await_args is not None
         assert select.await_args.kwargs["required_account_id"] == owner.id

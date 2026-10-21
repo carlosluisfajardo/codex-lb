@@ -23068,11 +23068,9 @@ async def test_get_or_create_http_bridge_session_inflight_wait_times_out(
 
     assert exc_info.value.status_code == 429
     assert exc_info.value.payload["error"]["code"] == "capacity_exhausted_active_sessions"
-    assert key not in service._http_bridge_inflight_sessions
-    with pytest.raises(ProxyResponseError) as future_exc_info:
-        await inflight_future
-    assert future_exc_info.value.status_code == 429
-    assert future_exc_info.value.payload["error"]["code"] == "capacity_exhausted_active_sessions"
+    assert service._http_bridge_inflight_sessions[key] is inflight_future
+    assert not inflight_future.done(), "a waiter's timeout cannot settle another request's creation"
+    inflight_future.cancel()
 
 
 @pytest.mark.asyncio
@@ -23401,11 +23399,9 @@ async def test_get_or_create_http_bridge_session_capacity_wait_times_out(
 
     assert exc_info.value.status_code == 429
     assert exc_info.value.payload["error"]["code"] == "capacity_exhausted_active_sessions"
-    assert inflight_key not in service._http_bridge_inflight_sessions
-    with pytest.raises(ProxyResponseError) as future_exc_info:
-        await inflight_future
-    assert future_exc_info.value.status_code == 429
-    assert future_exc_info.value.payload["error"]["code"] == "capacity_exhausted_active_sessions"
+    assert service._http_bridge_inflight_sessions[inflight_key] is inflight_future
+    assert not inflight_future.done(), "a waiter's timeout cannot settle another request's creation"
+    inflight_future.cancel()
     create_http_bridge_session.assert_not_awaited()
 
 
@@ -23987,11 +23983,12 @@ async def test_get_or_create_http_bridge_session_late_owner_after_inflight_evict
     await asyncio.wait_for(create_started.wait(), timeout=1.0)
     assert key in service._http_bridge_inflight_sessions
 
-    with pytest.raises(ProxyResponseError) as waiter_exc_info:
-        await asyncio.wait_for(get_session(), timeout=1.0)
-
-    assert waiter_exc_info.value.status_code == 429
-    assert waiter_exc_info.value.payload["error"]["code"] == "capacity_exhausted_active_sessions"
+    # Force owner-marker invalidation; a waiter's deadline no longer owns it.
+    inflight = service._http_bridge_inflight_sessions[key]
+    failure = http_bridge_helpers_module._http_bridge_startup_wait_timeout_error(
+        "http_bridge_inflight_session", code="capacity_exhausted_active_sessions"
+    )
+    assert await service._fail_http_bridge_inflight_session_creation(key, inflight, failure)
     assert key not in service._http_bridge_inflight_sessions
 
     finish_create.set()
@@ -28188,6 +28185,11 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
     stored_model: str | None,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    # This projection-only fixture has no database account row. Its owner is
+    # unavailable, not terminally retired; keep that independent proof false.
+    monkeypatch.setattr(
+        service._durable_bridge, "retire_continuity_owner_if_unavailable", AsyncMock(return_value=False)
+    )
     account_neutral_classifier = Mock(
         wraps=http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay
     )
@@ -37408,10 +37410,13 @@ async def test_rejected_creator_does_not_release_the_registered_winners_durable_
     owner_task = asyncio.create_task(get_session())
     await asyncio.wait_for(create_started.wait(), timeout=1.0)
 
-    # The waiter times out and evicts the inflight future; a replacement then
-    # wins the registry slot while the stale creator is still in flight.
-    with pytest.raises(ProxyResponseError):
-        await asyncio.wait_for(get_session(), timeout=1.0)
+    # Force marker invalidation before a replacement wins the registry slot;
+    # a waiter's timeout must no longer cause that invalidation.
+    inflight = service._http_bridge_inflight_sessions[key]
+    failure = http_bridge_helpers_module._http_bridge_startup_wait_timeout_error(
+        "http_bridge_inflight_session", code="capacity_exhausted_active_sessions"
+    )
+    assert await service._fail_http_bridge_inflight_session_creation(key, inflight, failure)
     async with service._http_bridge_lock:
         service._http_bridge_sessions[key] = registered_winner
 
@@ -37775,11 +37780,13 @@ async def test_admission_waiters_do_not_accumulate_callbacks_on_shared_inflight_
     callbacks = getattr(inflight, "_callbacks", None)
     assert callbacks is not None and len(callbacks) == 1
 
-    # The surviving waiters time out: the first to fire fails the shared
-    # future for the rest with the local-overload contract error.
+    # The surviving waiters time out independently; only the creator owns
+    # settlement of the shared future.
     remaining = await asyncio.gather(*waiters[25:], return_exceptions=True)
     assert all(isinstance(result, ProxyResponseError) and result.status_code == 429 for result in remaining)
-    assert key not in service._http_bridge_inflight_sessions
+    assert service._http_bridge_inflight_sessions[key] is inflight
+    assert not inflight.done()
+    inflight.cancel()
 
 
 def _denied_anchor_session(
