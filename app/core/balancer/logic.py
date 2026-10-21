@@ -6,7 +6,8 @@ import math
 import random
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Collection, Iterable, Literal
 
 from app.core.balancer.types import FailureClass, UpstreamError
@@ -153,12 +154,32 @@ class AccountState:
     selection_weight_multiplier: float = 1.0
 
 
+class OwnerFailureReason(StrEnum):
+    UNKNOWN = "unknown"
+    COOLDOWN = "cooldown"
+    ERROR_BACKOFF = "error_backoff"
+    LOCAL_CONTENTION = "local_contention"
+    QUOTA = "quota"
+    RATE_LIMIT = "rate_limit"
+    AUTHENTICATION = "authentication"
+    PAUSED = "paused"
+    DEACTIVATED = "deactivated"
+    POLICY = "policy"
+    ABSENT = "absent"
+    EXCLUDED = "excluded"
+
+    @property
+    def temporary(self) -> bool:
+        return self in (self.COOLDOWN, self.ERROR_BACKOFF, self.LOCAL_CONTENTION)
+
+
 @dataclass
 class SelectionResult:
     account: AccountState | None
     error_message: str | None
     error_code: str | None = None
     resets_at: int | None = None
+    owner_failure_reason: OwnerFailureReason = OwnerFailureReason.UNKNOWN
 
 
 USAGE_LIMIT_REACHED = "usage_limit_reached"
@@ -239,6 +260,7 @@ def pool_usage_exhaustion(
         error_message=message,
         error_code=USAGE_LIMIT_REACHED,
         resets_at=resets_at,
+        owner_failure_reason=OwnerFailureReason.QUOTA,
     )
 
 
@@ -555,6 +577,14 @@ def select_account(
     usage_exhaustion_state_list = list(usage_exhaustion_states) if usage_exhaustion_states is not None else all_states
     bypass_account_ids = None if bypass_quota_exceeded_account_ids is None else set(bypass_quota_exceeded_account_ids)
 
+    blocked_reasons: list[OwnerFailureReason] = []
+
+    def failure(message: str, *, resets_at: int | None = None) -> SelectionResult:
+        # A pool failure is not provenance for one owner. Only the singleton
+        # required-owner decision can positively qualify temporary recovery.
+        reason = blocked_reasons[0] if len(all_states) == len(blocked_reasons) == 1 else OwnerFailureReason.UNKNOWN
+        return SelectionResult(None, message, resets_at=resets_at, owner_failure_reason=reason)
+
     for state in all_states:
         bypass_standard_quota = (
             ignore_standard_quota
@@ -563,10 +593,13 @@ def select_account(
             or (bypass_account_ids is not None and state.account_id in bypass_account_ids)
         )
         if state.status == AccountStatus.DEACTIVATED:
+            blocked_reasons.append(OwnerFailureReason.DEACTIVATED)
             continue
         if state.status == AccountStatus.PAUSED:
+            blocked_reasons.append(OwnerFailureReason.PAUSED)
             continue
         if _known_expired_reauth(state, current):
+            blocked_reasons.append(OwnerFailureReason.AUTHENTICATION)
             continue
         if state.status == AccountStatus.RATE_LIMITED:
             if state.reset_at and current >= state.reset_at:
@@ -575,6 +608,7 @@ def select_account(
                 state.error_count = 0
                 state.reset_at = None
             elif not bypass_standard_quota:
+                blocked_reasons.append(OwnerFailureReason.RATE_LIMIT)
                 continue
         if state.status == AccountStatus.QUOTA_EXCEEDED:
             if state.reset_at and current >= state.reset_at:
@@ -583,17 +617,20 @@ def select_account(
                 state.secondary_used_percent = 0.0
                 state.reset_at = None
             elif not bypass_standard_quota:
+                blocked_reasons.append(OwnerFailureReason.QUOTA)
                 continue
         if state.cooldown_until and current >= state.cooldown_until:
             state.cooldown_until = None
             state.last_error_at = None
             state.error_count = 0
         if state.cooldown_until and current < state.cooldown_until:
+            blocked_reasons.append(OwnerFailureReason.COOLDOWN)
             continue
         if state.error_count >= ERROR_BACKOFF_THRESHOLD:
             backoff = min(300, 30 * (2 ** (state.error_count - ERROR_BACKOFF_THRESHOLD)))
             if state.last_error_at and current - state.last_error_at < backoff:
                 in_error_backoff.append(state)
+                blocked_reasons.append(OwnerFailureReason.ERROR_BACKOFF)
                 continue
             # Error backoff expired — reset error state so recovery is
             # not penalised by stale counts. The account has already
@@ -608,7 +645,9 @@ def select_account(
     if traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC and available:
         opportunistic_available, reason = _filter_opportunistic_candidates(available, current)
         if not opportunistic_available:
-            return SelectionResult(None, f"opportunistic burn window closed: {reason}")
+            return SelectionResult(
+                None, f"opportunistic burn window closed: {reason}", owner_failure_reason=OwnerFailureReason.POLICY
+            )
         available = opportunistic_available
 
     if not available:
@@ -637,7 +676,11 @@ def select_account(
             if traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC:
                 opportunistic_available, reason = _filter_opportunistic_candidates(available, current)
                 if not opportunistic_available:
-                    return SelectionResult(None, f"opportunistic burn window closed: {reason}")
+                    return SelectionResult(
+                        None,
+                        f"opportunistic burn window closed: {reason}",
+                        owner_failure_reason=OwnerFailureReason.POLICY,
+                    )
                 available = opportunistic_available
         else:
             if allow_usage_exhaustion_error:
@@ -648,7 +691,10 @@ def select_account(
                     ignore_standard_quota_account_ids=bypass_account_ids,
                 )
                 if usage_exhaustion is not None:
-                    return usage_exhaustion
+                    return replace(
+                        usage_exhaustion,
+                        owner_failure_reason=failure(usage_exhaustion.error_message or "").owner_failure_reason,
+                    )
             expired_reauth = [state for state in all_states if _known_expired_reauth(state, current)]
             deactivated = [s for s in all_states if s.status == AccountStatus.DEACTIVATED]
             paused = [s for s in all_states if s.status == AccountStatus.PAUSED]
@@ -657,29 +703,29 @@ def select_account(
 
             if not rate_limited and not quota_exceeded:
                 if paused and expired_reauth and deactivated:
-                    return SelectionResult(None, "All accounts are paused, deactivated, or require re-authentication")
+                    return failure("All accounts are paused, deactivated, or require re-authentication")
                 if paused and expired_reauth:
-                    return SelectionResult(None, "All accounts are paused or require re-authentication")
+                    return failure("All accounts are paused or require re-authentication")
                 if paused and deactivated:
-                    return SelectionResult(None, "All accounts are paused or deactivated")
+                    return failure("All accounts are paused or deactivated")
                 if expired_reauth and deactivated:
-                    return SelectionResult(None, "All accounts are deactivated or require re-authentication")
+                    return failure("All accounts are deactivated or require re-authentication")
                 if paused:
-                    return SelectionResult(None, "All accounts are paused")
+                    return failure("All accounts are paused")
                 if expired_reauth:
-                    return SelectionResult(None, "All accounts require re-authentication")
+                    return failure("All accounts require re-authentication")
                 if deactivated:
-                    return SelectionResult(None, "All accounts are deactivated")
+                    return failure("All accounts are deactivated")
             if quota_exceeded:
                 reset_candidates = [s.reset_at for s in quota_exceeded if s.reset_at]
                 if reset_candidates:
                     wait_seconds = max(0, min(reset_candidates) - int(current))
-                    return SelectionResult(None, _format_retry_hint(wait_seconds))
+                    return failure(_format_retry_hint(wait_seconds), resets_at=int(min(reset_candidates)))
             cooldowns = [s.cooldown_until for s in all_states if s.cooldown_until and s.cooldown_until > current]
             if cooldowns:
                 wait_seconds = max(0.0, min(cooldowns) - current)
-                return SelectionResult(None, _format_retry_hint(wait_seconds))
-            return SelectionResult(None, "No available accounts")
+                return failure(_format_retry_hint(wait_seconds))
+            return failure("No available accounts")
 
     def _reset_first_sort_key(state: AccountState) -> tuple[int, float, float, float, float, str]:
         reset_bucket_days = _reset_preference_bucket(state, current, prefer_earlier_reset_window)

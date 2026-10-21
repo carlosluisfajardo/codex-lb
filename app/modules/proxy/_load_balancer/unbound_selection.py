@@ -9,6 +9,7 @@ from typing import Generic, Protocol, TypeVar
 
 from app.core.balancer import (
     AccountState,
+    OwnerFailureReason,
     ResetPreferenceWindow,
     RoutingCostsByAccount,
     RoutingStrategy,
@@ -26,6 +27,7 @@ from app.modules.proxy._load_balancer.sticky_selection import (
     _filter_recovery_probe_candidates,
     _filter_states_for_account_caps,
     _probing_result_requires_recovery_reservation,
+    _required_owner_contention_reason,
     _select_account_preferring_budget_safe,
 )
 from app.modules.proxy._load_balancer.tunables import RoutingTunables
@@ -95,6 +97,7 @@ class UnboundSelectionOutcome(Generic[SelectionInputsT]):
     error_code: str | None
     resets_at: int | None = None
     disposition: str = "shared_result"
+    owner_failure_reason: OwnerFailureReason = OwnerFailureReason.UNKNOWN
 
 
 async def run_unbound_selection_path(
@@ -130,6 +133,7 @@ async def run_unbound_selection_path(
     error_message: str | None = None
     selection_error_code: str | None = None
     selection_resets_at: int | None = None
+    owner_failure_reason = OwnerFailureReason.UNKNOWN
 
     def _direct_error(
         *,
@@ -150,6 +154,7 @@ async def run_unbound_selection_path(
     attempt = 0
     suppress_recovery_probe_candidates = False
     while True:
+        owner_failure_reason = OwnerFailureReason.UNKNOWN
         attempt += 1
         probe_reservation: ProbeReservation | None = None
         probe_reservation_invalidated = False
@@ -197,12 +202,32 @@ async def run_unbound_selection_path(
                 # atomic — no commit-phase re-check is needed on this path.
                 selection_error_code = API_KEY_STREAM_FAIR_SHARE_ERROR_CODE
                 error_message = fair_share_denial_message(fair_share_denial)
-                result = SelectionResult(None, error_message)
+                result = SelectionResult(
+                    None,
+                    error_message,
+                    owner_failure_reason=_required_owner_contention_reason(
+                        states,
+                        owner_account_id=required_account_id,
+                        selection_inputs=selection_inputs,
+                        traffic_class=traffic_class,
+                        now=selection_now,
+                    ),
+                )
             elif not selection_states and states:
                 selection_error_code = _account_cap_error_code(lease_kind)
                 selection_resets_at = None
                 error_message = _account_cap_error_message(lease_kind, caps)
-                result = SelectionResult(None, error_message)
+                result = SelectionResult(
+                    None,
+                    error_message,
+                    owner_failure_reason=_required_owner_contention_reason(
+                        states,
+                        owner_account_id=required_account_id,
+                        selection_inputs=selection_inputs,
+                        traffic_class=traffic_class,
+                        now=selection_now,
+                    ),
+                )
                 logger.warning(
                     "Account cap exhausted during selection lease_kind=%s reason=%s candidates=%s",
                     lease_kind,
@@ -354,6 +379,15 @@ async def run_unbound_selection_path(
                 error_message = result.error_message
                 selection_error_code = result.error_code or selection_error_code
                 selection_resets_at = result.resets_at or selection_resets_at
+                owner_failure_reason = result.owner_failure_reason
+                if not states and required_account_id is not None:
+                    owner_failure_reason = _required_owner_contention_reason(
+                        states,
+                        owner_account_id=required_account_id,
+                        selection_inputs=selection_inputs,
+                        traffic_class=traffic_class,
+                        now=selection_now,
+                    )
 
         if probe_reservation_invalidated:
             selected_snapshot = None
@@ -531,4 +565,5 @@ async def run_unbound_selection_path(
         error_message=error_message,
         error_code=selection_error_code,
         resets_at=selection_resets_at,
+        owner_failure_reason=owner_failure_reason,
     )

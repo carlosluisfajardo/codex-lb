@@ -9,12 +9,13 @@ orchestration class.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import Literal, TypedDict
 from uuid import uuid4
 
+from app.core.balancer import OwnerFailureReason
 from app.core.metrics.prometheus import (
     PROMETHEUS_AVAILABLE,
     prompt_cache_key_derivation_total,
@@ -102,6 +103,33 @@ class _AffinityPolicy:
     # only: it never participates in routing, but it is the signal that tells
     # an operator whether unanchored threads are being held or are churning.
     prompt_cache_derivation_outcome: str | None = None
+
+    @staticmethod
+    def preferred_owner_eligible(
+        owner_id: str | None,
+        *,
+        excluded_account_ids: Collection[str],
+        scoped_account_ids: Collection[str] | None,
+        single_account_routing_id: str | None,
+        required_continuity: bool,
+        overrides_single_account_routing: bool,
+    ) -> bool:
+        return (
+            owner_id is not None
+            and owner_id not in excluded_account_ids
+            and (
+                scoped_account_ids is None
+                or owner_id in scoped_account_ids
+                or (required_continuity and not overrides_single_account_routing)
+            )
+            and (single_account_routing_id is None or owner_id == single_account_routing_id or required_continuity)
+        )
+
+    @staticmethod
+    def unavailable_owner_reason(owner_id: str, excluded_account_ids: Collection[str]) -> OwnerFailureReason:
+        if owner_id in excluded_account_ids:
+            return OwnerFailureReason.EXCLUDED
+        return OwnerFailureReason.POLICY
 
     @property
     def selection_key(self) -> str | None:

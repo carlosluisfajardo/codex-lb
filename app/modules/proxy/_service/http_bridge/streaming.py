@@ -109,6 +109,8 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_should_attempt_soft_affinity_reroute,
     _http_bridge_should_rollover_after_context_overflow,
     _http_bridge_turn_state_anchor_for_owner_failure,
+    _HTTPBridgeRequiredOwnerReplayForbiddenError,
+    _HTTPBridgeRequiredOwnerSelectionError,
     _is_missing_durable_bridge_table_error,
     _log_http_bridge_event,
     _make_http_bridge_session_header_fallback_key,
@@ -658,6 +660,8 @@ def _http_bridge_capacity_wait_plan(
     request_deadline: float,
     now: float,
 ) -> tuple[float, float, str | None] | None:
+    if isinstance(exc, _HTTPBridgeRequiredOwnerSelectionError):
+        return None
     account_capacity_wait_seconds = _http_bridge_account_capacity_wait_seconds(exc)
     if account_capacity_wait_seconds is None:
         return None
@@ -2524,6 +2528,8 @@ class _HTTPBridgeStreamingMixin:
                     fallback_on_preferred_account_unavailable=not file_required_preferred_account,
                     request_usage_budget=request_state.request_usage_budget,
                     request_deadline=request_deadline,
+                    response_create_attempt_count=request_state.response_create_attempt_count,
+                    allow_required_owner_recovery=True,
                     session_header_fallback_key=session_header_fallback_key,
                     exclude_account_ids=fresh_replay_excluded_account_ids or None,
                     deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
@@ -2542,6 +2548,9 @@ class _HTTPBridgeStreamingMixin:
                 # carries its own continuity is a safe fresh raw-HTTP replay.
                 if effective_payload.previous_response_id != payload.previous_response_id:
                     setattr(exc, _HTTP_BRIDGE_PREPARED_ANCHOR_ATTR, True)
+                if isinstance(exc, _HTTPBridgeRequiredOwnerReplayForbiddenError):
+                    owner_unavailable_allows_account_neutral_replay(exc)
+                    raise
                 if switch_model_transition_to_account_neutral_fork(exc):
                     continue
                 if not owner_unavailable_allows_account_neutral_replay(exc):
@@ -2822,11 +2831,16 @@ class _HTTPBridgeStreamingMixin:
                             request_usage_budget=request_state.request_usage_budget,
                             session_header_fallback_key=session_header_fallback_key,
                             request_deadline=request_deadline,
+                            response_create_attempt_count=request_state.response_create_attempt_count,
+                            allow_required_owner_recovery=False,
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
                         )
                     except ProxyResponseError as capacity_exc:
+                        if isinstance(capacity_exc, _HTTPBridgeRequiredOwnerReplayForbiddenError):
+                            owner_unavailable_allows_account_neutral_replay(capacity_exc)
+                            raise
                         if owner_unavailable_allows_account_neutral_replay(capacity_exc):
                             switch_to_account_neutral_replay()
                             owner_forward_fresh_replay = True
@@ -3587,6 +3601,8 @@ class _HTTPBridgeStreamingMixin:
                             allow_previous_response_recovery_rebind=request_state.previous_response_id is not None,
                             request_usage_budget=request_state.request_usage_budget,
                             request_deadline=request_deadline,
+                            response_create_attempt_count=request_state.response_create_attempt_count,
+                            allow_required_owner_recovery=False,
                             session_header_fallback_key=session_header_fallback_key,
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
@@ -3699,6 +3715,8 @@ class _HTTPBridgeStreamingMixin:
                             preferred_account_id=None,
                             request_usage_budget=request_state.request_usage_budget,
                             request_deadline=request_deadline,
+                            response_create_attempt_count=request_state.response_create_attempt_count,
+                            allow_required_owner_recovery=False,
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
@@ -4066,6 +4084,8 @@ class _HTTPBridgeStreamingMixin:
                             ),
                             request_usage_budget=estimate_api_key_request_usage(retry_payload),
                             request_deadline=request_deadline,
+                            response_create_attempt_count=request_state.response_create_attempt_count,
+                            allow_required_owner_recovery=False,
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,

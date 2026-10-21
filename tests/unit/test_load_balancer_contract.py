@@ -14,6 +14,7 @@ import app.modules.proxy.load_balancer as load_balancer_module
 from app.db.models import Account, AccountStatus, StickySession, StickySessionKind, UsageHistory
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
+from app.modules.proxy._load_balancer.sticky_selection import StickySelectionOutcome
 from app.modules.proxy.account_cache import AccountSelectionCache
 from app.modules.proxy.load_balancer import AccountConcurrencyCaps, AccountSelection, LoadBalancer
 from app.modules.proxy.repo_bundle import ProxyRepositories
@@ -449,6 +450,7 @@ async def test_opportunistic_policy_block_is_not_classified_as_owner_unavailable
         "opportunistic burn window closed: preserve floor or stale usage data blocks opportunistic burn"
     )
     assert selection.error_code == load_balancer_module.OPPORTUNISTIC_BURN_WINDOW_CLOSED
+    assert selection.owner_failure_reason is load_balancer_module.OwnerFailureReason.POLICY
 
 
 @pytest.mark.asyncio
@@ -574,7 +576,7 @@ async def test_hard_sticky_owner_miss_does_not_mark_healthy_pool_degraded(
 
 
 @pytest.mark.asyncio
-async def test_required_continuity_owner_preserves_transient_hard_affinity_saturation(
+async def test_required_continuity_owner_preserves_untyped_hard_affinity_saturation(
     selection_cache: AccountSelectionCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -583,7 +585,7 @@ async def test_required_continuity_owner_preserves_transient_hard_affinity_satur
     sticky_repo.account_id = owner.id
 
     async def saturated_selection(_owner: object, *, request: Any) -> object:
-        return SimpleNamespace(
+        return StickySelectionOutcome(
             selection_inputs=request.selection_inputs,
             selected_snapshot=None,
             selected_lease=None,
@@ -591,8 +593,8 @@ async def test_required_continuity_owner_preserves_transient_hard_affinity_satur
             error_code="hard_affinity_saturated",
             resets_at=None,
             disposition="shared_result",
-            # This caller excluded nothing, so the saturation is a transient
-            # owner outage and keeps its recovery wait (#2163).
+            # Exclusion provenance does not prove that an untyped outage
+            # is temporary; the legacy constructor must retain unknown.
             hard_affinity_owner_excluded=False,
         )
 
@@ -610,6 +612,7 @@ async def test_required_continuity_owner_preserves_transient_hard_affinity_satur
     assert selection.error_message == "Hard affinity owner account is unavailable"
     assert selection.error_code == "hard_affinity_saturated"
     assert selection.hard_affinity_owner_excluded is False
+    assert selection.owner_failure_reason == "unknown"
 
 
 @pytest.mark.asyncio
