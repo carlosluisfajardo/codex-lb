@@ -3432,7 +3432,11 @@ def _mark_http_bridge_reader_handoff_reconnect_failed(session: Any, old_reader: 
 
 
 class _HTTPBridgeRequiredOwnerSelectionError(ProxyResponseError):
-    """A required-owner decision is final for outer capacity/replay heuristics."""
+    """A required-owner decision cannot start another outer capacity window."""
+
+
+class _HTTPBridgeRequiredOwnerReplayForbiddenError(_HTTPBridgeRequiredOwnerSelectionError):
+    """An owner mismatch, exhausted window or attempted send also forbids replay."""
 
 
 def _http_bridge_previous_response_owner_unavailable_error() -> ProxyResponseError:

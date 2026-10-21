@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from app.core.config.settings import Settings
 from app.db.models import AccountStatus, DashboardSettings, HttpBridgeSessionState, StickySessionKind
 from app.modules.proxy import load_balancer as lb
 from app.modules.proxy import service as proxy
+from app.modules.proxy._service.http_bridge.helpers import _HTTPBridgeRequiredOwnerReplayForbiddenError
 from app.modules.proxy._service.http_bridge.request_submit import _send_http_bridge_request_text_with_archive_id
 from app.modules.proxy._service.http_bridge.streaming import _http_bridge_capacity_wait_plan
 from app.modules.proxy.account_cache import AccountSelectionCache
@@ -496,6 +498,101 @@ async def test_followup_replacement_cannot_start_another_owner_window(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fence", ["followup", "attempted"])
+async def test_fenced_singleflight_join_preserves_creator_and_eligible_waiters(
+    monkeypatch: pytest.MonkeyPatch, fence: str
+) -> None:
+    service, owner, scheduler, clock, opened = _bridge(monkeypatch)
+    monkeypatch.setattr(service, "_claim_durable_http_bridge_session", AsyncMock())
+    key = proxy._HTTPBridgeSessionKey("request", "singleflight-owner-recovery", None)
+    state = proxy._WebSocketRequestState(
+        request_id="fenced-singleflight",
+        model=None,
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0,
+    )
+    attempted_send = AsyncMock(side_effect=RuntimeError("send outcome unknown"))
+    if fence == "attempted":
+        old_session = _make_bridge_session()
+        old_session.upstream = cast(Any, SimpleNamespace(send_text=attempted_send))
+        with pytest.raises(RuntimeError, match="send outcome unknown"):
+            await _send_http_bridge_request_text_with_archive_id(
+                old_session, state, '{"type":"response.create","previous_response_id":"resp-original"}', clock=clock
+            )
+        assert state.response_create_sent_at is None
+        assert state.response_create_attempt_count == 1
+
+    async def join(*, fenced: bool = False) -> Any:
+        return await service._get_or_create_http_bridge_session(
+            key,
+            headers={},
+            affinity=proxy._AffinityPolicy(),
+            api_key=None,
+            request_model=None,
+            previous_response_id="resp-original",
+            allow_previous_response_recovery_rebind=True,
+            idle_ttl_seconds=120,
+            max_sessions=8,
+            preferred_account_id=owner.id,
+            preferred_account_has_continuity_provenance=True,
+            fallback_on_preferred_account_unavailable=False,
+            request_deadline=120,
+            response_create_attempt_count=state.response_create_attempt_count if fenced else 0,
+            allow_required_owner_recovery=not (fenced and fence == "followup"),
+        )
+
+    creator = scheduler.create_task(join())
+    session = None
+    try:
+        await scheduler.drain()
+        inflight = service._http_bridge_inflight_sessions[key]
+        assert not creator.done()
+        assert opened.await_count == 0
+        eligible = scheduler.create_task(join())
+        cancelled_waiter = scheduler.create_task(join())
+        fenced_waiter = scheduler.create_task(join(fenced=True))
+        await scheduler.drain()
+        refused_promptly = fenced_waiter.done()
+        cancelled_waiter.cancel()
+        await scheduler.drain()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_waiter
+        assert service._http_bridge_inflight_sessions.get(key) is inflight
+        assert not inflight.done()
+        assert not creator.done() and not eligible.done()
+        assert opened.await_count == 0
+        await scheduler.advance(4)
+        session = await creator
+        assert await eligible is session
+        assert inflight.result() is session
+        assert service._http_bridge_sessions[key] is session
+        assert key not in service._http_bridge_inflight_sessions
+        assert session.account.id == owner.id
+        assert opened.await_count == 1
+        assert opened.await_args.args[0].id == owner.id
+        assert not session.closed
+        assert service._load_balancer._runtime[owner.id].inflight_streams == 1
+        assert attempted_send.await_count == int(fence == "attempted")
+        # Let the shared creator finish even on the unfixed path, so this pin
+        # distinguishes recovery inheritance from a fixture/setup failure.
+        assert refused_promptly, "fenced request inherited another request's required-owner recovery"
+        with pytest.raises(ProxyResponseError) as caught:
+            await fenced_waiter
+        assert isinstance(caught.value, _HTTPBridgeRequiredOwnerReplayForbiddenError)
+        assert caught.value.status_code == 502
+        assert caught.value.payload["error"]["code"] == "previous_response_owner_unavailable"
+        assert _http_bridge_capacity_wait_plan(caught.value, request_deadline=120, now=4) is None
+        assert await join(fenced=True) is session, "completed same-owner reuse must remain available"
+    finally:
+        await scheduler.cancel_owned_tasks()
+        if session is not None:
+            await service._load_balancer.release_account_lease(session.account_lease)
+        assert all(not runtime.leases for runtime in service._load_balancer._runtime.values())
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("legacy", [False, True])
 async def test_excluded_or_untyped_owner_refuses_without_heuristic_wait(
     monkeypatch: pytest.MonkeyPatch, legacy: bool
@@ -519,7 +616,38 @@ async def test_excluded_or_untyped_owner_refuses_without_heuristic_wait(
 async def test_required_owner_mismatch_keeps_outer_stream_anchor_and_releases_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service, owner, scheduler, _, opened = _bridge(monkeypatch, blocked="none")
+    await _assert_required_owner_final_refusal(monkeypatch, "mismatch")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["mismatch_incomplete", "expired", "attempted"])
+async def test_required_owner_final_refusal_preserves_outer_fence_and_attribution(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, scenario: str
+) -> None:
+    caplog.set_level(logging.INFO)
+    await _assert_required_owner_final_refusal(monkeypatch, scenario)
+    if scenario == "mismatch_incomplete":
+        rejections = [
+            record.getMessage()
+            for record in caplog.records
+            if "owner_unavailable_replay_rejected" in record.getMessage()
+        ]
+        assert len(rejections) == 1
+        assert "detail=reason=payload_not_full_resend" in rejections[0]
+
+
+@pytest.mark.asyncio
+async def test_required_owner_terminal_before_expiry_keeps_existing_full_resend_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _assert_required_owner_final_refusal(monkeypatch, "terminal_before_expiry")
+
+
+async def _assert_required_owner_final_refusal(monkeypatch: pytest.MonkeyPatch, scenario: str) -> None:
+    mismatch = scenario.startswith("mismatch")
+    service, owner, scheduler, clock, opened = _bridge(monkeypatch, blocked="none" if mismatch else "cooldown")
+    if not mismatch:
+        service._load_balancer._runtime[owner.id].cooldown_until = clock.time() + 120
     settings = DashboardSettings(
         prefer_earlier_reset_accounts=False,
         routing_strategy="usage_weighted",
@@ -549,6 +677,8 @@ async def test_required_owner_mismatch_keeps_outer_stream_anchor_and_releases_le
             ],
         }
     )
+    if scenario == "mismatch_incomplete":
+        payload.input = "next question"
     lookup = proxy.DurableBridgeLookup(
         session_id="mismatched-owner",
         canonical_kind="session_header",
@@ -575,15 +705,27 @@ async def test_required_owner_mismatch_keeps_outer_stream_anchor_and_releases_le
     monkeypatch.setattr(proxy, "_http_bridge_owner_instance", AsyncMock(return_value=instance))
     monkeypatch.setattr(proxy, "_active_http_bridge_instance_ring", AsyncMock(return_value=(instance, (instance,))))
     alternate = _account("mismatched-alternate")
-    lease = await service._load_balancer.acquire_account_lease(alternate.id, kind="stream")
-    assert lease is not None
-    # Force an inconsistent selector result; no natural selector path is known
-    # to violate this invariant. Keep real creation, lease release and outer replay.
-    select = AsyncMock(return_value=lb.AccountSelection(alternate, None, lease=lease))
+    if mismatch:
+        lease = await service._load_balancer.acquire_account_lease(alternate.id, kind="stream")
+        assert lease is not None
+        # Force an inconsistent selector result; no natural selector path is known
+        # to violate this invariant. Keep real creation, lease release and outer replay.
+        select = AsyncMock(return_value=lb.AccountSelection(alternate, None, lease=lease))
+    else:
+        first_selection = asyncio.Event()
+        real_select = service._load_balancer.select_account
+
+        async def observe_selection(**kwargs: Any) -> lb.AccountSelection:
+            selection = await real_select(**kwargs)
+            first_selection.set()
+            return selection
+
+        select = AsyncMock(side_effect=observe_selection)
     monkeypatch.setattr(service._load_balancer, "select_account", select)
     get_or_create = service._get_or_create_http_bridge_session
     attempts: list[tuple[str | None, str | None, set[str]]] = []
     refusal: ProxyResponseError | None = None
+    creation_started = asyncio.Event()
 
     async def observe_creation(key: Any, **kwargs: Any) -> Any:
         nonlocal refusal
@@ -594,6 +736,11 @@ async def test_required_owner_mismatch_keeps_outer_stream_anchor_and_releases_le
             # Bound a broken outer replay after recording its changed owner and
             # anchor, without allowing the forced selector to dispatch upstream.
             raise refusal
+        if scenario == "attempted":
+            # Inject retained send provenance at the creation seam. The actual
+            # send/cleared-timestamp intersection is pinned separately above.
+            kwargs["response_create_attempt_count"] = 1
+        creation_started.set()
         try:
             return await get_or_create(key, **kwargs)
         except ProxyResponseError as exc:
@@ -601,25 +748,46 @@ async def test_required_owner_mismatch_keeps_outer_stream_anchor_and_releases_le
             raise
 
     monkeypatch.setattr(service, "_get_or_create_http_bridge_session", observe_creation)
+
+    async def consume() -> None:
+        async for _ in service._stream_via_http_bridge(
+            payload,
+            headers={"x-codex-session-id": "mismatched-owner"},
+            codex_session_affinity=True,
+            propagate_http_errors=True,
+            openai_cache_affinity=True,
+            api_key=None,
+            api_key_reservation=None,
+            suppress_text_done_events=False,
+            idle_ttl_seconds=120,
+            codex_idle_ttl_seconds=1800,
+            max_sessions=8,
+            queue_limit=4,
+        ):
+            pass
+
+    task = scheduler.create_task(consume())
     try:
+        await asyncio.wait_for(creation_started.wait(), timeout=5)
+        if not mismatch:
+            await asyncio.wait_for(first_selection.wait(), timeout=5)
+        await scheduler.drain()
+        if scenario == "expired":
+            assert not task.done()
+            assert opened.await_count == 0
+            await scheduler.advance(30)
+        elif scenario == "terminal_before_expiry":
+            owner.status = AccountStatus.PAUSED
+            service._load_balancer._selection_inputs_cache.invalidate(propagate=False)
+            await scheduler.advance(2)
         with pytest.raises(ProxyResponseError) as caught:
-            async for _ in service._stream_via_http_bridge(
-                payload,
-                headers={"x-codex-session-id": "mismatched-owner"},
-                codex_session_affinity=True,
-                propagate_http_errors=True,
-                openai_cache_affinity=True,
-                api_key=None,
-                api_key_reservation=None,
-                suppress_text_done_events=False,
-                idle_ttl_seconds=120,
-                codex_idle_ttl_seconds=1800,
-                max_sessions=8,
-                queue_limit=4,
-            ):
-                pass
-        assert attempts == [(owner.id, "resp_required_anchor", set())], "mismatch must not drop owner/anchor or replay"
-        assert select.await_count == 1, caught.value.payload
+            await asyncio.wait_for(task, timeout=5)
+        expected_attempts: list[tuple[str | None, str | None, set[str]]] = [(owner.id, "resp_required_anchor", set())]
+        if scenario == "terminal_before_expiry":
+            expected_attempts.append((None, None, {owner.id}))
+        assert attempts == expected_attempts, "only independent existing proof may change owner/anchor or replay"
+        expected_selections = 15 if scenario == "expired" else 2 if scenario == "terminal_before_expiry" else 1
+        assert select.await_count == expected_selections, caught.value.payload
         assert select.await_args is not None
         assert select.await_args.kwargs["required_account_id"] == owner.id
         assert caught.value.status_code == 502
@@ -632,8 +800,9 @@ async def test_required_owner_mismatch_keeps_outer_stream_anchor_and_releases_le
         }
         assert payload.previous_response_id == "resp_required_anchor"
         assert opened.await_count == 0
-        assert service._load_balancer._runtime[alternate.id].inflight_streams == 0
-        assert not service._load_balancer._runtime[alternate.id].leases
+        if mismatch:
+            assert service._load_balancer._runtime[alternate.id].inflight_streams == 0
+        assert all(not runtime.leases for runtime in service._load_balancer._runtime.values())
         assert not service._http_bridge_inflight_sessions
         assert not service._http_bridge_sessions
     finally:

@@ -114,6 +114,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_should_wait_for_registration,
     _http_bridge_startup_wait_timeout_error,
     _http_bridge_turn_state_alias_key,
+    _HTTPBridgeRequiredOwnerReplayForbiddenError,
     _log_http_bridge_event,
     _log_http_bridge_startup_wait_timeout,
     _mark_http_bridge_reader_handoff_reconnect_failed,
@@ -1400,6 +1401,9 @@ class _HTTPBridgeMixin(
                     pass
                 continue
             if inflight_future is not None and not owns_creation:
+                if require_preferred_account and (response_create_attempt_count or not allow_required_owner_recovery):
+                    refusal = _http_bridge_previous_response_owner_unavailable_error()
+                    raise _HTTPBridgeRequiredOwnerReplayForbiddenError(refusal.status_code, refusal.payload)
                 wait_timeout_seconds = _proxy_admission_wait_timeout_seconds()
                 try:
                     session = await self._await_http_bridge_registry_wait(inflight_future, timeout=wait_timeout_seconds)
@@ -1738,8 +1742,9 @@ class _HTTPBridgeMixin(
             preferred_account_id=preferred_account_id,
             require_preferred_account=require_preferred_account,
             continuity_owner=preferred_account_is_continuity_owner,
-            allow_recovery=allow_required_owner_recovery and response_create_attempt_count == 0,
+            allow_recovery=allow_required_owner_recovery,
             excluded_account_ids=excluded_account_ids,
+            response_create_attempt_count=response_create_attempt_count,
         )
         while True:
             select_kwargs = {

@@ -109,6 +109,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_should_attempt_soft_affinity_reroute,
     _http_bridge_should_rollover_after_context_overflow,
     _http_bridge_turn_state_anchor_for_owner_failure,
+    _HTTPBridgeRequiredOwnerReplayForbiddenError,
     _HTTPBridgeRequiredOwnerSelectionError,
     _is_missing_durable_bridge_table_error,
     _log_http_bridge_event,
@@ -2547,7 +2548,8 @@ class _HTTPBridgeStreamingMixin:
                 # carries its own continuity is a safe fresh raw-HTTP replay.
                 if effective_payload.previous_response_id != payload.previous_response_id:
                     setattr(exc, _HTTP_BRIDGE_PREPARED_ANCHOR_ATTR, True)
-                if isinstance(exc, _HTTPBridgeRequiredOwnerSelectionError):
+                if isinstance(exc, _HTTPBridgeRequiredOwnerReplayForbiddenError):
+                    owner_unavailable_allows_account_neutral_replay(exc)
                     raise
                 if switch_model_transition_to_account_neutral_fork(exc):
                     continue
@@ -2836,7 +2838,8 @@ class _HTTPBridgeStreamingMixin:
                             defer_account_health_writes=request_state.api_key_reservation is not None,
                         )
                     except ProxyResponseError as capacity_exc:
-                        if isinstance(capacity_exc, _HTTPBridgeRequiredOwnerSelectionError):
+                        if isinstance(capacity_exc, _HTTPBridgeRequiredOwnerReplayForbiddenError):
+                            owner_unavailable_allows_account_neutral_replay(capacity_exc)
                             raise
                         if owner_unavailable_allows_account_neutral_replay(capacity_exc):
                             switch_to_account_neutral_replay()

@@ -12,6 +12,7 @@ from app.core.errors import openai_error
 from app.core.utils.shared_future import _await_cleanup_deferring_cancellation
 from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_previous_response_owner_unavailable_error,
+    _HTTPBridgeRequiredOwnerReplayForbiddenError,
     _HTTPBridgeRequiredOwnerSelectionError,
 )
 from app.modules.proxy._service.http_bridge.protocol import _HTTPBridgeServiceProtocol
@@ -28,6 +29,7 @@ class _HTTPBridgeOwnerSelection:
     continuity_owner: bool
     allow_recovery: bool
     excluded_account_ids: Collection[str]
+    response_create_attempt_count: int = 0
     recovery_deadline: float | None = field(default=None, init=False)
     refusal: ProxyResponseError | None = field(default=None, init=False)
 
@@ -61,7 +63,7 @@ class _HTTPBridgeOwnerSelection:
                         )
                         if self.continuity_owner:
                             refusal = _http_bridge_previous_response_owner_unavailable_error()
-                            raise _HTTPBridgeRequiredOwnerSelectionError(refusal.status_code, refusal.payload)
+                            raise _HTTPBridgeRequiredOwnerReplayForbiddenError(refusal.status_code, refusal.payload)
                         raise ProxyResponseError(
                             503,
                             openai_error(
@@ -99,17 +101,28 @@ class _HTTPBridgeOwnerSelection:
                 refusal = ProxyResponseError(status_code, error_payload)
             if not self.require_preferred_account or self.preferred_account_id is None:
                 raise refusal
-            # Keep the envelope, but deny outer capacity/anchor replay another
-            # window. The object survives pre-dispatch connection retries.
-            self.refusal = _HTTPBridgeRequiredOwnerSelectionError(refusal.status_code, refusal.payload)
-            if (
+            can_wait = (
                 self.allow_recovery
+                and self.response_create_attempt_count == 0
                 and selection.owner_failure_reason.temporary
                 and self.preferred_account_id not in self.excluded_account_ids
-            ):
-                now = clock_for(service).monotonic()
-                if self.recovery_deadline is None:
-                    self.recovery_deadline = min(self.request_deadline, now + 30.0)
+            )
+            now = clock_for(service).monotonic()
+            if can_wait and self.recovery_deadline is None:
+                self.recovery_deadline = min(self.request_deadline, now + 30.0)
+            # No refusal grants another capacity window. Store a final refusal
+            # while waiting; a terminal transition before expiry may still use
+            # the existing independent recovery proofs.
+            refusal_type = (
+                _HTTPBridgeRequiredOwnerReplayForbiddenError
+                if can_wait
+                or self.response_create_attempt_count > 0
+                or (self.recovery_deadline is not None and now >= self.recovery_deadline)
+                else _HTTPBridgeRequiredOwnerSelectionError
+            )
+            self.refusal = refusal_type(refusal.status_code, refusal.payload)
+            if can_wait:
+                assert self.recovery_deadline is not None
                 remaining = self.recovery_deadline - now
                 if remaining > 0:
                     await scheduler_for(service).sleep(min(2.0, remaining))
