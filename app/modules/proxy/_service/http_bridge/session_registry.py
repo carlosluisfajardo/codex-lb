@@ -65,6 +65,10 @@ from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_e
 logger = logging.getLogger("app.modules.proxy.service")
 
 
+class _HTTPBridgeOwnerRecoveryInProgressError(_HTTPBridgeRequiredOwnerReplayForbiddenError):
+    """The shared creator is only waiting for its required owner selection."""
+
+
 class _HTTPBridgeCreationFuture(asyncio.Future[_HTTPBridgeSession]):
     """One creator's deadline and a shared view that cannot inherit recovery."""
 
@@ -79,7 +83,7 @@ class _HTTPBridgeCreationFuture(asyncio.Future[_HTTPBridgeSession]):
         if self._without_recovery is not None and not self._without_recovery.done():
             refusal = _http_bridge_previous_response_owner_unavailable_error()
             self._without_recovery.set_exception(
-                _HTTPBridgeRequiredOwnerReplayForbiddenError(refusal.status_code, refusal.payload)
+                _HTTPBridgeOwnerRecoveryInProgressError(refusal.status_code, refusal.payload)
             )
             self._without_recovery.exception()
 

@@ -15,3 +15,7 @@ The first two owner rechecks retain their short cadence, then rechecks slow to e
 ## Example and constraints
 
 A full-history continuation whose owner has 60 seconds of backoff immediately uses its existing verified replay on another account. An incomplete continuation instead keeps its owner/anchor during one bounded window. A stream-cap refusal waits on the original capacity budget. A healthy follow-up may share creation, but if that creation enters recovery the follow-up refuses while eligible waiters continue. Retained attempts, wrong-owner results, incomplete/mismatched history and ambiguous-send fences remain intact.
+
+## M1 clarification
+
+In M1, request B has independent positive full-history proof and no known or ambiguous same-operation effects. Sharing a creation key with incomplete creator A does not establish that they are the same logical operation. Distinguish the refusal emitted by A's actual owner-selection recovery from wrong-owner and other final refusals. Only B's initial creation catch may use that distinction with its existing proof and unattempted operation provenance; follow-up catches stay final. Known recovery attempts and existing operation/output provenance remain fenced. B uses the existing replay path, leaving A's future and deadline untouched. The four review lows are outside this correction.

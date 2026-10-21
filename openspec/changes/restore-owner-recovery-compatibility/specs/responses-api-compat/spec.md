@@ -78,3 +78,12 @@ First HTTP bridge creation MAY wait only when selection positively identifies co
 - **THEN** it SHALL retain the existing outer capacity wait
 - **AND** a joining request with a retained response-create attempt SHALL remain final without another wait or replay
 - **AND** neither joining request SHALL cancel or release the creator's work
+
+#### Scenario: Independent proof holder joins a recovering creator
+- **GIVEN** request A lacks full-history replay proof and is only waiting in required-owner selection before any upstream open
+- **AND** request B shares the creation key but independently holds the existing durable full-history and portable-projection proof, has never dispatched, and has no known or ambiguous same-operation effect
+- **WHEN** B joins A's recovering creation
+- **THEN** B SHALL immediately reach its existing guarded account-neutral replay without waiting for, cancelling, releasing or replaying A
+- **AND** B SHALL dispatch exactly once on its guarded replay path while A retains its original future, owner, lease ownership and deadline
+- **AND** sharing a creation key alone SHALL NOT be treated as evidence of the same logical operation
+- **AND** follow-up replacements, retained/ambiguous attempts, known same-operation effects, incomplete or mismatched history, wrong-owner refusals and downstream output SHALL NOT gain this replay

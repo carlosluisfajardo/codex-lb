@@ -166,6 +166,7 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _websocket_event_error_param,
     _websocket_event_error_type,
 )
+from app.modules.proxy._service.http_bridge.session_registry import _HTTPBridgeOwnerRecoveryInProgressError
 from app.modules.proxy._service.http_bridge.upstream_events import (
     _abandon_durable_http_bridge_continuity,
 )
@@ -1644,6 +1645,7 @@ class _HTTPBridgeStreamingMixin:
                 durable_full_resend_has_safe_fresh_context,
                 durable_full_resend_anchor_reason,
             ) = classify_durable_full_resend(durable_lookup)
+        existing_recovery_attempt = False
         if (
             durable_full_resend_has_safe_fresh_context
             and durable_full_resend_anchor_count is not None
@@ -1672,6 +1674,7 @@ class _HTTPBridgeStreamingMixin:
                             session_id=durable_lookup.session_id,
                             request_fingerprint=durable_recovery_attempt_fingerprint,
                         )
+                        existing_recovery_attempt = existing_attempt is not None
                         if existing_attempt is not None and (
                             durable_lookup.state != HttpBridgeSessionState.ACTIVE
                             or not durable_lookup.lease_is_active(now=utcnow())
@@ -2549,8 +2552,25 @@ class _HTTPBridgeStreamingMixin:
                 if effective_payload.previous_response_id != payload.previous_response_id:
                     setattr(exc, _HTTP_BRIDGE_PREPARED_ANCHOR_ATTR, True)
                 if isinstance(exc, _HTTPBridgeRequiredOwnerReplayForbiddenError):
-                    owner_unavailable_allows_account_neutral_replay(exc)
-                    raise
+                    replay_proven = owner_unavailable_allows_account_neutral_replay(exc)
+                    # A creation key is not an operation identity. An independent
+                    # unsubmitted proof holder may leave selection-only recovery;
+                    # wrong-owner errors and follow-up catches remain final.
+                    if not (
+                        isinstance(exc, _HTTPBridgeOwnerRecoveryInProgressError)
+                        and replay_proven
+                        and not existing_recovery_attempt
+                        and request_state.response_create_attempt_count == 0
+                        and request_state.response_create_sent_at is None
+                        and request_state.operation_id is None
+                        and not request_state.operation_registered
+                        and request_state.recovery_attempt_fingerprint is None
+                        and request_state.response_id is None
+                        and request_state.response_event_count == 0
+                        and not request_state.downstream_visible
+                        and request_state.last_downstream_sequence_number is None
+                    ):
+                        raise
                 if switch_model_transition_to_account_neutral_fork(exc):
                     continue
                 if not owner_unavailable_allows_account_neutral_replay(exc):

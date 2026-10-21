@@ -6,3 +6,5 @@
 - [x] Bound selector churn without changing cache, metrics or persistence policy.
 - [x] Mutation-walk protective assertions and restore exact production bytes.
 - [x] Run focused regressions, architecture, lint, types and strict specs; return exact diff and source pen.
+
+- [x] Correct M1 independent proof-holder joining recovery; prove real-path RED/GREEN, safety mutations and focused final checks.

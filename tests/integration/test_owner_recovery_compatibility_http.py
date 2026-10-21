@@ -26,8 +26,11 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("blocked", ["cooldown", "error_backoff", "capacity"])
-@pytest.mark.parametrize("client_anchor", [False, True])
+@pytest.mark.parametrize(
+    ("client_anchor", "blocked"),
+    [(anchor, blocked) for anchor in (False, True) for blocked in ("cooldown", "error_backoff", "capacity")]
+    + [(True, "joining_cooldown")],
+)
 async def test_real_http_owner_recovery_preserves_guarded_replay_and_capacity(
     async_client, app_instance, monkeypatch, blocked, client_anchor
 ) -> None:
@@ -58,7 +61,7 @@ async def test_real_http_owner_recovery_preserves_guarded_replay_and_capacity(
     service._clock, service._scheduler, service._load_balancer._clock = clock, scheduler, clock
     monkeypatch.setattr(time, "time", clock.time)
     runtime = service._load_balancer._runtime[owner]
-    if blocked == "cooldown":
+    if blocked in ("cooldown", "joining_cooldown"):
         runtime.cooldown_until = clock.time() + 120
     elif blocked == "error_backoff":
         owner_account = await _get_account(owner)
@@ -93,11 +96,37 @@ async def test_real_http_owner_recovery_preserves_guarded_replay_and_capacity(
 
     monkeypatch.setattr(service._load_balancer, "select_account", observe_selection)
     started = clock.monotonic()
+    creator = None
+    creation_calls = []
+    get_or_create = service._get_or_create_http_bridge_session
+
+    async def observe_creation(key, **kwargs):
+        creation_calls.append((key, kwargs["preferred_account_id"], kwargs["previous_response_id"]))
+        return await get_or_create(key, **kwargs)
+
+    monkeypatch.setattr(service, "_get_or_create_http_bridge_session", observe_creation)
+    if blocked == "joining_cooldown":
+        creator = scheduler.create_task(
+            _collect_sse_events(
+                async_client,
+                "/backend-api/codex/responses",
+                json_body=dict(body, input="independent incomplete request A", previous_response_id=response["id"]),
+                headers=headers,
+            )
+        )
+        await asyncio.wait_for(selected.wait(), 5)
+        await scheduler.drain()
+        ((creation_key, creation_future),) = service._http_bridge_inflight_sessions.items()
+        original_deadline = creation_future.request_deadline
+        assert not creator.done() and not creation_future.done()
+        assert runtime.inflight_streams == 0 and not runtime.leases
+        selected.clear()
     task = scheduler.create_task(
         _collect_sse_events(async_client, "/backend-api/codex/responses", json_body=body, headers=headers)
     )
     try:
-        await asyncio.wait_for(selected.wait(), 5)
+        if blocked != "joining_cooldown":
+            await asyncio.wait_for(selected.wait(), 5)
         await scheduler.drain()
         if blocked == "capacity":
             for _ in range(100):
@@ -121,6 +150,14 @@ async def test_real_http_owner_recovery_preserves_guarded_replay_and_capacity(
                     break
                 await asyncio.sleep(0.01)
             assert task.done(), "positive existing full-history proof must replay immediately, before owner waiting"
+        if creator is not None:
+            assert opened == [owner, alternate], "independent proof holder B must reach guarded replay while A waits"
+            assert service._http_bridge_inflight_sessions[creation_key] is creation_future
+            assert not creator.done() and not creation_future.done()
+            assert runtime.inflight_streams == 0 and not runtime.leases
+            assert creation_future.request_deadline == original_deadline
+            assert creation_calls[:2] == [(creation_key, owner, response["id"])] * 2
+            assert creation_calls[2][1:] == (None, None)
         events = await asyncio.wait_for(task, 5)
         assert events[-1]["type"] == "response.completed"
         assert opened == [owner, owner if blocked == "capacity" else alternate]
@@ -136,5 +173,13 @@ async def test_real_http_owner_recovery_preserves_guarded_replay_and_capacity(
             assert sent["input"] == full_history
             assert len(decisions) == 2
     finally:
+        if creator is not None:
+            creator.cancel()
+            await asyncio.gather(creator, return_exceptions=True)
+            assert creation_future.cancelled()
+            assert creation_key not in service._http_bridge_inflight_sessions
+            assert runtime.inflight_streams == 0 and not runtime.leases
+        if task.done() and not task.cancelled():
+            task.exception()
         await service.close_all_http_bridge_sessions()
         await scheduler.cancel_owned_tasks()
