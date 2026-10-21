@@ -28,8 +28,10 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_live_turn_state_alias_owner,
     _http_bridge_owner_lookup_unavailable_error_envelope,
     _http_bridge_previous_response_alias_key,
+    _http_bridge_previous_response_owner_unavailable_error,
     _http_bridge_request_budget_seconds,
     _http_bridge_turn_state_alias_key,
+    _HTTPBridgeRequiredOwnerReplayForbiddenError,
     _is_missing_durable_bridge_table_error,
     _log_http_bridge_event,
     _persist_http_bridge_previous_response_alias,
@@ -63,6 +65,57 @@ from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_e
 logger = logging.getLogger("app.modules.proxy.service")
 
 
+class _HTTPBridgeCreationFuture(asyncio.Future[_HTTPBridgeSession]):
+    """One creator's deadline and a shared view that cannot inherit recovery."""
+
+    def __init__(self, request_deadline: float) -> None:
+        super().__init__()
+        self.request_deadline = request_deadline
+        self._recovering = False
+        self._without_recovery: asyncio.Future[_HTTPBridgeSession] | None = None
+
+    def mark_recovering(self) -> None:
+        self._recovering = True
+        if self._without_recovery is not None and not self._without_recovery.done():
+            refusal = _http_bridge_previous_response_owner_unavailable_error()
+            self._without_recovery.set_exception(
+                _HTTPBridgeRequiredOwnerReplayForbiddenError(refusal.status_code, refusal.payload)
+            )
+            self._without_recovery.exception()
+
+    def for_waiter(self, *, allow_recovery: bool) -> asyncio.Future[_HTTPBridgeSession]:
+        if allow_recovery:
+            return self
+        if self._without_recovery is None:
+            self._without_recovery = asyncio.get_running_loop().create_future()
+            self.add_done_callback(self._settle_without_recovery)
+        if self._recovering:
+            self.mark_recovering()
+        return self._without_recovery
+
+    def _settle_without_recovery(self, done: asyncio.Future[_HTTPBridgeSession]) -> None:
+        view = self._without_recovery
+        assert view is not None
+        if view.done():
+            return
+        if done.cancelled():
+            view.cancel()
+        elif (error := done.exception()) is not None:
+            view.set_exception(error)
+            view.exception()
+        else:
+            view.set_result(done.result())
+
+
+def _http_bridge_creation_wait_timeout(
+    future: asyncio.Future[_HTTPBridgeSession], *, request_deadline: float | None, now: float, default: float
+) -> float:
+    deadline = future.request_deadline if isinstance(future, _HTTPBridgeCreationFuture) else now + default
+    if request_deadline is not None:
+        deadline = min(deadline, request_deadline)
+    return max(0.0, deadline - now)
+
+
 def _recovery_can_rebind_live_alias(session: _HTTPBridgeSession) -> bool:
     return session.key.affinity_kind in HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_REBINDABLE_KINDS or (
         is_http_bridge_account_neutral_replay(
@@ -84,6 +137,27 @@ def _requires_durable_recovery_alias_serialization(session: _HTTPBridgeSession) 
 
 
 class _HTTPBridgeSessionRegistryMixin:
+    async def _await_http_bridge_creation(
+        self: Any,
+        future: asyncio.Future[_HTTPBridgeSession],
+        *,
+        timeout: float,
+        require_preferred_account: bool,
+        allow_recovery: bool,
+        response_create_attempt_count: int,
+    ) -> _HTTPBridgeSession:
+        wait_future = future
+        if isinstance(future, _HTTPBridgeCreationFuture):
+            wait_future = future.for_waiter(
+                allow_recovery=not require_preferred_account or (response_create_attempt_count == 0 and allow_recovery)
+            )
+        try:
+            return await self._await_http_bridge_registry_wait(wait_future, timeout=timeout)
+        except ProxyResponseError as exc:
+            if require_preferred_account and response_create_attempt_count > 0:
+                raise _HTTPBridgeRequiredOwnerReplayForbiddenError(exc.status_code, exc.payload) from exc
+            raise
+
     async def prune_idle_http_bridge_sessions(self: Any) -> int:
         """Run the idle sweep off the request path (issue #1354).
 

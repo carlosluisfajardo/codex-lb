@@ -134,11 +134,11 @@ Local Responses overload failures MUST expose stable low-cardinality reason fiel
 
 ### Requirement: HTTP bridge startup admission waits are bounded
 
-The proxy MUST apply the fixed 10-second proxy admission wait timeout to each HTTP bridge startup wait attempt for per-session response-create gate acquisition, bridge capacity waiters, and in-flight session creation waiters.
+The proxy MUST apply the fixed 10-second proxy admission wait timeout to each per-session response-create gate acquisition attempt. A waiter on a request-owned bridge creation SHALL use the earlier of its own original request deadline and the creator's original request deadline. Legacy handoff waits without a creation deadline retain the fixed admission timeout, clamped to the waiter's remaining request budget.
 
 For per-session response-create gate acquisition by a bridged Responses request, an expired gate acquisition attempt MUST be treated as a recoverable capacity wait rather than a terminal failure: the request MUST release its queue slot and account lease, wait with capacity-wait progress semantics, and retry gate acquisition, bounded by the bridge request budget. Requests eligible for soft-affinity reroute MUST still attempt the reroute before entering the recoverable wait. When the bridge request budget is exhausted before the gate opens, the proxy MUST reject the request locally with HTTP 429, `error.code = "response_create_gate_timeout"`, and the stable local-overload reason.
 
-For bridge capacity waiters and in-flight session creation waiters, when the timeout expires the proxy MUST reject the request locally with HTTP 429 and an OpenAI-style `proxy_overloaded` error envelope. Timing out while observing another request's pending in-flight session creation MUST evict that in-flight marker when it is still pending so later requests can attempt a fresh bridge session instead of waiting on the same stalled future.
+For bridge capacity waiters and in-flight session creation waiters, when the timeout expires the proxy MUST reject the request locally with HTTP 429 and an OpenAI-style `capacity_exhausted_active_sessions` error envelope. A waiter timing out or being cancelled MUST NOT evict, fail or cancel another request's in-flight creation, discard its opened upstream work, or release its lease. The creator retains responsibility for settling its own marker.
 
 If a request owns in-flight bridge session creation and is cancelled or fails after publishing the in-flight marker but before registering the created session, the proxy MUST remove or settle that in-flight marker. If a session owner later finishes creation after its in-flight marker was evicted, the owner MUST NOT return an unregistered bridge session to the caller.
 
@@ -172,14 +172,14 @@ If a request owns in-flight bridge session creation and is cancelled or fails af
 #### Scenario: In-flight bridge session creation does not finish
 
 - **WHEN** a bridged Responses request waits on another request's in-flight session creation
-- **AND** the in-flight creation does not finish before the fixed proxy admission wait timeout
+- **AND** the in-flight creation does not finish before the waiter's applicable creation/request deadline
 - **THEN** the waiter is rejected locally with HTTP 429 and `error.code = "proxy_overloaded"`
-- **AND** the stalled in-flight marker is evicted if it is still pending
+- **AND** the creator and other waiters retain their own creation, deadline and lease ownership
 
 #### Scenario: Bridge capacity waiter does not make progress
 
 - **WHEN** the HTTP bridge is at capacity and a request waits for in-flight bridge work to free capacity
-- **AND** no capacity becomes available before the fixed proxy admission wait timeout
+- **AND** no capacity becomes available before the waiter's applicable creation/request deadline
 - **THEN** the waiter is rejected locally with HTTP 429 and `error.code = "proxy_overloaded"`
 
 #### Scenario: In-flight owner is cancelled during stale session close
@@ -887,7 +887,7 @@ Critical sections holding an HTTP bridge session's `pending_lock` MUST NOT await
 
 ### Requirement: Admission waits on shared futures scale O(1) per waiter
 
-When multiple requests wait on one shared future (an inflight bridge session creation, a capacity slot, a token-refresh singleflight, or a usage-refresh singleflight), the system MUST use the established shared-future fan-out wait mechanism so attaching a waiter, a waiter timing out, and a waiter being cancelled each perform O(1) work on the shared future. The shared future MUST carry a constant number of done callbacks regardless of waiter count, and the wait mechanism itself MUST NOT cancel or otherwise mutate the shared future or the work it represents when a waiter times out or is cancelled. Admission handlers MAY still settle the shared future explicitly after a waiter's timeout (the http-bridge timeout handler fails and unregisters the inflight future so piled-up waiters converge on one overload outcome); that settlement is an admission-contract decision, not a side effect of waiting. The shared future's result, exception, or cancellation MUST propagate to every waiter with the same semantics as `asyncio.wait_for(asyncio.shield(shared), timeout)`.
+When multiple requests wait on one shared future (an inflight bridge session creation, a capacity slot, a token-refresh singleflight, or a usage-refresh singleflight), the system MUST use the established shared-future fan-out wait mechanism so attaching a waiter, a waiter timing out, and a waiter being cancelled each perform O(1) work on the shared future. The shared future MUST carry a constant number of done callbacks regardless of waiter count, and the wait mechanism itself MUST NOT cancel or otherwise mutate the shared future or the work it represents when a waiter times out or is cancelled. HTTP bridge admission handlers SHALL NOT settle or unregister another request's pending creation because a waiter timed out; only the creation owner settles its own work. The shared future's result, exception, or cancellation MUST propagate to every waiter with the same semantics as `asyncio.wait_for(asyncio.shield(shared), timeout)`.
 
 The same bounded-callback contract applies to waits that re-attach to one owned task repeatedly: defer-cancellation waits on owned cleanup tasks, repeated timed waits such as SSE keepalive ticks on a pending chunk task, and bounded teardown drains. A defer-cancellation wait MUST shield itself from level-cancelled scopes so re-delivered cancellation cannot busy-spin the wait loop, MUST keep the owned task's done-callback count bounded by a constant regardless of how many times the waiter is cancelled or times out, MUST NOT cancel the owned task, MUST defer the caller's cancellation until the owned task finishes and then surface it, and MUST propagate the owned task's cancellation and exceptions unchanged.
 

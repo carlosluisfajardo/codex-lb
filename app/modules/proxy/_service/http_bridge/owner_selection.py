@@ -6,6 +6,7 @@ from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.core.balancer import OwnerFailureReason
 from app.core.clients.proxy import ProxyResponseError
 from app.core.clock import clock_for, scheduler_for
 from app.core.errors import openai_error
@@ -17,6 +18,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
 )
 from app.modules.proxy._service.http_bridge.protocol import _HTTPBridgeServiceProtocol
 from app.modules.proxy._service.http_bridge.service_stubs import _record_same_account_takeover
+from app.modules.proxy._service.http_bridge.session_registry import _HTTPBridgeCreationFuture
 from app.modules.proxy.load_balancer import CONTINUITY_OWNER_UNAVAILABLE, AccountSelection
 from app.modules.proxy.selection_errors import selection_failure_response
 
@@ -30,8 +32,10 @@ class _HTTPBridgeOwnerSelection:
     allow_recovery: bool
     excluded_account_ids: Collection[str]
     response_create_attempt_count: int = 0
+    creation: _HTTPBridgeCreationFuture | None = None
     recovery_deadline: float | None = field(default=None, init=False)
     refusal: ProxyResponseError | None = field(default=None, init=False)
+    failed_selections: int = field(default=0, init=False)
 
     async def select(
         self,
@@ -90,6 +94,14 @@ class _HTTPBridgeOwnerSelection:
             if last_error is not None:
                 raise last_error
             if (
+                selection.owner_failure_reason is OwnerFailureReason.LOCAL_CONTENTION
+                and self.response_create_attempt_count == 0
+            ):
+                # Local admission keeps its established outer request-deadline
+                # wait, including follow-up creation; it is not provider recovery.
+                status_code, error_payload = selection_failure_response(selection)
+                raise ProxyResponseError(status_code, error_payload)
+            if (
                 self.require_preferred_account
                 and self.preferred_account_id is not None
                 and self.continuity_owner
@@ -110,14 +122,11 @@ class _HTTPBridgeOwnerSelection:
             now = clock_for(service).monotonic()
             if can_wait and self.recovery_deadline is None:
                 self.recovery_deadline = min(self.request_deadline, now + 30.0)
-            # No refusal grants another capacity window. Store a final refusal
-            # while waiting; a terminal transition before expiry may still use
-            # the existing independent recovery proofs.
+            # The outer proof still decides replay on an unattempted refusal,
+            # including expiry. The typed refusal cannot start another window.
             refusal_type = (
                 _HTTPBridgeRequiredOwnerReplayForbiddenError
-                if can_wait
-                or self.response_create_attempt_count > 0
-                or (self.recovery_deadline is not None and now >= self.recovery_deadline)
+                if self.response_create_attempt_count > 0
                 else _HTTPBridgeRequiredOwnerSelectionError
             )
             self.refusal = refusal_type(refusal.status_code, refusal.payload)
@@ -125,7 +134,11 @@ class _HTTPBridgeOwnerSelection:
                 assert self.recovery_deadline is not None
                 remaining = self.recovery_deadline - now
                 if remaining > 0:
-                    await scheduler_for(service).sleep(min(2.0, remaining))
+                    if self.creation is not None:
+                        self.creation.mark_recovering()
+                    self.failed_selections += 1
+                    delay = 2.0 if self.failed_selections < 3 else 8.0
+                    await scheduler_for(service).sleep(min(delay, remaining))
                     continue
             raise self.refusal
 

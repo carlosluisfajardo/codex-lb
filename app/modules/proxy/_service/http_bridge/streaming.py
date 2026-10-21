@@ -2529,7 +2529,7 @@ class _HTTPBridgeStreamingMixin:
                     request_usage_budget=request_state.request_usage_budget,
                     request_deadline=request_deadline,
                     response_create_attempt_count=request_state.response_create_attempt_count,
-                    allow_required_owner_recovery=True,
+                    allow_required_owner_recovery=not durable_full_resend_allows_account_neutral_replay(),
                     session_header_fallback_key=session_header_fallback_key,
                     exclude_account_ids=fresh_replay_excluded_account_ids or None,
                     deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
