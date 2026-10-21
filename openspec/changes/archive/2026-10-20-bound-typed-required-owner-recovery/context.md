@@ -1,0 +1,11 @@
+# Design
+
+Reasons describe the effective selector decision for this request, not persistent account health. Core selection records the blocker it actually encounters. Local admission may report temporary contention only after the same owner's core selection succeeds on a disposable state copy; a core failure retains its terminal or unknown reason. Thus a quota-blocked owner at its stream cap still refuses promptly.
+
+Hard affinity retains the core reason and reset metadata while preserving its established public error code. Legacy failures remain unknown. The bridge consumes only the three positive temporary reasons, sleeps with the existing scheduler, and owns one monotonic deadline clamped to its original request deadline. The same deadline bounds each reselection, and a late successful selection is rejected before upstream connection. Failed-selection leases are released before waiting. No circuit state or error-text inference participates.
+
+The source tests use synthetic account repositories and virtual time, without provider/account/runtime access. They exercise the real core selector, load balancer and service before the bridge consumer. Source and fixture evidence does not qualify installation or live runtime.
+
+An internal refusal subtype preserves the public envelope while preventing outer capacity and replay heuristics from starting another window or dropping the continuation anchor. All five HTTP bridge creation call sites pass the retained send-attempt count; only initial creation permits owner recovery. Follow-up replacement paths cannot start a new recovery window. Repeated cancellation defers propagation until the existing singleflight cleanup finishes.
+
+The bridge owner-selection seam retains the window across pre-dispatch connection retries and owns every rejected selection lease until release completes. In particular, synchronous selection work can return success after expiry while the runtime lock is occupied; repeated cancellation must not orphan that late lease. The existing cancellation-deferring helper settles release before cancellation reaches singleflight cleanup. Selection DTOs live with load-balancer types and retain the public load-balancer import; affinity eligibility and refusal classification live with affinity policy. Opportunistic envelope remapping preserves the core policy reason.

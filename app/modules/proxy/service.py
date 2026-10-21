@@ -1846,19 +1846,13 @@ class ProxyService(
                         )
                     single_account_routing_id = selected_account_id
                     routing_strategy = "single_account"
-                preferred_eligible = (
-                    preferred_account_id is not None
-                    and preferred_account_id not in excluded_account_ids_set
-                    and (
-                        scoped_account_ids is None
-                        or preferred_account_id in scoped_account_ids
-                        or (required_continuity and not preferred_account_overrides_single_account_routing)
-                    )
-                    and (
-                        single_account_routing_id is None
-                        or preferred_account_id == single_account_routing_id
-                        or required_continuity
-                    )
+                preferred_eligible = _AffinityPolicy.preferred_owner_eligible(
+                    preferred_account_id,
+                    excluded_account_ids=excluded_account_ids_set,
+                    scoped_account_ids=scoped_account_ids,
+                    single_account_routing_id=single_account_routing_id,
+                    required_continuity=required_continuity,
+                    overrides_single_account_routing=preferred_account_overrides_single_account_routing,
                 )
                 if preferred_account_id is not None and not preferred_eligible:
                     logger.warning(
@@ -1876,6 +1870,9 @@ class ProxyService(
                             account=None,
                             error_message="Preferred account is not available",
                             error_code="preferred_account_unavailable",
+                            owner_failure_reason=_AffinityPolicy.unavailable_owner_reason(
+                                preferred_account_id, excluded_account_ids_set
+                            ),
                         )
                 if preferred_eligible:
                     preferred_sticky_inputs = _AffinityPolicy.preferred_owner_sticky_inputs(

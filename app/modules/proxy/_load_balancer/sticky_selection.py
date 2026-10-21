@@ -15,6 +15,7 @@ from app.core.balancer import (
     ROUTING_POLICY_PRESERVE,
     TRAFFIC_CLASS_FOREGROUND,
     AccountState,
+    OwnerFailureReason,
     ResetPreferenceWindow,
     RoutingCostsByAccount,
     RoutingStrategy,
@@ -374,6 +375,7 @@ class StickySelectionOutcome(Generic[SelectionInputsT]):
     # owner is one of the caller's own ``exclude_account_ids``
     # (``_hard_affinity_owner_excluded_by_caller``).
     hard_affinity_owner_excluded: bool = False
+    owner_failure_reason: OwnerFailureReason = OwnerFailureReason.UNKNOWN
 
 
 def _hard_affinity_owner_excluded_by_caller(
@@ -458,6 +460,7 @@ async def run_sticky_selection_path(
     error_message: str | None = None
     selection_error_code: str | None = None
     selection_resets_at: int | None = None
+    owner_failure_reason = OwnerFailureReason.UNKNOWN
 
     def _direct_error(
         *,
@@ -498,6 +501,7 @@ async def run_sticky_selection_path(
     suppress_recovery_probe_candidates = False
     pending_initial_owner_lookup = request.initial_sticky_owner_lookup
     while True:
+        owner_failure_reason = OwnerFailureReason.UNKNOWN
         attempt += 1
         sticky_existing_is_legacy = isinstance(legacy_existing_account_id, str)
         if sticky_kind is not None:
@@ -806,15 +810,45 @@ async def run_sticky_selection_path(
             # denial. Sticky DB work, mapping mutation, and probe
             # reservation are all skipped so mappings are preserved.
             selection_error_code = API_KEY_STREAM_FAIR_SHARE_ERROR_CODE
-            result = SelectionResult(None, fair_share_denial_message(fair_share_denial))
+            result = SelectionResult(
+                None,
+                fair_share_denial_message(fair_share_denial),
+                owner_failure_reason=_required_owner_contention_reason(
+                    states,
+                    owner_account_id=sticky_existing_account_id if hard_sticky else required_account_id,
+                    selection_inputs=selection_inputs,
+                    traffic_class=traffic_class,
+                    now=owner._clock.time(),
+                ),
+            )
         elif hard_sticky and not selection_states:
             selection_error_code = "hard_affinity_saturated"
             selection_resets_at = None
-            result = SelectionResult(None, "Hard affinity owner account is unavailable")
+            result = SelectionResult(
+                None,
+                "Hard affinity owner account is unavailable",
+                owner_failure_reason=_required_owner_contention_reason(
+                    states,
+                    owner_account_id=sticky_existing_account_id,
+                    selection_inputs=selection_inputs,
+                    traffic_class=traffic_class,
+                    now=owner._clock.time(),
+                ),
+            )
         elif not selection_states and states:
             selection_error_code = _account_cap_error_code(lease_kind)
             selection_resets_at = None
-            result = SelectionResult(None, _account_cap_error_message(lease_kind, caps))
+            result = SelectionResult(
+                None,
+                _account_cap_error_message(lease_kind, caps),
+                owner_failure_reason=_required_owner_contention_reason(
+                    states,
+                    owner_account_id=required_account_id,
+                    selection_inputs=selection_inputs,
+                    traffic_class=traffic_class,
+                    now=owner._clock.time(),
+                ),
+            )
             logger.warning(
                 "Account cap exhausted during sticky selection lease_kind=%s reason=%s candidates=%s",
                 lease_kind,
@@ -843,10 +877,11 @@ async def run_sticky_selection_path(
             )
             if result.account is None:
                 selection_error_code = "hard_affinity_saturated"
-                selection_resets_at = None
-                result = SelectionResult(
-                    None,
-                    result.error_message or "Hard affinity owner account is unavailable",
+                selection_resets_at = result.resets_at
+                result = replace(
+                    result,
+                    error_code=None,
+                    error_message=result.error_message or "Hard affinity owner account is unavailable",
                 )
             else:
                 selection_error_code = None
@@ -969,6 +1004,7 @@ async def run_sticky_selection_path(
                 error_message = result.error_message
                 selection_error_code = result.error_code or selection_error_code
                 selection_resets_at = result.resets_at or selection_resets_at
+                owner_failure_reason = result.owner_failure_reason
             elif probe_reservation_invalidated:
                 selected = None
             else:
@@ -996,6 +1032,7 @@ async def run_sticky_selection_path(
                 ):
                     selection_error_code = _account_cap_error_code(lease_kind)
                     error_message = _account_cap_error_message(lease_kind, caps)
+                    owner_failure_reason = OwnerFailureReason.LOCAL_CONTENTION
                 elif (
                     lease_kind is not None
                     and (
@@ -1016,6 +1053,7 @@ async def run_sticky_selection_path(
                     # could otherwise overshoot the share.
                     selection_error_code = API_KEY_STREAM_FAIR_SHARE_ERROR_CODE
                     error_message = fair_share_denial_message(fair_share_recheck)
+                    owner_failure_reason = OwnerFailureReason.LOCAL_CONTENTION
                 else:
                     selection_admitted = True
                     if lease_kind is not None:
@@ -1345,6 +1383,7 @@ async def run_sticky_selection_path(
         error_message=error_message,
         error_code=selection_error_code,
         resets_at=selection_resets_at,
+        owner_failure_reason=owner_failure_reason,
         hard_affinity_owner_excluded=_hard_affinity_owner_excluded_by_caller(
             error_code=selection_error_code,
             owner_account_id=sticky_existing_account_id,
@@ -1918,6 +1957,38 @@ def _pool_has_available_account_without_backoff(
         traffic_class=traffic_class,
     )
     return result.account is not None
+
+
+def _required_owner_contention_reason(
+    states: Iterable[AccountState],
+    *,
+    owner_account_id: str | None | object,
+    selection_inputs: SelectionInputsProtocol,
+    traffic_class: TrafficClass,
+    now: float,
+) -> OwnerFailureReason:
+    """A capacity denial earns a wait only after this exact owner passes eligibility."""
+    if not isinstance(owner_account_id, str):
+        return OwnerFailureReason.UNKNOWN
+    owner_states = [replace(state) for state in states if state.account_id == owner_account_id]
+    if not owner_states:
+        # Paused/deactivated accounts are removed before state construction.
+        # Only their explicit status in the eligible owner pool is evidence;
+        # absence of another state never proves local contention.
+        for account in selection_inputs.effective_continuity_owner_candidates:
+            if account.id == owner_account_id and account.status in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED):
+                owner_states = [AccountState(account.id, account.status)]
+                break
+    if len(owner_states) != 1:
+        return OwnerFailureReason.UNKNOWN
+    result = select_account(
+        owner_states,
+        now=now,
+        allow_backoff_fallback=False,
+        traffic_class=traffic_class,
+        allow_usage_exhaustion_error=False,
+    )
+    return OwnerFailureReason.LOCAL_CONTENTION if result.account is not None else result.owner_failure_reason
 
 
 def _account_cap_error_code(lease_kind: AccountLeaseKind | None) -> str | None:

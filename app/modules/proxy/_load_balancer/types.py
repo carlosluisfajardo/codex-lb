@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from app.core.balancer import OwnerFailureReason
+from app.db.models import Account
+from app.modules.proxy._load_balancer.model_eligibility import CatalogOmissionQuotaAdmission
+
 AccountLeaseKind = Literal["response_create", "stream"]
 
 MAX_SELECTION_ATTEMPTS = 4
@@ -94,3 +98,19 @@ class AccountConcurrencyCaps:
     configured_response_create_limit: int | None = None
     configured_stream_limit: int | None = None
     replica_count: int = 1
+
+
+@dataclass
+class AccountSelection:
+    account: Account | None
+    error_message: str | None
+    error_code: str | None = None
+    resets_at: int | None = None
+    lease: AccountLease | None = None
+    catalog_omission_quota_admission: CatalogOmissionQuotaAdmission | None = None
+    continuity_owner_no_longer_exists: bool = False
+    # ``hard_affinity_saturated`` whose resolved owner is one of the caller's
+    # own ``exclude_account_ids``: the wait a transient owner outage earns
+    # cannot clear this one (``_hard_affinity_owner_excluded_by_caller``).
+    hard_affinity_owner_excluded: bool = False
+    owner_failure_reason: OwnerFailureReason = OwnerFailureReason.UNKNOWN

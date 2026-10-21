@@ -23,6 +23,7 @@ from app.core.balancer import (
     TRAFFIC_CLASS_FOREGROUND,
     TRAFFIC_CLASS_OPPORTUNISTIC,
     AccountState,
+    OwnerFailureReason,
     ResetPreferenceWindow,
     RoutingCostsByAccount,
     RoutingStrategy,
@@ -72,7 +73,7 @@ from app.modules.proxy._load_balancer.error_rate import (
 from app.modules.proxy._load_balancer.latency_cohort import apply_latency_cohort_weights
 from app.modules.proxy._load_balancer.model_eligibility import (
     _ADDITIONAL_QUOTA_EXEMPT_PLAN_TYPES,
-    CatalogOmissionQuotaAdmission,
+    CatalogOmissionQuotaAdmission,  # noqa: F401 -- compatibility import
     _additional_quota_applies_to_plan,  # noqa: F401
     _additional_quota_eligibility,
     _additional_usage_is_exhausted,  # noqa: F401
@@ -146,6 +147,9 @@ from app.modules.proxy._load_balancer.types import (
     ProbeReservation,
     RuntimeState,
 )
+from app.modules.proxy._load_balancer.types import (
+    AccountSelection as AccountSelection,
+)
 from app.modules.proxy._load_balancer.unbound_selection import (
     UnboundSelectionRequest,
     run_unbound_selection_path,
@@ -210,21 +214,6 @@ class _NormalizedUsageInputs:
     effective_secondary_entry: _UsageWindowEntry | None
     secondary_used: float | None
     secondary_reset: int | None
-
-
-@dataclass
-class AccountSelection:
-    account: Account | None
-    error_message: str | None
-    error_code: str | None = None
-    resets_at: int | None = None
-    lease: AccountLease | None = None
-    catalog_omission_quota_admission: CatalogOmissionQuotaAdmission | None = None
-    continuity_owner_no_longer_exists: bool = False
-    # ``hard_affinity_saturated`` whose resolved owner is one of the caller's
-    # own ``exclude_account_ids``: the wait a transient owner outage earns
-    # cannot clear this one (``_hard_affinity_owner_excluded_by_caller``).
-    hard_affinity_owner_excluded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -772,6 +761,11 @@ class LoadBalancer:
                 error_message=selection_inputs.error_message,
                 error_code=selection_inputs.error_code,
                 continuity_owner_no_longer_exists=selection_inputs.error_code == CONTINUITY_OWNER_UNAVAILABLE,
+                owner_failure_reason=(
+                    OwnerFailureReason.ABSENT
+                    if selection_inputs.error_code == CONTINUITY_OWNER_UNAVAILABLE
+                    else OwnerFailureReason.POLICY
+                ),
             )
 
         selected_snapshot: Account | None = None
@@ -779,6 +773,7 @@ class LoadBalancer:
         selected_lease: AccountLease | None = None
         selection_error_code: str | None = None
         selection_resets_at: int | None = None
+        owner_failure_reason = OwnerFailureReason.UNKNOWN
         legacy_existing_account_id: str | None = None
         legacy_abandoned_account_id: str | None = None
         sticky_seed_account_id: str | None = None
@@ -910,6 +905,7 @@ class LoadBalancer:
             error_message = unbound_outcome.error_message
             selection_error_code = unbound_outcome.error_code
             selection_resets_at = unbound_outcome.resets_at
+            owner_failure_reason = unbound_outcome.owner_failure_reason
             if unbound_outcome.disposition == "direct_error":
                 return AccountSelection(
                     account=None,
@@ -988,6 +984,7 @@ class LoadBalancer:
             error_message = sticky_outcome.error_message
             selection_error_code = sticky_outcome.error_code
             selection_resets_at = sticky_outcome.resets_at
+            owner_failure_reason = sticky_outcome.owner_failure_reason
             hard_affinity_owner_excluded = sticky_outcome.hard_affinity_owner_excluded
             if sticky_outcome.disposition == "direct_error":
                 return AccountSelection(
@@ -1017,6 +1014,7 @@ class LoadBalancer:
                     account=None,
                     error_message=error_message,
                     error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
+                    owner_failure_reason=owner_failure_reason,
                 )
             if required_continuity_owner and selection_error_code is None:
                 selection_error_code = CONTINUITY_OWNER_UNAVAILABLE
@@ -1025,6 +1023,7 @@ class LoadBalancer:
                     account=None,
                     error_message=error_message,
                     error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
+                    owner_failure_reason=owner_failure_reason,
                 )
             if error_message == "No available accounts" and not owner_restricted_selection:
                 set_degraded("all upstream accounts are unavailable")
@@ -1041,6 +1040,9 @@ class LoadBalancer:
                 error_code=selection_error_code,
                 resets_at=selection_resets_at,
                 hard_affinity_owner_excluded=hard_affinity_owner_excluded,
+                owner_failure_reason=(
+                    OwnerFailureReason.EXCLUDED if hard_affinity_owner_excluded else owner_failure_reason
+                ),
             )
         if not circuit_breaker_open:
             set_normal()
