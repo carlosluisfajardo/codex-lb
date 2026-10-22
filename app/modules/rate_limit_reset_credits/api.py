@@ -4,7 +4,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -49,12 +49,14 @@ from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.schemas import AccountUsageResetConsumeRequest
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.rate_limit_reset_credits.redeem_coordination import (
+    RedeemClaimLostError,
     RedeemClaimTimeoutError,
     acquire_redeem_claim,
     get_pinned_redeem_credit_id,
     new_redeem_claim_holder_id,
     pin_redeem_request,
     release_redeem_claim,
+    renew_redeem_claim,
     renew_redeem_claim_periodically,
 )
 from app.modules.rate_limit_reset_credits.store import (
@@ -178,6 +180,8 @@ async def consume_rate_limit_reset_credit(
             refresh_usage=_build_refresh_usage_callback(context),
             resolve_route=_resolve_reset_credit_route,
             redeem_request_id=payload.redeem_request_id if payload is not None else None,
+            expected_credit_id=payload.expected_credit_id if payload is not None else None,
+            expected_credit_expires_at=payload.expected_credit_expires_at if payload is not None else None,
         )
     except RefreshError as exc:
         if exc.is_permanent:
@@ -229,7 +233,7 @@ async def _redeem_soonest_reset_credit(
     effective_consume_fn = consume_fn or consume_reset_credit
 
     try:
-        async with serialize_reset_credit_redeem(account.id, session=lock_session):
+        async with serialize_reset_credit_redeem(account.id, session=lock_session) as assert_claim_owned:
             return await _redeem_soonest_reset_credit_locked(
                 account=account,
                 store=store,
@@ -243,7 +247,13 @@ async def _redeem_soonest_reset_credit(
                 skip_if_redeem_request_pinned=skip_if_redeem_request_pinned,
                 expected_credit_id=expected_credit_id,
                 expected_credit_expires_at=expected_credit_expires_at,
+                assert_claim_owned=assert_claim_owned,
             )
+    except RedeemClaimLostError as exc:
+        raise DashboardConflictError(
+            "Reset credit redemption lost its claim; retain the request ID to reconcile any in-flight consume",
+            code="reset_credit_redeem_claim_lost",
+        ) from exc
     except RedeemClaimTimeoutError as exc:
         raise DashboardConflictError(
             "Another reset credit redemption is already in progress for this account",
@@ -276,22 +286,35 @@ async def serialize_reset_credit_redeem(
             # live holders keep the lease renewed via a heartbeat task so a
             # legitimately slow redemption is not taken over mid-section.
             holder_id = new_redeem_claim_holder_id()
-            await acquire_redeem_claim(account_id, holder_id)
-            heartbeat = asyncio.create_task(
-                renew_redeem_claim_periodically(account_id, holder_id),
-                name=f"reset-credit-redeem-claim-heartbeat:{account_id}",
-            )
+
+            async def assert_claim_owned() -> None:
+                try:
+                    owned = await renew_redeem_claim(account_id, holder_id)
+                except Exception as exc:
+                    raise RedeemClaimLostError("Reset-credit consume admission could not establish ownership") from exc
+                if not owned:
+                    raise RedeemClaimLostError("Reset-credit consume admission lost its claim")
+
             try:
-                yield
+                await acquire_redeem_claim(account_id, holder_id)
+                try:
+                    async with asyncio.TaskGroup() as tasks:
+                        heartbeat = tasks.create_task(
+                            renew_redeem_claim_periodically(account_id, holder_id),
+                            name=f"reset-credit-redeem-claim-heartbeat:{account_id}",
+                        )
+                        try:
+                            yield assert_claim_owned
+                        finally:
+                            heartbeat.cancel()
+                except ExceptionGroup as failures:
+                    # Keep the existing single-body domain exception surface.
+                    # Multiple simultaneous failures remain explicitly grouped.
+                    if len(failures.exceptions) == 1:
+                        raise failures.exceptions[0] from failures
+                    raise
             finally:
-
-                async def cleanup_redeem_claim() -> None:
-                    heartbeat.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await heartbeat
-                    await release_redeem_claim(account_id, holder_id)
-
-                cancellation = await _await_cleanup_deferring_cancellation(cleanup_redeem_claim())
+                cancellation = await _await_cleanup_deferring_cancellation(release_redeem_claim(account_id, holder_id))
                 if cancellation is not None:
                     raise cancellation
             return
@@ -324,6 +347,7 @@ async def _redeem_soonest_reset_credit_locked(
     skip_if_redeem_request_pinned: bool,
     expected_credit_id: str | None,
     expected_credit_expires_at: datetime | None,
+    assert_claim_owned: Callable[[], Awaitable[None]] | None = None,
 ) -> _RedeemResetCreditOutcome:
     redeem_account = account
     if auth_manager is not None:
@@ -396,6 +420,14 @@ async def _redeem_soonest_reset_credit_locked(
         # leaves a durable pin any replica can reuse.
         credit_id = await pin_redeem_request(account.id, redeem_request_id, credit.id)
 
+    pinned_credit = next((item for item in credits_response.credits if item.id == credit_id), None)
+    if (expected_credit_id is not None and expected_credit_id != credit_id) or (
+        expected_credit_expires_at is not None
+        and (pinned_credit is None or not _same_credit_expiry(pinned_credit.expires_at, expected_credit_expires_at))
+    ):
+        raise DashboardConflictError("Target reset credit changed", code="target_reset_credit_changed")
+    if assert_claim_owned is not None:
+        await assert_claim_owned()
     try:
         result = await effective_consume_fn(
             access_token,

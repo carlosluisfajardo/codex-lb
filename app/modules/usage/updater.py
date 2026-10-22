@@ -132,9 +132,37 @@ class AccountsRepositoryWithStatusComparePort(AccountsRepositoryPort, Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class UsageRefreshReceipt:
+    window: str
+    reset_at: int | None
+    recorded_at: datetime
+    usage_id: int
+
+
+@dataclass(frozen=True, slots=True)
 class AccountRefreshResult:
     usage_written: bool
     fetch_succeeded: bool = True
+    receipts: tuple[UsageRefreshReceipt, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _UsageRequestState:
+    status: AccountStatus
+    reason: str | None
+    reset_at: int | None
+    blocked_at: int | None
+    refresh_token_encrypted: bytes
+
+    @classmethod
+    def capture(cls, account: Account) -> _UsageRequestState:
+        return cls(
+            account.status,
+            account.deactivation_reason,
+            account.reset_at,
+            account.blocked_at,
+            account.refresh_token_encrypted,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,7 +442,7 @@ class UsageUpdater:
         access_token_override: str | None = None,
     ) -> AccountRefreshResult:
         """Refresh one account and expose whether the upstream fetch completed."""
-        if account.status in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
+        if account.status == AccountStatus.DEACTIVATED:
             return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
         try:
             result = await _USAGE_REFRESH_SINGLEFLIGHT.run(
@@ -592,6 +620,7 @@ class UsageUpdater:
         usage_account_id: str | None,
         access_token_override: str | None = None,
     ) -> AccountRefreshResult:
+        failure_state = _UsageRequestState.capture(account)
         access_token = access_token_override or self._encryptor.decrypt(account.access_token_encrypted)
         payload: UsagePayload | None = None
         try:
@@ -612,7 +641,7 @@ class UsageUpdater:
             return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
         except UsageFetchError as exc:
             if _should_deactivate_for_usage_error(exc):
-                await self._deactivate_for_client_error(account, exc)
+                await self._deactivate_for_client_error(account, exc, failure_state)
                 return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
             if access_token_override is not None:
                 _mark_usage_refresh_auth_cooldown(account.id, exc.status_code)
@@ -625,6 +654,7 @@ class UsageUpdater:
             except RefreshError:
                 _mark_usage_refresh_auth_cooldown(account.id, exc.status_code)
                 return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
+            failure_state = _UsageRequestState.capture(account)
             access_token = self._encryptor.decrypt(account.access_token_encrypted)
             try:
                 route = await _resolve_upstream_route_for_account(account, operation="usage_refresh")
@@ -644,7 +674,7 @@ class UsageUpdater:
                 return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
             except UsageFetchError as retry_exc:
                 if _should_deactivate_for_usage_error(retry_exc):
-                    await self._deactivate_for_client_error(account, retry_exc)
+                    await self._deactivate_for_client_error(account, retry_exc, failure_state)
                 else:
                     _mark_usage_refresh_auth_cooldown(account.id, retry_exc.status_code)
                 return AccountRefreshResult(usage_written=False, fetch_succeeded=False)
@@ -765,12 +795,16 @@ class UsageUpdater:
             )
 
         if secondary and secondary.used_percent is not None:
+            carries_credits = not any(window and window.used_percent is not None for window in (primary, monthly))
             snapshot_windows.append(
                 UsageWindowWrite(
                     window="secondary",
                     used_percent=float(secondary.used_percent),
                     reset_at=_reset_at(secondary.reset_at, secondary.reset_after_seconds, now_epoch),
                     window_minutes=_window_minutes(secondary.limit_window_seconds),
+                    credits_has=credits_has if carries_credits else None,
+                    credits_unlimited=credits_unlimited if carries_credits else None,
+                    credits_balance=credits_balance if carries_credits else None,
                 )
             )
 
@@ -792,10 +826,18 @@ class UsageUpdater:
             snapshot_windows,
         )
         usage_written = any(_usage_entry_written(entry) for entry in entries)
-        await self._recover_quota_status_from_usage(account, primary=primary, secondary=secondary, monthly=monthly)
-        return AccountRefreshResult(usage_written=usage_written)
+        if not account.routing_held:
+            await self._recover_quota_status_from_usage(account, primary=primary, secondary=secondary, monthly=monthly)
+        receipts = tuple(
+            UsageRefreshReceipt(entry.window or "primary", entry.reset_at, entry.recorded_at, entry.id)
+            for entry in entries
+            if isinstance(entry, UsageHistory) and entry.id is not None
+        )
+        return AccountRefreshResult(usage_written=usage_written, receipts=receipts)
 
-    async def _deactivate_for_client_error(self, account: Account, exc: UsageFetchError) -> None:
+    async def _deactivate_for_client_error(
+        self, account: Account, exc: UsageFetchError, failure_state: _UsageRequestState
+    ) -> None:
         if not self._auth_manager:
             return
         reason = f"Usage API error: HTTP {exc.status_code} - {exc.message}"
@@ -804,6 +846,19 @@ class UsageUpdater:
             if exc.code in PERMANENT_FAILURE_CODES
             else AccountStatus.DEACTIVATED
         )
+        repository = cast(AccountsRepositoryWithStatusComparePort, self._auth_manager._repo)
+        changed = await repository.update_status_if_current(
+            account.id,
+            status,
+            reason,
+            expected_status=failure_state.status,
+            expected_deactivation_reason=failure_state.reason,
+            expected_reset_at=failure_state.reset_at,
+            expected_blocked_at=failure_state.blocked_at,
+            expected_refresh_token_encrypted=failure_state.refresh_token_encrypted,
+        )
+        if not changed:
+            return
         logger.warning(
             "Marking account unavailable due to client error account_id=%s account_status=%s status=%s "
             "message=%s request_id=%s",
@@ -813,7 +868,6 @@ class UsageUpdater:
             exc.message,
             get_request_id(),
         )
-        await self._auth_manager._repo.update_status(account.id, status, reason)
         account.status = status
         account.deactivation_reason = reason
         if status == AccountStatus.DEACTIVATED:
@@ -967,6 +1021,8 @@ class UsageUpdater:
         account.workspace_label = stored.workspace_label
         account.seat_type = stored.seat_type
         account.plan_type = stored.plan_type
+        account.routing_policy = stored.routing_policy
+        account.routing_held = stored.routing_held
         account.access_token_encrypted = stored.access_token_encrypted
         account.refresh_token_encrypted = stored.refresh_token_encrypted
         account.id_token_encrypted = stored.id_token_encrypted

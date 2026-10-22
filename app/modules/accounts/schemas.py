@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List
+from typing import List, Literal
 
 from pydantic import Field, PrivateAttr, field_validator
 
@@ -90,6 +90,7 @@ class AccountSummary(DashboardModel):
     seat_type: str | None = None
     plan_type: str
     routing_policy: str = Field(default="normal", pattern=r"^(normal|burn_first|preserve)$")
+    routing_held: bool = False
     status: str
     security_work_authorized: bool = False
     usage: AccountUsage | None = None
@@ -188,7 +189,44 @@ class AccountLimitWarmupUpdateResponse(DashboardModel):
     enabled: bool
 
 
-class AccountRoutingPolicyUpdateRequest(DashboardModel):
+class AccountRoutingExpectation(DashboardModel):
+    status: Literal["active", "paused", "reauth_required", "rate_limited", "quota_exceeded", "deactivated"]
+    routing_policy: Literal["normal", "burn_first", "preserve"]
+    routing_held: bool
+
+
+class AccountStateUpdateRequest(DashboardModel):
+    expected: AccountRoutingExpectation | None = None
+
+
+class AccountRoutingHoldRequest(DashboardModel):
+    held: bool
+    expected: AccountRoutingExpectation
+
+
+class AccountRoutingStateResponse(DashboardModel):
+    account_id: str
+    status: str
+    routing_policy: str
+    routing_held: bool
+
+
+class AccountUsageRefreshRequest(DashboardModel):
+    window: Literal["primary", "secondary", "monthly"]
+    expected_reset_at: int
+    expected: AccountRoutingExpectation
+
+
+class AccountUsageRefreshResponse(AccountRoutingStateResponse):
+    refreshed: bool
+    fetch_succeeded: bool
+    usage_id: int | None = None
+    recorded_at: datetime | None = None
+    window: str
+    reset_at: int | None = None
+
+
+class AccountRoutingPolicyUpdateRequest(AccountStateUpdateRequest):
     routing_policy: str = Field(pattern=r"^(normal|burn_first|preserve)$")
 
 
@@ -229,6 +267,8 @@ class AccountProbeResponse(DashboardModel):
 
 class AccountUsageResetConsumeRequest(DashboardModel):
     redeem_request_id: str | None = None
+    expected_credit_id: str | None = Field(default=None, min_length=1)
+    expected_credit_expires_at: datetime | None = None
 
     @field_validator("redeem_request_id")
     @classmethod

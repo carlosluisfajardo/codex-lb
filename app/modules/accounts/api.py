@@ -37,12 +37,17 @@ from app.modules.accounts.schemas import (
     AccountProbeRequest,
     AccountProbeResponse,
     AccountReactivateResponse,
+    AccountRoutingHoldRequest,
     AccountRoutingPolicyUpdateRequest,
     AccountRoutingPolicyUpdateResponse,
+    AccountRoutingStateResponse,
     AccountsResponse,
+    AccountStateUpdateRequest,
     AccountTrendsResponse,
     AccountUpdateRequest,
     AccountUpdateResponse,
+    AccountUsageRefreshRequest,
+    AccountUsageRefreshResponse,
     AccountUsageResetConsumeRequest,
     AccountUsageResetConsumeResponse,
     AccountUsageResetCreditsResponse,
@@ -249,11 +254,12 @@ async def import_account(
 @router.post("/{account_id}/reactivate", response_model=AccountReactivateResponse)
 async def reactivate_account(
     account_id: str,
+    payload: AccountStateUpdateRequest | None = None,
     _write_access=Depends(require_dashboard_permission(Permission.ACCOUNTS_WRITE)),
     context: AccountsContext = Depends(get_accounts_context),
 ) -> AccountReactivateResponse:
     try:
-        success = await context.service.reactivate_account(account_id)
+        success = await context.service.reactivate_account(account_id, payload.expected if payload else None)
     except AccountStateTransitionError as exc:
         raise DashboardConflictError(str(exc), code="account_state_transition_invalid") from exc
     if not success:
@@ -348,11 +354,12 @@ async def probe_account(
 @router.post("/{account_id}/pause", response_model=AccountPauseResponse)
 async def pause_account(
     account_id: str,
+    payload: AccountStateUpdateRequest | None = None,
     _write_access=Depends(require_dashboard_permission(Permission.ACCOUNTS_WRITE)),
     context: AccountsContext = Depends(get_accounts_context),
 ) -> AccountPauseResponse:
     try:
-        success = await context.service.pause_account(account_id)
+        success = await context.service.pause_account(account_id, payload.expected if payload else None)
     except AccountStateTransitionError as exc:
         raise DashboardConflictError(str(exc), code="account_state_transition_invalid") from exc
     if not success:
@@ -399,10 +406,45 @@ async def update_account_routing_policy(
     _write_access=Depends(require_dashboard_permission(Permission.ACCOUNTS_WRITE)),
     context: AccountsContext = Depends(get_accounts_context),
 ) -> AccountRoutingPolicyUpdateResponse:
-    success = await context.service.set_routing_policy(account_id, payload.routing_policy)
+    try:
+        success = await context.service.set_routing_policy(account_id, payload.routing_policy, payload.expected)
+    except AccountStateTransitionError as exc:
+        raise DashboardConflictError(str(exc), code="account_state_transition_invalid") from exc
     if not success:
         raise DashboardNotFoundError("Account not found", code="account_not_found")
     return AccountRoutingPolicyUpdateResponse(account_id=account_id, routing_policy=payload.routing_policy)
+
+
+@router.put("/{account_id}/routing-hold", response_model=AccountRoutingStateResponse)
+async def update_account_routing_hold(
+    account_id: str,
+    payload: AccountRoutingHoldRequest,
+    _write_access=Depends(require_dashboard_permission(Permission.ACCOUNTS_WRITE)),
+    context: AccountsContext = Depends(get_accounts_context),
+) -> AccountRoutingStateResponse:
+    try:
+        result = await context.service.set_routing_hold(account_id, payload.held, payload.expected)
+    except AccountStateTransitionError as exc:
+        raise DashboardConflictError(str(exc), code="account_state_transition_invalid") from exc
+    if result is None:
+        raise DashboardNotFoundError("Account not found", code="account_not_found")
+    return result
+
+
+@router.post("/{account_id}/usage-refresh", response_model=AccountUsageRefreshResponse)
+async def refresh_account_usage_window(
+    account_id: str,
+    payload: AccountUsageRefreshRequest,
+    _write_access=Depends(require_dashboard_permission(Permission.ACCOUNTS_WRITE)),
+    context: AccountsContext = Depends(get_accounts_context),
+) -> AccountUsageRefreshResponse:
+    try:
+        result = await context.service.refresh_usage_window(account_id, payload)
+    except AccountStateTransitionError as exc:
+        raise DashboardConflictError(str(exc), code="account_state_transition_invalid") from exc
+    if result is None:
+        raise DashboardNotFoundError("Account not found", code="account_not_found")
+    return result
 
 
 @router.delete("/{account_id}", response_model=AccountDeleteResponse)

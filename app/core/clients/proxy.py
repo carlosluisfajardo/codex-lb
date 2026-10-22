@@ -39,6 +39,7 @@ from aiohttp.client_ws import DEFAULT_WS_CLIENT_TIMEOUT, WebSocketDataQueue
 from aiohttp.http_websocket import WS_KEY, WebSocketReader, WebSocketWriter
 from multidict import CIMultiDict
 
+from app.core.auth.cookies import without_dashboard_auth_cookies
 from app.core.clients.codex import (
     CodexClient,
     CodexTransportError,
@@ -736,7 +737,16 @@ def _should_drop_inbound_header(name: str) -> bool:
 
 
 def filter_inbound_headers(headers: Mapping[str, str]) -> dict[str, str]:
-    return {key: value for key, value in headers.items() if not _should_drop_inbound_header(key)}
+    filtered: dict[str, str] = {}
+    for key, value in headers.items():
+        if _should_drop_inbound_header(key):
+            continue
+        if key.lower() == "cookie":
+            value = without_dashboard_auth_cookies(value)
+            if not value:
+                continue
+        filtered[key] = value
+    return filtered
 
 
 def _rewrite_turn_metadata_installation_id(value: JsonValue, codex_installation_id: str | None) -> JsonValue:
@@ -995,6 +1005,10 @@ def _build_upstream_headers(
                 if account_id and not any(existing.lower() == lowered for existing in headers):
                     headers[key] = account_id
             elif not _should_drop_inbound_header(key):
+                if lowered == "cookie":
+                    value = without_dashboard_auth_cookies(value)
+                    if not value:
+                        continue
                 headers[key] = value
     else:
         headers = {

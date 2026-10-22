@@ -431,6 +431,58 @@ async def test_codex_control_request_uses_codex_client_when_route_is_resolved(ro
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("transport", ["control", "http", "websocket"])
+async def test_prepared_transport_excludes_local_dashboard_cookies(
+    route: ResolvedUpstreamRoute, native: bool, transport: str
+) -> None:
+    headers = {
+        "Cookie": (
+            "ordinary=keep; codex_lb_dashboard_session=local-session; codex_lb_step_up=local-step; other=also-keep"
+        ),
+        "User-Agent": "codex_exec/0.151.0" if native else "OpenAI/Python 2.24.0",
+        "x-codex-turn-state": "keep-turn-state",
+    }
+    if transport == "control":
+        client = _CodexClient()
+        result = await codex_control_request(
+            "agent-identities/jwks",
+            method="GET",
+            payload=None,
+            query_params={},
+            headers=headers,
+            access_token="selected-token",
+            account_id="selected-account",
+            route=route,
+            codex_client=cast(Any, client),
+        )
+        assert result.status_code == 200
+        assert client.calls[0]["url"].endswith("/codex/agent-identities/jwks")
+    else:
+        client = _WsCodexClient() if transport == "websocket" else _CodexClient(_StreamResponse())
+        events = [
+            event
+            async for event in stream_responses(
+                ResponsesRequest(model="gpt-5.2", instructions="Reply.", input="hello", stream=True),
+                headers,
+                "selected-token",
+                "selected-account",
+                route=route,
+                codex_client=cast(Any, client),
+                upstream_stream_transport_override=transport,
+                session=cast(Any, object()),
+            )
+        ]
+        assert events
+    assert len(client.calls) == 1
+    prepared = {key.lower(): value for key, value in client.calls[0]["headers"].items()}
+    assert prepared["cookie"] == "ordinary=keep; other=also-keep"
+    assert prepared["authorization"] == "Bearer selected-token"
+    assert prepared["chatgpt-account-id"] == "selected-account"
+    assert prepared["x-codex-turn-state"] == "keep-turn-state"
+
+
+@pytest.mark.asyncio
 async def test_compact_responses_uses_codex_client_when_route_is_resolved(route: ResolvedUpstreamRoute) -> None:
     client = _CodexClient(_CompactStreamResponse())
     trace = UpstreamProxyRouteTrace()

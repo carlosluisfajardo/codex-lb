@@ -114,7 +114,10 @@ class RoutingAvailabilityCache:
     def __init__(self, session_factory: Callable[[], AsyncSession] | None = None) -> None:
         self._session_factory = session_factory
         self._snapshot: dict[str, AccountStatus] | None = None
+        self._held_accounts: set[str] = set()
         self._local_marks: set[str] = set()
+        self._refresh_generation = 0
+        self._published_refresh_generation = 0
 
     @property
     def seeded(self) -> bool:
@@ -131,7 +134,7 @@ class RoutingAvailabilityCache:
         _request_account_routing_bump()
 
     def is_unavailable(self, account_id: str) -> bool:
-        if account_id in self._local_marks:
+        if account_id in self._local_marks or account_id in self._held_accounts:
             return True
         snapshot = self._snapshot
         if snapshot is None:
@@ -156,27 +159,44 @@ class RoutingAvailabilityCache:
         namespace version unacknowledged and retries on the next poll cycle, so
         a transient failure cannot make a replica permanently miss a pause,
         deletion, or deactivation.
+
+        A successfully published refresh supersedes older in-flight reads.
+        Starting a later refresh cannot discard a hold endpoint's successful
+        read while that later refresh remains pending or fails. Reset also
+        supersedes every read that started before it.
         """
+        self._refresh_generation += 1
+        generation = self._refresh_generation
         marks_before_refresh = frozenset(self._local_marks)
         factory = self._session_factory or SessionLocal
         session = factory()
         try:
-            result = await session.execute(select(Account.id, Account.status))
-            snapshot: dict[str, AccountStatus] = {account_id: status for account_id, status in result.all()}
+            result = await session.execute(select(Account.id, Account.status, Account.routing_held))
+            rows = result.all()
+            snapshot: dict[str, AccountStatus] = {account_id: status for account_id, status, _held in rows}
+            held_accounts = {account_id for account_id, _status, held in rows if held}
         finally:
             await close_session(session)
+        if generation < self._published_refresh_generation:
+            return
+        self._published_refresh_generation = generation
         self._snapshot = snapshot
+        self._held_accounts = held_accounts
         self._local_marks = {
             account_id
             for account_id in self._local_marks
             if account_id not in marks_before_refresh
+            or account_id in held_accounts
             or (status := snapshot.get(account_id)) is None
             or status in _ROUTING_UNAVAILABLE_STATUSES
         }
 
     def reset(self) -> None:
         """Drop all state (snapshot back to unseeded). Test isolation helper."""
+        self._refresh_generation += 1
+        self._published_refresh_generation = self._refresh_generation
         self._snapshot = None
+        self._held_accounts.clear()
         self._local_marks.clear()
 
 

@@ -19,6 +19,7 @@ from app.modules.sticky_sessions.schemas import (
     StickySessionsDeleteFilteredResponse,
     StickySessionsDeleteRequest,
     StickySessionsDeleteResponse,
+    StickySessionsDeleteSnapshotRequest,
     StickySessionsListResponse,
     StickySessionSortBy,
     StickySessionSortDir,
@@ -42,6 +43,7 @@ async def list_sticky_sessions(
     kind: StickySessionKind | None = Query(default=None),
     stale_only: bool = Query(default=False, alias="staleOnly"),
     account_query: str | None = Query(default=None, alias="accountQuery"),
+    account_id: str | None = Query(default=None, alias="accountId", min_length=1),
     key_query: str | None = Query(default=None, alias="keyQuery"),
     sort_by: StickySessionSortBy = Query(default="updated_at", alias="sortBy"),
     sort_dir: StickySessionSortDir = Query(default="desc", alias="sortDir"),
@@ -53,6 +55,7 @@ async def list_sticky_sessions(
         kind=kind,
         stale_only=stale_only,
         account_query=account_query,
+        account_id=account_id,
         key_query=key_query,
         sort_by=sort_by,
         sort_dir=sort_dir,
@@ -63,6 +66,8 @@ async def list_sticky_sessions(
         entries=[
             StickySessionEntryResponse(
                 key=entry.key,
+                account_id=entry.account_id,
+                ownership_generation=entry.ownership_generation,
                 display_name=entry.display_name,
                 kind=entry.kind,
                 created_at=entry.created_at,
@@ -116,3 +121,19 @@ async def delete_filtered_sticky_sessions(
         key_query=payload.key_query,
     )
     return StickySessionsDeleteFilteredResponse(deleted_count=deleted_count)
+
+
+@router.post("/delete-snapshot", response_model=StickySessionsDeleteResponse)
+async def delete_sticky_session_snapshot(
+    payload: StickySessionsDeleteSnapshotRequest,
+    _write_access=Depends(require_dashboard_write_access),
+    context: StickySessionsContext = Depends(get_sticky_sessions_context),
+) -> StickySessionsDeleteResponse:
+    result = await context.service.delete_snapshot(payload.sessions)
+    return StickySessionsDeleteResponse(
+        deleted_count=result.deleted_count,
+        deleted=[StickySessionIdentifier(key=key, kind=kind) for key, kind in result.deleted],
+        failed=[
+            StickySessionDeleteFailure(key=entry.key, kind=entry.kind, reason=entry.reason) for entry in result.failed
+        ],
+    )

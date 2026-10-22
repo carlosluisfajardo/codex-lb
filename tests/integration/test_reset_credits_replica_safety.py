@@ -17,7 +17,8 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.sql.dml import Update
 
 from app.core.auth import generate_unique_account_id
 from app.core.cache.invalidation import NAMESPACE_RESET_CREDITS, CacheInvalidationPoller
@@ -29,7 +30,9 @@ from app.core.clients.rate_limit_reset_credits import (
 )
 from app.db.models import ResetCreditRedeemClaim, ResetCreditRedeemRequest
 from app.db.session import SessionLocal
+from app.modules.proxy import api as proxy_api
 from app.modules.rate_limit_reset_credits import api as reset_credits_api
+from app.modules.rate_limit_reset_credits import redeem_coordination as coordination
 from app.modules.rate_limit_reset_credits.redeem_coordination import (
     RedeemClaimTimeoutError,
     acquire_redeem_claim,
@@ -125,7 +128,393 @@ async def _noop_refresh(account) -> None:  # noqa: ANN001
     return None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss_detection", ["heartbeat", "consume_fence"])
+@pytest.mark.parametrize("surface", ["dashboard", "v1"])
+async def test_lost_claim_stops_owning_body_before_consume(async_client, monkeypatch, loss_detection, surface):
+    account_id = await _import_account(async_client, email="lost-claim@example.invalid", account_id="lost-claim")
+    credit = _credit("retained-credit")
+    await get_rate_limit_reset_credits_store().set(account_id, _snapshot([credit]))
+    fetch_started, release_fetch = asyncio.Event(), asyncio.Event()
+    renew_allowed, renew_finished = asyncio.Event(), asyncio.Event()
+
+    async def fetch(*args, **kwargs):
+        fetch_started.set()
+        await release_fetch.wait()
+        return _upstream_response([credit])
+
+    async def controlled_heartbeat(account_id, holder_id):
+        await renew_allowed.wait()
+        try:
+            await renew_redeem_claim_periodically(account_id, holder_id, renew_interval_seconds=0)
+        finally:
+            renew_finished.set()
+
+    consumed = AsyncMock(return_value=_success_consume(credit.id))
+    monkeypatch.setattr(reset_credits_api, "fetch_reset_credits", fetch)
+    monkeypatch.setattr(reset_credits_api, "consume_reset_credit", consumed)
+    monkeypatch.setattr(reset_credits_api, "_build_refresh_usage_callback", lambda context: _noop_refresh)
+    monkeypatch.setattr(reset_credits_api, "renew_redeem_claim_periodically", controlled_heartbeat)
+    monkeypatch.setattr(proxy_api, "fetch_reset_credits", fetch)
+    monkeypatch.setattr(proxy_api, "consume_reset_credit", consumed)
+    monkeypatch.setattr(proxy_api, "_refresh_usage_after_v1_reset_credit_redeem", _noop_refresh)
+    authorization = await _create_api_key(async_client, name="claim fixture") if surface == "v1" else None
+    pending = asyncio.create_task(
+        async_client.post(
+            f"/api/accounts/{account_id}/rate-limit-reset-credits/consume"
+            if surface == "dashboard"
+            else "/v1/reset-credit",
+            json={"redeemRequestId": "loss-test"}
+            if surface == "dashboard"
+            else {"account_id": account_id, "redeem_id": credit.id},
+            headers={} if authorization is None else {"Authorization": f"Bearer {authorization}"},
+        )
+    )
+    try:
+        await asyncio.wait_for(fetch_started.wait(), 2)
+        async with SessionLocal() as session:
+            await session.execute(
+                update(ResetCreditRedeemClaim)
+                .where(ResetCreditRedeemClaim.account_id == account_id)
+                .values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
+            )
+            await session.commit()
+        if loss_detection == "heartbeat":
+            assert await try_acquire_redeem_claim(account_id, "successor")
+            renew_allowed.set()
+            await asyncio.wait_for(renew_finished.wait(), 2)
+        release_fetch.set()
+        response = await asyncio.wait_for(pending, 2)
+        consumed.assert_not_awaited()
+        assert response.status_code == 409
+        assert "claim" in response.json()["error"]["message"].lower()
+        async with SessionLocal() as session:
+            retained = await session.get(ResetCreditRedeemClaim, account_id)
+            assert (retained.holder_id if retained is not None else None) == (
+                "successor" if loss_detection == "heartbeat" else None
+            )
+    finally:
+        release_fetch.set()
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await release_redeem_claim(account_id, "successor")
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_claim_commit_before_acquire_return_releases_exact_holder(async_client, monkeypatch):
+    account_id = await _import_account(
+        async_client, email="acquire-cancel@example.invalid", account_id="acquire-cancel"
+    )
+    committed = asyncio.Event()
+    original_close = coordination.close_session
+    first_close = True
+
+    async def delayed_first_close(session):
+        nonlocal first_close
+        await original_close(session)
+        if first_close:
+            first_close = False
+            committed.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(coordination, "close_session", delayed_first_close)
+
+    async def acquire():
+        async with SessionLocal() as session:
+            async with reset_credits_api.serialize_reset_credit_redeem(account_id, session=session):
+                raise AssertionError("cancelled acquisition must not enter body")
+
+    task = asyncio.create_task(acquire())
+    try:
+        await asyncio.wait_for(committed.wait(), 2)
+        task.cancel("after durable claim commit")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        async with SessionLocal() as session:
+            assert await session.get(ResetCreditRedeemClaim, account_id) is None
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expectation", ["id", "expiry"])
+async def test_dashboard_first_consume_cannot_retarget_changed_approval(async_client, monkeypatch, expectation):
+    account_id = await _import_account(
+        async_client, email="approved-reset@example.invalid", account_id="approved-reset"
+    )
+    approved = _credit("approved-a", expires_at="2030-01-01T00:00:00Z")
+    later = _credit("later-b", expires_at="2030-02-01T00:00:00Z")
+    await get_rate_limit_reset_credits_store().set(account_id, _snapshot([approved, later]))
+    monkeypatch.setattr(reset_credits_api, "fetch_reset_credits", AsyncMock(return_value=_upstream_response([later])))
+    consumed = AsyncMock(return_value=_success_consume(later.id))
+    monkeypatch.setattr(reset_credits_api, "consume_reset_credit", consumed)
+    monkeypatch.setattr(reset_credits_api, "_build_refresh_usage_callback", lambda context: _noop_refresh)
+    payload = {"redeemRequestId": "approved-request"}
+    payload["expectedCreditId" if expectation == "id" else "expectedCreditExpiresAt"] = (
+        approved.id if expectation == "id" else "2030-01-01T00:00:00Z"
+    )
+    response = await async_client.post(f"/api/accounts/{account_id}/rate-limit-reset-credits/consume", json=payload)
+    consumed.assert_not_awaited()
+    assert response.status_code == 409
+    assert await get_pinned_redeem_credit_id(account_id, "approved-request") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contradiction", ["id", "expiry"])
+async def test_dashboard_retry_refuses_expectations_that_conflict_with_its_pin(
+    async_client, monkeypatch, contradiction
+):
+    account_id = await _import_account(
+        async_client, email="pinned-approval@example.invalid", account_id="pinned-approval"
+    )
+    approved = _credit("approved-a", expires_at="2030-01-01T00:00:00Z")
+    later = _credit("later-b", expires_at="2030-02-01T00:00:00Z")
+    await pin_redeem_request(account_id, "pinned-request", approved.id)
+    await get_rate_limit_reset_credits_store().set(account_id, _snapshot([approved, later]))
+    monkeypatch.setattr(
+        reset_credits_api, "fetch_reset_credits", AsyncMock(return_value=_upstream_response([approved, later]))
+    )
+    consumed = AsyncMock(return_value=_success_consume(approved.id))
+    monkeypatch.setattr(reset_credits_api, "consume_reset_credit", consumed)
+    monkeypatch.setattr(reset_credits_api, "_build_refresh_usage_callback", lambda context: _noop_refresh)
+    response = await async_client.post(
+        f"/api/accounts/{account_id}/rate-limit-reset-credits/consume",
+        json={
+            "redeemRequestId": "pinned-request",
+            "expectedCreditId": later.id if contradiction == "id" else approved.id,
+            "expectedCreditExpiresAt": "2030-02-01T00:00:00Z" if contradiction == "expiry" else "2030-01-01T00:00:00Z",
+        },
+    )
+    consumed.assert_not_awaited()
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "target_reset_credit_changed"
+    assert await get_pinned_redeem_credit_id(account_id, "pinned-request") == approved.id
+
+
 # --- cross-replica idempotency (durable redeem_request_id -> credit_id ledger) ---
+
+
+@pytest.mark.asyncio
+async def test_first_expected_credit_refuses_a_different_authoritative_pin(async_client, monkeypatch):
+    account_id = await _import_account(async_client, email="pin-race@example.invalid", account_id="pin-race")
+    approved = _credit("approved-a", expires_at="2030-01-01T00:00:00Z")
+    later = _credit("later-b", expires_at="2030-02-01T00:00:00Z")
+    await get_rate_limit_reset_credits_store().set(account_id, _snapshot([approved, later]))
+    monkeypatch.setattr(
+        reset_credits_api, "fetch_reset_credits", AsyncMock(return_value=_upstream_response([approved, later]))
+    )
+    consumed = AsyncMock(return_value=_success_consume(later.id))
+    monkeypatch.setattr(reset_credits_api, "consume_reset_credit", consumed)
+    monkeypatch.setattr(reset_credits_api, "_build_refresh_usage_callback", lambda context: _noop_refresh)
+
+    async def pin_won_elsewhere(account_id, request_id, credit_id):
+        await pin_redeem_request(account_id, request_id, later.id)
+        return await pin_redeem_request(account_id, request_id, credit_id)
+
+    monkeypatch.setattr(reset_credits_api, "pin_redeem_request", pin_won_elsewhere)
+    response = await async_client.post(
+        f"/api/accounts/{account_id}/rate-limit-reset-credits/consume",
+        json={
+            "redeemRequestId": "pin-race-request",
+            "expectedCreditId": approved.id,
+        },
+    )
+    consumed.assert_not_awaited()
+    assert response.status_code == 409 and response.json()["error"]["code"] == "target_reset_credit_changed"
+    assert await get_pinned_redeem_credit_id(account_id, "pin-race-request") == later.id
+
+
+@pytest.mark.asyncio
+async def test_expired_claim_cannot_be_renewed_back_into_ownership(async_client):
+    account_id = await _import_account(async_client, email="expired-renew@example.invalid", account_id="expired-renew")
+    assert await try_acquire_redeem_claim(account_id, "old-holder")
+    async with SessionLocal() as session:
+        await session.execute(
+            update(ResetCreditRedeemClaim)
+            .where(ResetCreditRedeemClaim.account_id == account_id)
+            .values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        await session.commit()
+    assert not await coordination.renew_redeem_claim(account_id, "old-holder")
+    assert await try_acquire_redeem_claim(account_id, "successor")
+    await release_redeem_claim(account_id, "old-holder")
+    async with SessionLocal() as session:
+        row = await session.get(ResetCreditRedeemClaim, account_id)
+        assert row is not None and row.holder_id == "successor"
+    await release_redeem_claim(account_id, "successor")
+
+
+def _gate_claim_update(monkeypatch, *, update_number=1):
+    now = [datetime(2030, 1, 1, tzinfo=UTC)]
+    entered, release = asyncio.Event(), asyncio.Event()
+    updates = 0
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now[0] if tz is not None else now[0].replace(tzinfo=None)
+
+    class DelayedSession:
+        def __init__(self):
+            self.session = SessionLocal()
+
+        def __getattr__(self, name):
+            return getattr(self.session, name)
+
+        async def execute(self, statement, *args, **kwargs):
+            nonlocal updates
+            if isinstance(statement, Update) and statement.table.name == "reset_credit_redeem_claims":
+                updates += 1
+                if updates == update_number:
+                    entered.set()
+                    await release.wait()
+            return await self.session.execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(coordination, "datetime", Clock)
+    monkeypatch.setattr(coordination, "SessionLocal", DelayedSession)
+    return now, entered, release
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("update_number", [1, 2])
+@pytest.mark.parametrize("elapsed_us", [1_999_999, 2_000_000, 3_000_000])
+async def test_renewal_checks_old_expiry_after_awaited_claim_write(
+    async_client, monkeypatch, elapsed_us, update_number
+):
+    account_id = await _import_account(async_client, email="delayed-renew@example.invalid", account_id="delayed-renew")
+    now, entered, release = _gate_claim_update(monkeypatch, update_number=update_number)
+    started_at = now[0]
+    old_expiry = started_at + timedelta(seconds=2)
+    assert await try_acquire_redeem_claim(account_id, "old-holder", lease_seconds=2)
+    pending = asyncio.create_task(coordination.renew_redeem_claim(account_id, "old-holder"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        now[0] += timedelta(microseconds=elapsed_us)
+        release.set()
+        renewed = await asyncio.wait_for(pending, 2)
+        assert renewed is (now[0] < old_expiry), "renewal resurrected a claim that expired while SQL awaited"
+        async with SessionLocal() as session:
+            row = await session.get(ResetCreditRedeemClaim, account_id)
+            assert row is not None and row.holder_id == "old-holder"
+            if renewed:
+                assert row.expires_at.replace(tzinfo=UTC) > old_expiry
+            else:
+                assert row.expires_at.replace(tzinfo=UTC) == old_expiry
+        if renewed:
+            assert not await try_acquire_redeem_claim(account_id, "successor")
+        else:
+            now[0] += timedelta(microseconds=1)
+            assert await try_acquire_redeem_claim(account_id, "successor")
+            assert not await coordination.renew_redeem_claim(account_id, "old-holder")
+            await release_redeem_claim(account_id, "old-holder")
+            async with SessionLocal() as session:
+                row = await session.get(ResetCreditRedeemClaim, account_id)
+                assert row is not None and row.holder_id == "successor"
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["dashboard", "v1"])
+async def test_delayed_claim_renewal_refuses_consume_admission(async_client, monkeypatch, surface):
+    account_id = await _import_account(
+        async_client, email="delayed-consume@example.invalid", account_id="delayed-consume"
+    )
+    credit = _credit("retained-credit", expires_at="2031-01-01T00:00:00Z")
+    await get_rate_limit_reset_credits_store().set(account_id, _snapshot([credit]))
+    authorization = await _create_api_key(async_client, name="delayed claim fixture") if surface == "v1" else None
+    now, entered, release = _gate_claim_update(monkeypatch)
+    monkeypatch.setattr(reset_credits_api, "acquire_redeem_claim", partial(acquire_redeem_claim, lease_seconds=2))
+
+    async def idle_heartbeat(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    consumed = AsyncMock(return_value=_success_consume(credit.id))
+    monkeypatch.setattr(reset_credits_api, "renew_redeem_claim_periodically", idle_heartbeat)
+    for module in (reset_credits_api, proxy_api):
+        monkeypatch.setattr(module, "fetch_reset_credits", AsyncMock(return_value=_upstream_response([credit])))
+        monkeypatch.setattr(module, "consume_reset_credit", consumed)
+    monkeypatch.setattr(reset_credits_api, "_build_refresh_usage_callback", lambda context: _noop_refresh)
+    monkeypatch.setattr(proxy_api, "_refresh_usage_after_v1_reset_credit_redeem", _noop_refresh)
+    pending = asyncio.create_task(
+        async_client.post(
+            f"/api/accounts/{account_id}/rate-limit-reset-credits/consume"
+            if surface == "dashboard"
+            else "/v1/reset-credit",
+            json={"redeemRequestId": "delayed-request"}
+            if surface == "dashboard"
+            else {"account_id": account_id, "redeem_id": credit.id},
+            headers={} if authorization is None else {"Authorization": f"Bearer {authorization}"},
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        now[0] += timedelta(seconds=3)
+        release.set()
+        response = await asyncio.wait_for(pending, 2)
+        consumed.assert_not_awaited()
+        assert response.status_code == 409, response.text
+        assert "claim" in response.json()["error"]["message"].lower()
+        if surface == "dashboard":
+            assert await get_pinned_redeem_credit_id(account_id, "delayed-request") == credit.id
+        assert await try_acquire_redeem_claim(account_id, "successor")
+        async with SessionLocal() as session:
+            row = await session.get(ResetCreditRedeemClaim, account_id)
+            assert row is not None and row.holder_id == "successor"
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_renewal_error_stops_owning_body_and_retains_unknown_consume_pin(async_client, monkeypatch):
+    account_id = await _import_account(async_client, email="renew-error@example.invalid", account_id="renew-error")
+    body_entered = asyncio.Event()
+    body_cancelled = asyncio.Event()
+    real_heartbeat = coordination.renew_redeem_claim_periodically
+
+    async def failed_renewal(*args, **kwargs):
+        await body_entered.wait()
+        raise RuntimeError("fixture renewal unavailable")
+
+    monkeypatch.setattr(coordination, "renew_redeem_claim", failed_renewal)
+    monkeypatch.setattr(
+        reset_credits_api, "renew_redeem_claim_periodically", partial(real_heartbeat, renew_interval_seconds=0)
+    )
+
+    async def owning_body():
+        async with SessionLocal() as session:
+            async with reset_credits_api.serialize_reset_credit_redeem(account_id, session=session):
+                await pin_redeem_request(account_id, "unknown-request", "approved-a")
+                body_entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    body_cancelled.set()
+
+    owner = asyncio.create_task(owning_body())
+    try:
+        await asyncio.wait_for(body_entered.wait(), 2)
+        done, _ = await asyncio.wait({owner}, timeout=2)
+        assert owner in done, "renewal uncertainty did not stop the owning body"
+        with pytest.raises(coordination.RedeemClaimLostError):
+            await owner
+    finally:
+        if not owner.done():
+            owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
+    assert body_cancelled.is_set()
+    assert await get_pinned_redeem_credit_id(account_id, "unknown-request") == "approved-a"
+    async with SessionLocal() as session:
+        assert await session.get(ResetCreditRedeemClaim, account_id) is None
 
 
 @pytest.mark.asyncio

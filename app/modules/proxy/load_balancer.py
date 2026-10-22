@@ -1280,7 +1280,9 @@ class LoadBalancer:
                         latest_primary={},
                         latest_secondary={},
                         latest_monthly={},
-                        continuity_owner_candidates=[],
+                        continuity_owner_candidates=[
+                            _clone_account(account) for account in continuity_owner_candidates
+                        ],
                         sticky_mutation_authority_account_ids=sticky_mutation_authority_account_ids,
                         quota_planner_settings=quota_planner_settings,
                         runtime_accounts=[_clone_account(account) for account in all_accounts],
@@ -2945,7 +2947,11 @@ def _filter_accounts_for_model_with_catalog_evidence(
 
 
 def _selectable_accounts(accounts: list[Account]) -> list[Account]:
-    return [account for account in accounts if account.status not in (AccountStatus.DEACTIVATED, AccountStatus.PAUSED)]
+    return [
+        account
+        for account in accounts
+        if not account.routing_held and account.status not in (AccountStatus.DEACTIVATED, AccountStatus.PAUSED)
+    ]
 
 
 def _mapped_model_has_registry_entry(model: str | None) -> bool:

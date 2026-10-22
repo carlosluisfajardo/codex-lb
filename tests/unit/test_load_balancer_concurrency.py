@@ -137,6 +137,110 @@ async def test_record_errors_uses_real_clock_by_default(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_delayed_sticky_selection_preserves_newer_unselected_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected, sibling = _make_account("selected"), _make_account("sibling")
+    sticky = _StubStickySessionsRepository()
+    sticky.account_id = selected.id
+    balancer = LoadBalancer(
+        lambda: _repo_factory(_StubAccountsRepository([selected, sibling]), _StubUsageRepository({}, {}), sticky)
+    )
+    started, release = asyncio.Event(), asyncio.Event()
+    original = balancer._select_with_stickiness
+
+    async def delayed(**kwargs: Any) -> Any:
+        result = await original(**kwargs)
+        started.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(balancer, "_select_with_stickiness", delayed)
+    pending = asyncio.create_task(
+        balancer.select_account(sticky_key="soft-owner", sticky_kind=StickySessionKind.STICKY_THREAD)
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        await balancer.record_errors(sibling, 2)
+        recorded = balancer._runtime[sibling.id]
+        expected = (recorded.error_count, recorded.last_error_at, recorded.cooldown_until, recorded.version)
+        release.set()
+        result = await asyncio.wait_for(pending, 2)
+        assert result.account is not None and result.account.id == selected.id
+        actual = balancer._runtime[sibling.id]
+        assert (actual.error_count, actual.last_error_at, actual.cooldown_until, actual.version) == expected
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_sticky_selection_commits_recovered_runtime_after_its_own_lease() -> None:
+    account = _make_account("lease-recovery")
+    sticky = _StubStickySessionsRepository()
+    sticky.account_id = account.id
+    now = datetime.now(timezone.utc).timestamp()
+    balancer = LoadBalancer(
+        lambda: _repo_factory(_StubAccountsRepository([account]), _StubUsageRepository({}, {}), sticky)
+    )
+    balancer._runtime[account.id] = RuntimeState(error_count=3, last_error_at=now - 400, cooldown_until=now - 1)
+    result = await balancer.select_account(
+        sticky_key="recovering", sticky_kind=StickySessionKind.STICKY_THREAD, lease_kind="stream"
+    )
+    try:
+        assert result.account is not None and result.lease is not None
+        runtime = balancer._runtime[account.id]
+        assert runtime.error_count == 0 and runtime.last_error_at is None and runtime.cooldown_until is None
+    finally:
+        await balancer.release_account_lease(result.lease)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("model_allowed", "scope_allowed"), [(True, True), (False, True), (True, False)])
+async def test_empty_pool_preserves_paused_owner_model_and_scope_eligibility(
+    monkeypatch: pytest.MonkeyPatch, model_allowed: bool, scope_allowed: bool
+) -> None:
+    owner = _make_account("paused-owner")
+    owner.status = AccountStatus.PAUSED
+    sticky = _StubStickySessionsRepository()
+    sticky.account_id = owner.id
+    balancer = LoadBalancer(
+        lambda: _repo_factory(_StubAccountsRepository([owner]), _StubUsageRepository({}, {}), sticky)
+    )
+    monkeypatch.setattr(load_balancer_module, "_mapped_model_has_registry_entry", lambda model: True)
+    monkeypatch.setattr(
+        load_balancer_module,
+        "_filter_accounts_for_model",
+        lambda accounts, model, **kwargs: accounts if model_allowed else [],
+    )
+    monkeypatch.setattr(
+        load_balancer_module,
+        "_filter_accounts_for_model_with_catalog_evidence",
+        lambda accounts, model, **kwargs: load_balancer_module._ModelAccountFilterResult(
+            accounts=[], general_model_account_ids=frozenset()
+        ),
+    )
+    scope = [owner.id] if scope_allowed else ["another-owner"]
+    inputs = await balancer._load_selection_inputs(model="fixture-model", account_ids=scope)
+    assert [account.id for account in inputs.effective_continuity_owner_candidates] == (
+        [owner.id] if model_allowed and scope_allowed else []
+    )
+    result = await balancer.select_account(
+        sticky_key="hard-owner",
+        sticky_kind=StickySessionKind.CODEX_SESSION,
+        model="fixture-model",
+        account_ids=scope,
+        required_account_id=owner.id,
+        required_continuity_owner=True,
+    )
+    assert result.account is None
+    assert (result.error_code == "continuity_owner_policy_conflict") is not (model_allowed and scope_allowed)
+    assert sticky.account_id == owner.id
+
+
+@pytest.mark.asyncio
 async def test_virtual_clock_controls_state_and_probe_health_transitions() -> None:
     clock = VirtualClock(epoch_value=2_000_000_000.0)
     account = _make_account("acc-virtual-clock-state")
@@ -403,7 +507,28 @@ class _StubStickySessionsRepository:
         self.insert_if_absent_calls.append((key, account_id, kind))
         if self.account_ids_by_key is None:
             self.account_ids_by_key = {}
-        return self.account_ids_by_key.setdefault(key, account_id)
+        result = self.account_ids_by_key.setdefault(key, account_id)
+        self.account_id = result
+        return result
+
+    async def refresh_if_current(
+        self,
+        key: str,
+        *,
+        expected_account_id: str,
+        kind: StickySessionKind,
+        seed_key: str | None = None,
+        seed_kind: StickySessionKind | None = None,
+    ) -> bool:
+        account_id = expected_account_id
+        current = self.account_ids_by_key.get(key) if self.account_ids_by_key is not None else self.account_id
+        if current != account_id or key in self.abandoned_keys or key in self.scoped_abandoned_account_ids_by_key:
+            return False
+        if seed_key is not None and seed_kind is not None:
+            await self.upsert_with_seed_if_absent(key, account_id, kind=kind, seed_key=seed_key, seed_kind=seed_kind)
+        else:
+            await self.upsert(key, account_id, kind=kind)
+        return True
 
     async def upsert_with_seed_if_absent(
         self,
@@ -2019,7 +2144,7 @@ async def test_concurrent_unbound_stickies_reserve_one_due_probe() -> None:
 
     selected_ids = {selection.account.id for selection in (first, second) if selection.account is not None}
     assert selected_ids == {healthy.id, probing.id}
-    assert [account_id for _, account_id, _ in sticky_repo.upserts].count(probing.id) == 1
+    assert [account_id for _, account_id, _ in sticky_repo.insert_if_absent_calls].count(probing.id) == 1
 
 
 @pytest.mark.asyncio

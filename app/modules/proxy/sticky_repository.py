@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal
+from uuid import uuid4
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -14,7 +15,7 @@ from sqlalchemy.sql import Insert
 from app.core.utils.time import naive_utc_to_epoch, to_utc_naive, utcnow
 from app.db.models import Account, AccountStatus, StickySession, StickySessionKind
 from app.db.session import sqlite_writer_section
-from app.modules.sticky_sessions.schemas import StickySessionSortBy, StickySessionSortDir
+from app.modules.sticky_sessions.schemas import StickySessionSnapshot, StickySessionSortBy, StickySessionSortDir
 
 # Each (key, kind) pair in delete_entries contributes 2 bind parameters to
 # the underlying DELETE...OR (key=:k AND kind=:t)... statement. SQLite's
@@ -325,6 +326,45 @@ class StickySessionsRepository:
             raise RuntimeError(f"StickySession upsert failed for key={key!r} kind={kind.value!r}")
         return row
 
+    async def refresh_if_current(
+        self,
+        key: str,
+        *,
+        kind: StickySessionKind,
+        expected_account_id: str,
+        seed_key: str | None = None,
+        seed_kind: StickySessionKind | None = None,
+    ) -> bool:
+        """Refresh an observed owner without resurrecting or rebinding its row."""
+        if seed_key is not None and seed_kind is None:
+            raise ValueError("seed_kind is required when seed_key is provided")
+        statement = (
+            update(StickySession)
+            .where(
+                StickySession.key == key,
+                StickySession.kind == kind,
+                StickySession.account_id == expected_account_id,
+                StickySession.continuity_abandoned_at.is_(None),
+                StickySession.continuity_abandonment_scope.is_(None),
+            )
+            .values(updated_at=utcnow())
+            .returning(StickySession.key)
+        )
+        async with sqlite_writer_section():
+            try:
+                result = await self._session.execute(statement)
+                refreshed = result.scalar_one_or_none() is not None
+                if refreshed and seed_key is not None:
+                    assert seed_kind is not None
+                    await self._session.execute(
+                        self._build_insert_do_nothing_statement(seed_key, expected_account_id, seed_kind)
+                    )
+                await self._session.commit()
+                return refreshed
+            except BaseException:
+                await self._session.rollback()
+                raise
+
     async def insert_if_absent(self, key: str, account_id: str, kind: StickySessionKind) -> str:
         """Insert immutable ownership and return the persisted owner."""
 
@@ -493,6 +533,7 @@ class StickySessionsRepository:
                 )
                 .values(
                     account_id=restore_account_id,
+                    ownership_generation=str(uuid4()),
                     updated_at=func.now(),
                     continuity_abandoned_at=None,
                     continuity_abandonment_scope=None,
@@ -524,6 +565,38 @@ class StickySessionsRepository:
                 result = await self._session.execute(statement.returning(StickySession.key, StickySession.kind))
                 await self._session.commit()
             deleted.extend((key, kind) for key, kind in result.all())
+        return deleted
+
+    async def delete_snapshot(self, entries: Sequence[StickySessionSnapshot]) -> list[tuple[str, StickySessionKind]]:
+        targets = [entry for entry in entries if not is_reserved_sticky_session_key(entry.key)]
+        deleted: list[tuple[str, StickySessionKind]] = []
+        try:
+            async with sqlite_writer_section():
+                for offset in range(0, len(targets), 100):
+                    chunk = targets[offset : offset + 100]
+                    statement = (
+                        delete(StickySession)
+                        .where(
+                            or_(
+                                *(
+                                    and_(
+                                        StickySession.key == entry.key,
+                                        StickySession.kind == entry.kind,
+                                        StickySession.account_id == entry.account_id,
+                                        StickySession.ownership_generation == entry.ownership_generation,
+                                    )
+                                    for entry in chunk
+                                )
+                            )
+                        )
+                        .returning(StickySession.key, StickySession.kind)
+                    )
+                    result = await self._session.execute(statement)
+                    deleted.extend((key, kind) for key, kind in result.all())
+                await self._session.commit()
+        except BaseException:
+            await self._session.rollback()
+            raise
         return deleted
 
     async def list_entry_identifiers(
@@ -558,6 +631,7 @@ class StickySessionsRepository:
         kind: StickySessionKind | None = None,
         updated_before: datetime | None = None,
         account_query: str | None = None,
+        account_id: str | None = None,
         key_query: str | None = None,
         sort_by: StickySessionSortBy = "updated_at",
         sort_dir: StickySessionSortDir = "desc",
@@ -571,6 +645,7 @@ class StickySessionsRepository:
                 kind=kind,
                 updated_before=updated_before,
                 account_query=account_query,
+                account_id=account_id,
                 key_query=key_query,
             )
             .join(Account, Account.id == StickySession.account_id)
@@ -592,6 +667,7 @@ class StickySessionsRepository:
         kind: StickySessionKind | None = None,
         updated_before: datetime | None = None,
         account_query: str | None = None,
+        account_id: str | None = None,
         key_query: str | None = None,
     ) -> int:
         statement = self._apply_filters(
@@ -599,6 +675,7 @@ class StickySessionsRepository:
             kind=kind,
             updated_before=updated_before,
             account_query=account_query,
+            account_id=account_id,
             key_query=key_query,
         )
         result = await self._session.execute(statement)
@@ -751,6 +828,7 @@ class StickySessionsRepository:
             index_elements=[StickySession.key, StickySession.kind],
             set_={
                 "account_id": account_id,
+                "ownership_generation": str(uuid4()),
                 "updated_at": func.now(),
                 # A fresh pin fully re-establishes ownership, so any earlier
                 # purge tombstone (see purge_stale_hard_codex_session_mappings)
@@ -780,6 +858,7 @@ class StickySessionsRepository:
         updated_before: datetime | None,
         account_query: str | None,
         key_query: str | None,
+        account_id: str | None = None,
     ):
         statement = statement.where(~StickySession.key.startswith(RESERVED_STICKY_SESSION_KEY_PREFIX, autoescape=True))
         if kind is not None:
@@ -788,6 +867,8 @@ class StickySessionsRepository:
             statement = statement.where(StickySession.updated_at < to_utc_naive(updated_before))
         if account_query:
             statement = statement.where(func.lower(Account.email).contains(account_query.lower()))
+        if account_id is not None:
+            statement = statement.where(StickySession.account_id == account_id)
         if key_query:
             statement = statement.where(func.lower(StickySession.key).contains(key_query.lower()))
         return statement

@@ -139,6 +139,7 @@ class Account(Base):
         server_default=text("'normal'"),
         nullable=False,
     )
+    routing_held: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
 
     access_token_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     refresh_token_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
@@ -879,6 +880,11 @@ class StickySession(Base):
         nullable=False,
     )
     account_id: Mapped[str] = mapped_column(String, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
+    # Nullable for old writers during rollback; rows without a generation are
+    # deliberately ineligible for snapshot cleanup.
+    ownership_generation: Mapped[str | None] = mapped_column(
+        String(36), default=lambda: str(uuid.uuid4()), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,

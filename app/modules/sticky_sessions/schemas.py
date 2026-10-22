@@ -14,6 +14,8 @@ StickySessionSortDir = Literal["asc", "desc"]
 
 class StickySessionEntryResponse(DashboardModel):
     key: str
+    account_id: str
+    ownership_generation: str | None = None
     display_name: str
     kind: StickySessionKind
     created_at: datetime
@@ -46,6 +48,15 @@ class StickySessionsDeleteRequest(DashboardModel):
                 raise ValueError("duplicate sticky session targets are not allowed")
             seen.add(target)
         return self
+
+
+class StickySessionSnapshot(StickySessionIdentifier):
+    account_id: str = Field(min_length=1)
+    ownership_generation: str = Field(min_length=1, max_length=36)
+
+
+class StickySessionsDeleteSnapshotRequest(StickySessionsDeleteRequest):
+    sessions: list[StickySessionSnapshot] = Field(min_length=1, max_length=500)
 
 
 class StickySessionDeleteFailure(DashboardModel):

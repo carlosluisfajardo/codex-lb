@@ -56,3 +56,7 @@ Observable deltas operators may notice:
 
 1. A cancellation that is already pending when a task reaches an uncontended bridge-lock acquire is now delivered at the task's next `await` instead of at the post-acquire checkpoint. Bodies under `pending_lock` are synchronous bookkeeping (see the "pending_lock critical sections do not suspend" requirement), so the cancellation lands at the same logical boundary — after the critical section — rather than inside it.
 2. `_http_bridge_pending_count_nowait` hits `WouldBlock` less often because the lock is no longer held across an extra loop turn per acquire. Expect fewer `http_bridge_pending_count_unavailable context=idle_prune` warnings (hundreds per hour in production before the change) and more sessions actually evaluated by idle prune on each sweep; eviction cadence therefore converges toward the configured idle TTL rather than being skipped for busy sessions.
+
+## Audit boundary and ownership interfaces
+
+Dashboard session and step-up cookies remain local. Shared HTTP/internal WebSocket preparation removes those cookie pairs and preserves ordinary allowed data; the public responses/Live WebSocket builder retains its existing all-cookie exclusion. Keyless browser-origin checks happen before acceptance and compare scheme, hostname and effective port. An API key bypasses this browser check only when the authentication path actually validates it; a bearer string ignored while global key authentication is disabled is still a keyless request.

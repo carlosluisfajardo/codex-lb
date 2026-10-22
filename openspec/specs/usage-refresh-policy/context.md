@@ -126,3 +126,7 @@ does not count as evidence that the account is healthy.
 
 - [#676 - initial bug report on `/wham/usage` vs. Settings UI divergence](https://github.com/Soju06/codex-lb/issues/676)
 - [#677 - dashboard per-account force-probe action](https://github.com/Soju06/codex-lb/issues/677)
+
+## Audit boundary and ownership interfaces
+
+POST /api/accounts/{id}/usage-refresh takes window, expectedResetAt and the caller's expected routing tuple. fetchSucceeded describes the fetch; refreshed requires that operation's persisted window/reset match and returns its usageId and recordedAt. A primary-only response cannot prove secondary freshness. No cached timestamp substitutes for the operation receipt, and refresh never releases a routing hold. Secondary-only snapshots now carry fresh credits when no writable primary/monthly row can carry them.

@@ -452,7 +452,7 @@ async def test_connect_responses_websocket_uses_websockets_transport(monkeypatch
             "session_id": "session-1",
             "User-Agent": "Codex CLI Test",
             "Origin": "https://chatgpt.com",
-            "Cookie": "dashboard_session=secret",
+            "Cookie": "codex_lb_dashboard_session=fixture; codex_lb_step_up=fixture; ordinary=value",
         },
         "access-token",
         "account-123",
@@ -506,6 +506,7 @@ async def test_connect_responses_websocket_prefers_native_direct_transport(monke
             "User-Agent": "Codex CLI Test",
             "Origin": "https://chatgpt.com",
             "openai-beta": "responses_websockets=2026-02-06",
+            "Cookie": "codex_lb_dashboard_session=fixture; codex_lb_step_up=fixture; ordinary=value",
         },
         "access-token",
         "account-123",
@@ -525,6 +526,7 @@ async def test_connect_responses_websocket_prefers_native_direct_transport(monke
     assert request.headers["Authorization"] == "Bearer access-token"
     assert request.headers["User-Agent"] == "Codex CLI Test"
     assert request.headers["Origin"] == "https://chatgpt.com"
+    assert not any(name.lower() == "cookie" for name in request.headers)
     assert native_websocket.sent == ["turn"]
     assert message.kind == "text"
     assert websocket.response_header("sec-websocket-protocol") == "openai"
@@ -548,7 +550,7 @@ async def test_connect_live_websocket_native_direct_preserves_subprotocol_offer(
 
     websocket = await connect_live_websocket(
         "rtc_live",
-        {"User-Agent": "Codex CLI Test"},
+        {"User-Agent": "Codex CLI Test", "Cookie": "codex_lb_dashboard_session=fixture; codex_lb_step_up=fixture"},
         "access-token",
         "account-123",
         protocol=RealtimeWebSocketProtocol.LIVE_V3,
@@ -558,6 +560,7 @@ async def test_connect_live_websocket_native_direct_preserves_subprotocol_offer(
 
     request = native_client.websocket.await_args.args[0]
     assert request.headers["sec-websocket-protocol"] == "live.v0, live.v1"
+    assert not any(name.lower() == "cookie" for name in request.headers)
     assert websocket.response_header("sec-websocket-protocol") == "live.v1"
 
 

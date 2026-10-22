@@ -19,13 +19,11 @@ from __future__ import annotations
 
 from typing import Final, Literal
 
+from app.core.auth.cookies import STEP_UP_COOKIE as STEP_UP_COOKIE
 from app.db.models import DashboardUser
 
 #: How long a step-up verification is honoured, in seconds.
 STEP_UP_MAX_AGE_SECONDS: Final = 300
-#: Short-lived cookie carrying a step-up for principals that have no session
-#: cookie to carry the claim (trusted-header accounts).
-STEP_UP_COOKIE: Final = "codex_lb_step_up"
 STEP_UP_UNAVAILABLE_MESSAGE: Final = "Set up two-factor authentication or a local password to change security settings"
 
 StepUpMethod = Literal["password", "totp"]

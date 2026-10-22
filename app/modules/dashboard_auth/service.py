@@ -14,6 +14,7 @@ import bcrypt
 import segno
 
 from app.core.audit.service import AuditActor, AuditAuthMethod, AuditService, AuditSeverity, AuditTarget
+from app.core.auth.cookies import DASHBOARD_SESSION_COOKIE as DASHBOARD_SESSION_COOKIE
 from app.core.auth.dashboard_access import (
     ADMIN_GRANTS,
     ASSIGNABLE_PRESET_ROLES,
@@ -62,7 +63,6 @@ from app.modules.dashboard_users.repository import (
     normalize_username,
 )
 
-DASHBOARD_SESSION_COOKIE = "codex_lb_dashboard_session"
 #: Cookie payload format. Version 1 carried ``pw``/``tv``/``role``/``gv`` and no
 #: user id; it is rejected outright so a stale cookie can never resolve to a
 #: user it was not issued for.

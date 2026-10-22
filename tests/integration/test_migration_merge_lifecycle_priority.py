@@ -11,13 +11,15 @@ from app.db.migrate import _build_alembic_config, check_migration_policy, check_
 PARENT = "20260912_000000_merge_thread_cache_and_bridge_retirement_heads"
 ACCOUNT = "20261005_000000_add_account_lifecycle_preferences"
 PRIORITY = "20261005_000000_add_dashboard_keyless_priority_service_tier"
-MERGE = "20261005_010000_merge_account_lifecycle_and_keyless_priority"
+MERGE = "20261022_000000_add_routing_hold_and_sticky_generation"
 
 
 def _preserved_data(path: Path) -> tuple[list[tuple], list[tuple], list[tuple], tuple]:
     with sqlite3.connect(path) as db:
+        # Compare the pre-existing columns across additive descendant migrations.
+        account_columns = [row[1] for row in db.execute("PRAGMA table_info(accounts)") if row[1] != "routing_held"]
         return (
-            db.execute("SELECT * FROM accounts ORDER BY id").fetchall(),
+            db.execute(f"SELECT {','.join(account_columns)} FROM accounts ORDER BY id").fetchall(),
             db.execute("SELECT * FROM usage_history ORDER BY id").fetchall(),
             db.execute("SELECT * FROM request_logs ORDER BY id").fetchall(),
             db.execute(
