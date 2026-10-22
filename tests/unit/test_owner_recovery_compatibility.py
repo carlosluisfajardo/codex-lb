@@ -360,7 +360,7 @@ def _proof_joiner_harness(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     monkeypatch.setattr(service, "_get_or_create_http_bridge_session", observe_creation)
 
-    def stream(payload: Any, name: str) -> asyncio.Task[Any]:
+    def stream(payload: Any, name: str, **stream_options: Any) -> asyncio.Task[Any]:
         async def consume() -> None:
             async for _ in service._stream_via_http_bridge(
                 payload,
@@ -375,6 +375,7 @@ def _proof_joiner_harness(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
                 codex_idle_ttl_seconds=1800,
                 max_sessions=8,
                 queue_limit=4,
+                **stream_options,
             ):
                 pass
 
@@ -460,3 +461,50 @@ async def test_proof_joiner_cannot_replay_effects_or_unproven_history(monkeypatc
     finally:
         await scheduler.cancel_owned_tasks()
     assert all(not runtime.leases for runtime in service._load_balancer._runtime.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fence", ["incomplete", "mismatch", "file_pin", "attempted"])
+async def test_mixed_temporary_capacity_refusal_keeps_independent_replay_guards(monkeypatch, fence) -> None:
+    h = _proof_joiner_harness(monkeypatch)
+    service, scheduler = h["service"], h["scheduler"]
+    runtime = service._load_balancer._runtime[h["owner"].id]
+    runtime.inflight_streams = 1
+    payload = h["full_history"].model_copy(deep=True)
+    if fence == "incomplete":
+        payload.input = "delta only"
+    elif fence == "mismatch":
+        payload.input[0]["content"][0]["text"] = "different history"
+    elif fence != "file_pin":
+        prepare = service._prepare_http_bridge_request
+
+        def attempted(*args, **kwargs):
+            state, text = prepare(*args, **kwargs)
+            state.response_create_attempt_count = 1
+            state.response_create_sent_at = None
+            return state, text
+
+        monkeypatch.setattr(service, "_prepare_http_bridge_request", attempted)
+    task = h["stream"](
+        payload, "fenced-capacity", rewritten_file_account_id=h["owner"].id if fence == "file_pin" else None
+    )
+    try:
+        await asyncio.wait_for(h["first_selection"].wait(), 5)
+        await scheduler.drain()
+        if fence != "attempted":
+            assert not task.done()
+            await scheduler.advance(30)
+        await _settle(scheduler, task)
+        assert len(h["attempts"]["fenced-capacity"]) == 1, "temporary capacity provenance cannot replace replay proof"
+        with pytest.raises(ProxyResponseError) as caught:
+            await asyncio.wait_for(task, 1)
+        assert caught.value.status_code == 429
+        assert caught.value.payload["error"]["code"] == "account_stream_cap"
+        if fence == "attempted":
+            assert isinstance(caught.value, _HTTPBridgeRequiredOwnerReplayForbiddenError)
+        assert payload.previous_response_id == "resp_required_anchor"
+        assert h["opened"].await_count == 0
+        assert all(not state.leases for state in service._load_balancer._runtime.values())
+        assert not service._http_bridge_inflight_sessions
+    finally:
+        await scheduler.cancel_owned_tasks()

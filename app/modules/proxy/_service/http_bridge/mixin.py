@@ -294,30 +294,6 @@ class _HTTPBridgeMixin(
         self._http_bridge_background_cleanup_failed |= any(isinstance(result, BaseException) for result in results)
         return not self._http_bridge_background_cleanup_failed
 
-    async def _fail_http_bridge_inflight_session_creation(
-        self,
-        key: "_HTTPBridgeSessionKey",
-        inflight_future: asyncio.Future["_HTTPBridgeSession"] | None,
-        exc: BaseException,
-    ) -> bool:
-        if inflight_future is None:
-            return False
-        async with self._http_bridge_lock:
-            current_future = self._http_bridge_inflight_sessions.get(key)
-            if current_future is not inflight_future:
-                return False
-            if getattr(inflight_future, "_http_bridge_handoff", False):
-                return False
-            self._http_bridge_inflight_sessions.pop(key, None)
-            if inflight_future.done():
-                return True
-            if isinstance(exc, asyncio.CancelledError):
-                inflight_future.cancel()
-            else:
-                inflight_future.set_exception(exc)
-                inflight_future.exception()
-            return True
-
     @overload
     async def _get_or_create_http_bridge_session(
         self,
@@ -1337,19 +1313,24 @@ class _HTTPBridgeMixin(
             try:
                 for session_to_close in sessions_to_close_before_create:
                     await self._close_http_bridge_session_bounded(session_to_close, reason="registry_detach")
+                if owns_creation and sessions_to_close_before_create:
+                    await self._enforce_http_bridge_capacity_after_planned_closes(
+                        key=key,
+                        inflight_future=inflight_future,
+                        max_sessions=max_sessions,
+                        request_model=request_model,
+                    )
             except BaseException as exc:
                 if owns_creation:
-                    await self._fail_http_bridge_inflight_session_creation(key, inflight_future, exc)
+                    cancellation = await _await_cleanup_deferring_cancellation(
+                        self._fail_http_bridge_inflight_session_creation(key, inflight_future, exc),
+                        scheduler=scheduler_for(self),
+                    )
+                    if cancellation is not None:
+                        raise cancellation from exc
                 raise
             if capacity_error_after_planned_closes is not None:
                 raise capacity_error_after_planned_closes
-            if owns_creation and sessions_to_close_before_create:
-                await self._enforce_http_bridge_capacity_after_planned_closes(
-                    key=key,
-                    inflight_future=inflight_future,
-                    max_sessions=max_sessions,
-                    request_model=request_model,
-                )
             if session_to_return_after_close is not None:
                 return session_to_return_after_close
             if owner_forward is not None:

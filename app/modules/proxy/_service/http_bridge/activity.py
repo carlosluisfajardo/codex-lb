@@ -117,6 +117,30 @@ class _HTTPBridgeActivityMixin:
         # finish closing its idle predecessor before enforcing the same cap.
         return forced_replacement and _http_bridge_capacity_generation_count(self) >= max_sessions
 
+    async def _fail_http_bridge_inflight_session_creation(
+        self: _HTTPBridgeServiceProtocol,
+        key: "_HTTPBridgeSessionKey",
+        inflight_future: asyncio.Future["_HTTPBridgeSession"] | None,
+        exc: BaseException,
+    ) -> bool:
+        if inflight_future is None:
+            return False
+        async with self._http_bridge_lock:
+            current_future = self._http_bridge_inflight_sessions.get(key)
+            if current_future is not inflight_future:
+                return False
+            if getattr(inflight_future, "_http_bridge_handoff", False):
+                return False
+            self._http_bridge_inflight_sessions.pop(key, None)
+            if inflight_future.done():
+                return True
+            if isinstance(exc, asyncio.CancelledError):
+                inflight_future.cancel()
+            else:
+                inflight_future.set_exception(exc)
+                inflight_future.exception()
+            return True
+
     async def _enforce_http_bridge_capacity_after_planned_closes(
         self: _HTTPBridgeServiceProtocol,
         *,

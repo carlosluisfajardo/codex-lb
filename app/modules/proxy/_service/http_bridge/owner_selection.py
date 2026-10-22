@@ -23,6 +23,14 @@ from app.modules.proxy.load_balancer import CONTINUITY_OWNER_UNAVAILABLE, Accoun
 from app.modules.proxy.selection_errors import selection_failure_response
 
 
+class _HTTPBridgeLocalCapacitySelectionError(_HTTPBridgeRequiredOwnerReplayForbiddenError):
+    """Positive local contention; only proven rejected-anchor reattach may wait."""
+
+
+class _HTTPBridgeTemporaryOwnerSelectionError(_HTTPBridgeRequiredOwnerSelectionError):
+    """Cooldown/backoff provenance retained without changing the public refusal."""
+
+
 @dataclass
 class _HTTPBridgeOwnerSelection:
     request_deadline: float
@@ -129,6 +137,15 @@ class _HTTPBridgeOwnerSelection:
                 if self.response_create_attempt_count > 0
                 else _HTTPBridgeRequiredOwnerSelectionError
             )
+            if selection.owner_failure_reason is OwnerFailureReason.LOCAL_CONTENTION:
+                refusal_type = _HTTPBridgeLocalCapacitySelectionError
+            elif (
+                self.response_create_attempt_count == 0
+                and self.continuity_owner
+                and self.preferred_account_id not in self.excluded_account_ids
+                and selection.owner_failure_reason in (OwnerFailureReason.COOLDOWN, OwnerFailureReason.ERROR_BACKOFF)
+            ):
+                refusal_type = _HTTPBridgeTemporaryOwnerSelectionError
             self.refusal = refusal_type(refusal.status_code, refusal.payload)
             if can_wait:
                 assert self.recovery_deadline is not None
