@@ -25,3 +25,20 @@ Dashboard consume SHALL accept `expectedCreditId` and `expectedCreditExpiresAt`.
 #### Scenario: Durable pin contradicts approval
 - **WHEN** an existing or concurrently established pin conflicts with expected identity or expiry
 - **THEN** consume is refused and the pin remains unchanged
+
+### Requirement: Dashboard redemption revalidates account eligibility after waits
+The shared dashboard and automatic redemption helper MUST re-read the authoritative account after acquiring redemption serialization and again after pre-consume credential, route, fetch, pin and claim-renewal waits. Before dispatch, the account MUST still exist, lack a pending-deletion marker, retain the intended local and upstream account identity, and satisfy the existing reset-redemption eligibility predicate. A routing hold alone MUST NOT make an otherwise eligible account ineligible. Refusal MUST preserve committed account state, settle the owned claim and retain any existing request pin for reconciliation. The final database observation does not make the subsequent external consume atomic with later account mutations.
+#### Scenario: Account becomes ineligible while waiting for serialization
+- **WHEN** a pause or other non-redeemable status commits while redemption waits for its predecessor
+- **THEN** the waiter refuses before credential or upstream work and does not consume a credit
+#### Scenario: Account changes during pre-consume work
+- **WHEN** an account becomes non-redeemable, is deleted or changes identity during credential, route, fetch or admission-renewal waits
+- **THEN** the final account check refuses fresh consume without overwriting that change
+#### Scenario: Independently held account remains eligible for redemption
+- **WHEN** an otherwise eligible account has an independent routing hold
+- **THEN** redemption retains the supported exact-credit, request-pin and claim-ownership behavior
+#### Scenario: Claim ownership changes during final account observation
+- **WHEN** the SQLite claim expires or changes holder while the final account read awaits
+- **THEN** account eligibility and the exact claim holder/deadline are observed in one SELECT
+- **AND** the observed deadline is checked after that await, without another await before consume admission
+- **AND** lost ownership refuses consume, retains the request pin and cannot release a successor claim
