@@ -128,6 +128,10 @@ from app.modules.proxy._service.http_bridge.helpers import (
 from app.modules.proxy._service.http_bridge.owner_forwarding import (
     _owner_forward_failure_allows_local_recovery,
 )
+from app.modules.proxy._service.http_bridge.owner_selection import (
+    _HTTPBridgeLocalCapacitySelectionError,
+    _HTTPBridgeTemporaryOwnerSelectionError,
+)
 from app.modules.proxy._service.http_bridge.quarantine import (
     _http_bridge_quarantine_clear_fence,
     _http_bridge_session_key_poison_quarantined,
@@ -2327,7 +2331,10 @@ class _HTTPBridgeStreamingMixin:
             return True
 
         def owner_unavailable_allows_account_neutral_replay(exc: ProxyResponseError) -> bool:
-            if not _http_bridge_is_previous_response_owner_unavailable(exc):
+            if not (
+                _http_bridge_is_previous_response_owner_unavailable(exc)
+                or isinstance(exc, _HTTPBridgeTemporaryOwnerSelectionError)
+            ):
                 return False
             rejection = classify_account_neutral_replay_rejection()
             if rejection is None:
@@ -4111,6 +4118,17 @@ class _HTTPBridgeStreamingMixin:
                             defer_account_health_writes=request_state.api_key_reservation is not None,
                         )
                     except ProxyResponseError as capacity_exc:
+                        if (
+                            isinstance(capacity_exc, _HTTPBridgeLocalCapacitySelectionError)
+                            and explicit_previous_response_rejection
+                            and retry_request_stage == "reattach"
+                            and retry_previous_response_id == request_state.previous_response_id
+                        ):
+                            # The upstream rejection and earlier replay/output
+                            # guards already authorized this same-anchor retry.
+                            # Preserve only its local admission wait, never a
+                            # new provider-owner window or ambiguous replay.
+                            capacity_exc = ProxyResponseError(capacity_exc.status_code, capacity_exc.payload)
                         wait_plan = _http_bridge_capacity_wait_plan(
                             capacity_exc, request_deadline=request_deadline, now=clock.monotonic()
                         )

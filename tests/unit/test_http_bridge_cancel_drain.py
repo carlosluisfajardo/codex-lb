@@ -1687,3 +1687,129 @@ async def test_close_http_bridge_session_bounded_times_out_on_injected_scheduler
     assert close_tasks[0].done()
     assert close_tasks[0] not in service._background_cleanup_tasks
     assert scheduler.owned_tasks == frozenset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_at", ["planned_close", "capacity_recheck"])
+@pytest.mark.parametrize("cancel_kind", ["level", "repeated_native"])
+@pytest.mark.parametrize("replacement", ["none", "successor", "handoff"])
+async def test_cancelled_capacity_creator_settles_before_next_creation(
+    monkeypatch, cancel_at, cancel_kind, replacement
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, contextlib.nullcontext()))
+    existing = _make_http_bridge_session(deque(), queued_request_count=0)
+    service._http_bridge_sessions[existing.key] = existing
+    key = proxy_service._HTTPBridgeSessionKey("request", "cancelled-capacity-creator", None)
+    close_entered, release_close = asyncio.Event(), asyncio.Event()
+    recheck_entered, release_recheck = asyncio.Event(), asyncio.Event()
+    scopes = []
+
+    real_close_resources = http_bridge_helpers._close_http_bridge_session_resources
+
+    async def close_resources(service_arg, session, **kwargs):
+        if session is not existing:
+            return await real_close_resources(service_arg, session, **kwargs)
+        close_entered.set()
+        await release_close.wait()
+
+    real_recheck = service._enforce_http_bridge_capacity_after_planned_closes
+
+    async def observe_recheck(**kwargs):
+        recheck_entered.set()
+        if cancel_at == "capacity_recheck":
+            await release_recheck.wait()
+        await real_recheck(**kwargs)
+
+    created = _make_http_bridge_session(deque(), queued_request_count=0, key=key)
+    create = AsyncMock(return_value=created)
+    monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", lambda: [])
+    monkeypatch.setattr(http_bridge_helpers, "_close_http_bridge_session_resources", close_resources)
+    monkeypatch.setattr(service, "_enforce_http_bridge_capacity_after_planned_closes", observe_recheck)
+    monkeypatch.setattr(service, "_create_http_bridge_session", create)
+    monkeypatch.setattr(service, "_claim_durable_http_bridge_session", AsyncMock())
+
+    async def get_or_create():
+        return await service._get_or_create_http_bridge_session(
+            key,
+            headers={},
+            affinity=proxy_service._AffinityPolicy(),
+            api_key=None,
+            request_model=None,
+            idle_ttl_seconds=120,
+            max_sessions=1,
+        )
+
+    async def creator():
+        cancellation = None
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            try:
+                await get_or_create()
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        if cancellation is not None:
+            raise cancellation
+        raise AssertionError("cancelled creator unexpectedly returned")
+
+    task = asyncio.create_task(creator())
+    lock_held = False
+    try:
+        await asyncio.wait_for(close_entered.wait(), 1)
+        future = service._http_bridge_inflight_sessions[key]
+        if cancel_at == "capacity_recheck":
+            release_close.set()
+            await asyncio.wait_for(recheck_entered.wait(), 1)
+            await service._http_bridge_lock.acquire()
+            lock_held = True
+            release_recheck.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        else:
+            await service._http_bridge_lock.acquire()
+            lock_held = True
+        replacement_future = None
+        if replacement != "none":
+            replacement_future = future if replacement == "handoff" else asyncio.get_running_loop().create_future()
+            if replacement == "handoff":
+                setattr(replacement_future, "_http_bridge_handoff", True)
+            service._http_bridge_inflight_sessions[key] = replacement_future
+        if cancel_kind == "level":
+            scopes[0].cancel()
+        else:
+            task.cancel()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        if cancel_kind == "repeated_native":
+            task.cancel()
+            await asyncio.sleep(0)
+        service._http_bridge_lock.release()
+        lock_held = False
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        await service._drain_http_bridge_background_cleanup_tasks(reason="test")
+        if replacement_future is not None:
+            assert service._http_bridge_inflight_sessions.get(key) is replacement_future
+            assert not replacement_future.done(), "cancelled creator must preserve its successor or handoff"
+            assert not future.done()
+            service._http_bridge_inflight_sessions.pop(key)
+            replacement_future.cancel()
+            future.cancel()
+        else:
+            assert future.cancelled(), "cancelled capacity creator must settle its own future"
+            assert key not in service._http_bridge_inflight_sessions
+        assert not service._http_bridge_detached_sessions
+        create.assert_not_awaited()
+        monkeypatch.setattr(service, "_enforce_http_bridge_capacity_after_planned_closes", real_recheck)
+        assert await asyncio.wait_for(get_or_create(), 1) is created
+        assert create.await_count == 1
+        assert key not in service._http_bridge_inflight_sessions
+    finally:
+        if lock_held:
+            service._http_bridge_lock.release()
+        release_close.set()
+        release_recheck.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await service._drain_http_bridge_background_cleanup_tasks(reason="test")
+        await service.close_all_http_bridge_sessions()
