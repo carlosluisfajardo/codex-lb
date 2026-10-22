@@ -2,22 +2,71 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 from uuid import uuid4
 
-import pytest
-import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
+# Settings defaults and some encryptors are constructed during app imports,
+# before any fixture runs. Refuse stale application modules instead of trying
+# to repair cached paths or already-created clients after the fact.
+if any(name == "app" or name.startswith("app.") for name in sys.modules):
+    raise RuntimeError("Test isolation must run before application imports")
 
-TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="codex-lb-tests-"))
+# Create the session under the OS temporary root itself, never an inherited
+# TMPDIR or cached tempfile.tempdir that could name an application store.
+# Windows has no environment-independent root, so it keeps tempfile's default.
+_TEST_SESSION = tempfile.TemporaryDirectory(prefix="codex-lb-tests-", dir=None if os.name == "nt" else "/tmp")
+TEST_SESSION_DIR = Path(_TEST_SESSION.name).resolve()
+TEST_HOME = TEST_SESSION_DIR / "home"
+TEST_DB_DIR = TEST_HOME / ".codex-lb"
+TEST_TMP_DIR = TEST_SESSION_DIR / "tmp"
 TEST_DB_PATH = TEST_DB_DIR / "codex-lb.db"
+for directory in (TEST_HOME, TEST_DB_DIR, TEST_TMP_DIR):
+    directory.mkdir(mode=0o700)
 
-os.environ["CODEX_LB_DATABASE_URL"] = os.environ.get(
-    "CODEX_LB_TEST_DATABASE_URL", f"sqlite+aiosqlite:///{TEST_DB_PATH}"
-)
+# Keep fallback HOME discovery, settings env files and later temporary fixtures
+# inside this session too. Inherited key/archive overrides must not survive.
+_TEST_ENV = {
+    "HOME": str(TEST_HOME),
+    "CODEX_LB_DATA_DIR": str(TEST_DB_DIR),
+    "CODEX_LB_DATABASE_URL": os.environ.get("CODEX_LB_TEST_DATABASE_URL", f"sqlite+aiosqlite:///{TEST_DB_PATH}"),
+    "CODEX_LB_ENCRYPTION_KEY_FILE": str(TEST_DB_DIR / "encryption.key"),
+    "CODEX_LB_CONVERSATION_ARCHIVE_DIR": str(TEST_DB_DIR / "conversation-archive"),
+    "CODEX_LB_ENV_FILE": str(TEST_SESSION_DIR / "absent.env"),
+    "TMPDIR": str(TEST_TMP_DIR),
+    "TEMP": str(TEST_TMP_DIR),
+    "TMP": str(TEST_TMP_DIR),
+    "PYTEST_DEBUG_TEMPROOT": str(TEST_TMP_DIR),
+}
+for name in tuple(os.environ):
+    if name.upper() in _TEST_ENV:
+        del os.environ[name]
+os.environ.update(_TEST_ENV)
+tempfile.tempdir = str(TEST_TMP_DIR)
+
+
+def _require_private_test_path(path: Path) -> None:
+    # Check lexical containment before probing anything; then reject symlinks
+    # one component at a time so even the guard never follows one into a store.
+    absolute = Path(os.path.abspath(path))
+    if ".." in path.parts or not absolute.is_relative_to(TEST_SESSION_DIR):
+        raise RuntimeError("Refusing storage access outside the private test session")
+    current = TEST_SESSION_DIR
+    for part in absolute.relative_to(TEST_SESSION_DIR).parts:
+        current /= part
+        if current.is_symlink():
+            raise RuntimeError("Refusing symlink storage access outside the private test session")
+
+
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.engine import make_url  # noqa: E402
+
 os.environ["CODEX_LB_UPSTREAM_BASE_URL"] = "https://example.invalid/backend-api"
 # The HTTP responses session bridge is a request-path feature with a T4 env
 # kill switch (see app/core/config/tiers.py). The suite runs on the raw
@@ -37,11 +86,42 @@ os.environ["CODEX_LB_UPSTREAM_ROUTE_CACHE_TTL_SECONDS"] = "0"
 # ``_disable_background_loop_schedulers`` fixture and its leader election by
 # ``_disable_leader_election_startup`` (see their docstrings below).
 
+# Preserve the explicit PostgreSQL test route used by CI. File-backed SQLite
+# overrides must stay private before app.db.session can construct its engine.
+_test_database_url = make_url(os.environ["CODEX_LB_DATABASE_URL"])
+if _test_database_url.get_backend_name() == "sqlite" and _test_database_url.database not in (None, "", ":memory:"):
+    _require_private_test_path(Path(_test_database_url.database))
+
+from app.core import crypto as _test_crypto  # noqa: E402
+
+_unchecked_get_or_create_key = _test_crypto._get_or_create_key
+
+
+def _private_get_or_create_key(key_file: Path) -> bytes:
+    _require_private_test_path(key_file)
+    return _unchecked_get_or_create_key(key_file)
+
+
+# This I/O seam covers explicit key paths as well as mutated/cached settings.
+# An autouse fixture would be too late for encryptors constructed at import.
+_key_file_patch = patch.object(_test_crypto, "_get_or_create_key", new=_private_get_or_create_key)
+_key_file_patch.start()
+
 from app.db.models import Base  # noqa: E402
 from app.db.session import engine  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.modules.auth_providers.seed import seed_default_auth_providers  # noqa: E402
 from app.modules.dashboard_roles.seed import seed_preset_dashboard_roles  # noqa: E402
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config: pytest.Config) -> None:
+    # pytest-xdist hands each worker a --basetemp inside the controller's
+    # session, yet each worker bootstraps its own session above. Drop it before
+    # pytest builds tmp_path_factory so worker tmp_path, and keys created
+    # there, fall back to this worker's private PYTEST_DEBUG_TEMPROOT.
+    if hasattr(config, "workerinput"):
+        config.option.basetemp = None
 
 
 class _NoopScheduler:
