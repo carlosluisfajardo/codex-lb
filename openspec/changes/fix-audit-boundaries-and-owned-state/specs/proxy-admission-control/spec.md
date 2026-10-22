@@ -18,3 +18,16 @@ A keyless WebSocket MUST reject foreign, opaque, malformed or ambiguous browser 
 #### Scenario: Supported CLI and authenticated clients
 - **WHEN** an authorized CLI omits browser metadata or a client supplies a valid API key
 - **THEN** the browser-origin predicate does not deny the request
+
+### Requirement: Retained direct WebSockets enforce routing blocks before dispatch
+Every direct WebSocket `response.create` MUST check the serving account's current routing-unavailable cache at the final send boundary, including ordinary frames without capability or conversation requirements. A pause or routing hold completed before dispatch, including during admission or account-capacity waits, MUST prevent fresh work from being sent on the retained socket. Refusal MUST settle that unsent frame's admission resources without stripping ownership anchors, selecting another account or cancelling unrelated in-flight work. The check MUST NOT add a per-frame database read. Work already dispatched has a separate outcome and is not cancelled or proven unspent by this check.
+#### Scenario: Ordinary frame follows a successful routing block
+- **WHEN** request one completes on a retained direct socket and its account is successfully paused or held before ordinary request two
+- **THEN** request two receives a terminal refusal and is not sent upstream
+- **AND** the retained socket does not opportunistically rebind to a different account
+#### Scenario: Routing block completes during account admission
+- **WHEN** request two waits for account admission and a pause or hold completes before the wait ends
+- **THEN** the final send check refuses the frame before upstream dispatch
+#### Scenario: Explicit release permits later work
+- **WHEN** the account is explicitly reactivated or its hold released after a refused frame
+- **THEN** an eligible later frame can use the same retained socket and its released admission resources
