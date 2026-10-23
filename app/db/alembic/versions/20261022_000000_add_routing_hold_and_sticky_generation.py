@@ -11,8 +11,17 @@ branch_labels = None
 depends_on = None
 
 
+def _column_names(table: str) -> set[str]:
+    return {column["name"] for column in sa.inspect(op.get_bind()).get_columns(table)}
+
+
 def upgrade() -> None:
-    op.add_column("accounts", sa.Column("routing_held", sa.Boolean(), server_default=sa.false(), nullable=False))
+    # Legacy bootstrap and revision remaps replay this revision over schemas
+    # that already carry its columns; add (and backfill) only what is missing.
+    if "routing_held" not in _column_names("accounts"):
+        op.add_column("accounts", sa.Column("routing_held", sa.Boolean(), server_default=sa.false(), nullable=False))
+    if "ownership_generation" in _column_names("sticky_sessions"):
+        return
     op.add_column("sticky_sessions", sa.Column("ownership_generation", sa.String(36), nullable=True))
     bind = op.get_bind()
     rows = bind.execute(sa.text("SELECT key, kind FROM sticky_sessions")).all()

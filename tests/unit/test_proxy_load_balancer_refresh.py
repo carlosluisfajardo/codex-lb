@@ -142,6 +142,8 @@ class StubAccountsRepository(AccountsRepository):
         expected_reset_at: int | None = None,
         expected_blocked_at: int | None | object = _UNSET,
         expected_refresh_token_encrypted: bytes | None = None,
+        expected_routing_policy: str | None = None,
+        expected_routing_held: bool | None = None,
     ) -> bool:
         account = self._find_account(account_id)
         if account is None:
@@ -155,6 +157,8 @@ class StubAccountsRepository(AccountsRepository):
                 expected_refresh_token_encrypted is not None
                 and account.refresh_token_encrypted != expected_refresh_token_encrypted
             )
+            or (expected_routing_policy is not None and account.routing_policy != expected_routing_policy)
+            or (expected_routing_held is not None and account.routing_held != expected_routing_held)
         ):
             return False
         return await self.update_status(account_id, status, deactivation_reason, reset_at, blocked_at)

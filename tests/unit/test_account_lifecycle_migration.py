@@ -5,13 +5,9 @@ from pathlib import Path
 from alembic import command
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.orm import Session
 
-from app.core.crypto import TokenEncryptor
-from app.core.utils.time import utcnow
 from app.db.migrate import _build_alembic_config, check_migration_policy, check_schema_drift, run_upgrade
 from app.db.migration_url import to_sync_database_url
-from app.db.models import Account, AccountStatus
 
 _PARENT_REVISION = "20260912_000000_merge_thread_cache_and_bridge_retirement_heads"
 _REVISION = "20261005_000000_add_account_lifecycle_preferences"
@@ -47,22 +43,17 @@ def test_upgrade_downgrade_upgrade_is_additive_and_keeps_accounts(tmp_path: Path
     run_upgrade(url, _PARENT_REVISION, bootstrap_legacy=False)
     engine = create_engine(to_sync_database_url(url))
     try:
-        encryptor = TokenEncryptor()
-        with Session(engine) as session:
-            session.add(
-                Account(
-                    id="acc_fixture_migrated",
-                    email="migrated@example.com",
-                    plan_type="plus",
-                    routing_policy="burn_first",
-                    access_token_encrypted=encryptor.encrypt("a"),
-                    refresh_token_encrypted=encryptor.encrypt("r"),
-                    id_token_encrypted=encryptor.encrypt("i"),
-                    last_refresh=utcnow(),
-                    status=AccountStatus.ACTIVE,
+        # Seed with the parent revision's columns: the ORM model already
+        # describes later revisions (for example, accounts.routing_held).
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO accounts (id, codex_installation_id, email, plan_type, routing_policy, "
+                    "access_token_encrypted, refresh_token_encrypted, id_token_encrypted, last_refresh, status) "
+                    "VALUES ('acc_fixture_migrated', 'fixture-installation', 'migrated@example.com', 'plus', "
+                    "'burn_first', X'01', X'02', X'03', '2026-10-12 00:00:00', 'active')"
                 )
             )
-            session.commit()
         with engine.connect() as connection:
             accounts_before = _account_rows(connection)
             tables_before = set(inspect(connection).get_table_names())

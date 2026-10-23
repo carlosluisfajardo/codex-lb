@@ -25,6 +25,7 @@ from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
 from app.dependencies import get_proxy_service_for_app
 from app.modules.proxy import api as proxy_api
 from app.modules.proxy import service as proxy_service
+from app.modules.proxy._service.websocket import mixin as websocket_mixin_module
 from tests.integration.test_proxy_websocket_responses import (
     _FakeUpstreamMessage,
     _FakeUpstreamWebSocket,
@@ -257,6 +258,14 @@ def test_websocket_route_subscription_silence(app_instance, monkeypatch, phase: 
         proxy_service, "get_settings_cache", lambda: SimpleNamespace(get=AsyncMock(return_value=runtime_settings))
     )
     monkeypatch.setattr(service, "_connect_proxy_websocket", connect)
+    # This in-memory account has no database row, so the routing snapshot
+    # cannot list it; model only its availability at the per-frame fence.
+    routing_unavailable = websocket_mixin_module.is_account_routing_unavailable
+    monkeypatch.setattr(
+        websocket_mixin_module,
+        "is_account_routing_unavailable",
+        lambda account_id: account_id != account.id and routing_unavailable(account_id),
+    )
     monkeypatch.setattr(service, "_write_request_log", logs)
     monkeypatch.setattr(service, "_release_websocket_reservation", release)
     monkeypatch.setattr(service._load_balancer, "record_success", AsyncMock())

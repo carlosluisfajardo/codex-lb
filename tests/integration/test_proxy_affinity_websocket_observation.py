@@ -14,6 +14,7 @@ from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService
+from app.modules.proxy.account_cache import get_routing_availability_cache
 
 pytestmark = pytest.mark.integration
 
@@ -75,6 +76,9 @@ async def seed_account() -> str:
             )
         )
         await session.commit()
+        # Account creation propagates an account_routing refresh in production;
+        # this direct insert must reach the routing snapshot the same way.
+        await get_routing_availability_cache().refresh_from_db()
         key = await ApiKeysService(ApiKeysRepository(session)).create_key(
             ApiKeyCreateData(name="synthetic-ws", allowed_models=None, transport_policy_override="always_websocket")
         )

@@ -4,9 +4,7 @@ from datetime import datetime
 
 from app.db.models import Account, AccountStatus
 from app.db.session import detach_session_objects, get_background_session
-from app.modules.accounts.repository import AccountsRepository
-
-_UNSET = object()
+from app.modules.accounts.repository import _UNSET, AccountsRepository
 
 
 class BackgroundAccountsRepository:
@@ -57,30 +55,18 @@ class BackgroundAccountsRepository:
         expected_refresh_token_encrypted: bytes | None = None,
     ) -> bool:
         async with get_background_session() as session:
-            repo = AccountsRepository(session)
-            kwargs = {
-                "expected_status": expected_status,
-                "expected_deactivation_reason": expected_deactivation_reason,
-                "expected_reset_at": expected_reset_at,
-                "expected_refresh_token_encrypted": expected_refresh_token_encrypted,
-            }
-            if expected_blocked_at is not _UNSET:
-                kwargs["expected_blocked_at"] = expected_blocked_at
-            if blocked_at is _UNSET:
-                return await repo.update_status_if_current(
-                    account_id,
-                    status,
-                    deactivation_reason,
-                    reset_at,
-                    **kwargs,
-                )
-            return await repo.update_status_if_current(
+            # The repository's own sentinel forwards "not supplied" exactly.
+            return await AccountsRepository(session).update_status_if_current(
                 account_id,
                 status,
                 deactivation_reason,
                 reset_at,
                 blocked_at,
-                **kwargs,
+                expected_status=expected_status,
+                expected_deactivation_reason=expected_deactivation_reason,
+                expected_reset_at=expected_reset_at,
+                expected_blocked_at=expected_blocked_at,
+                expected_refresh_token_encrypted=expected_refresh_token_encrypted,
             )
 
     async def rotate_tokens(
