@@ -213,7 +213,7 @@ class AccountRoutingStateResponse(DashboardModel):
 
 class AccountUsageRefreshRequest(DashboardModel):
     window: Literal["primary", "secondary", "monthly"]
-    expected_reset_at: int
+    expected_reset_at: int | None = None
     expected: AccountRoutingExpectation
 
 
@@ -224,6 +224,7 @@ class AccountUsageRefreshResponse(AccountRoutingStateResponse):
     recorded_at: datetime | None = None
     window: str
     reset_at: int | None = None
+    used_percent: float | None = None
 
 
 class AccountRoutingPolicyUpdateRequest(AccountStateUpdateRequest):

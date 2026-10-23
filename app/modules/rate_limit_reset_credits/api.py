@@ -104,6 +104,11 @@ class RateLimitResetCreditsSnapshotResponse(DashboardModel):
     credits: list[ResetCreditItemResponse] = Field(default_factory=list)
 
 
+class RateLimitResetCreditsRefreshResponse(RateLimitResetCreditsSnapshotResponse):
+    account_id: str
+    fetched_at: datetime
+
+
 class ConsumeResetCreditResponseSchema(DashboardModel):
     code: str | None = None
     windows_reset: int | None = None
@@ -150,6 +155,69 @@ async def get_rate_limit_reset_credits(
         return _snapshot_to_response(snapshot)
 
     return None
+
+
+@router.post(
+    "/{account_id}/rate-limit-reset-credits/refresh",
+    response_model=RateLimitResetCreditsRefreshResponse,
+)
+async def refresh_rate_limit_reset_credits(
+    account_id: str,
+    _write_access=Depends(require_dashboard_permission(Permission.ACCOUNTS_WRITE)),
+    context: AccountsContext = Depends(get_accounts_context),
+) -> RateLimitResetCreditsRefreshResponse:
+    """Read the account's reset credits from upstream now, for inspection only.
+
+    Paused, held and reauthentication-required accounts stay unservable: this
+    read neither consumes nor changes policy, hold or the cached snapshot, and
+    status changes only through existing credential-refresh failure handling.
+    Every success comes from this request's fetch; a failed fetch is an error,
+    never an older snapshot.
+    """
+    account = await context.repository.get_by_id(account_id)
+    if account is None or account.delete_requested_at is not None:
+        raise DashboardNotFoundError("Account not found", code="account_not_found")
+    if account.status == AccountStatus.DEACTIVATED or not account.chatgpt_account_id:
+        raise DashboardConflictError("Account cannot read reset credits", code="account_not_reset_credit_applicable")
+    intended_chatgpt_account_id = account.chatgpt_account_id
+    auth_manager = context.service._auth_manager
+    try:
+        read_account = await auth_manager.ensure_fresh(account, force=False) if auth_manager is not None else account
+        route = await _resolve_reset_credit_route(read_account)
+        credits_response = await fetch_reset_credits(
+            TokenEncryptor().decrypt(read_account.access_token_encrypted),
+            read_account.chatgpt_account_id,
+            route=route,
+            allow_direct_egress=route is None,
+        )
+    except RefreshError as exc:
+        if exc.is_permanent:
+            get_account_selection_cache().invalidate()
+        raise DashboardConflictError(
+            f"Reset credit read could not refresh account credentials: {exc.message}",
+            code="account_reset_credit_refresh_failed",
+        ) from exc
+    except UpstreamProxyRouteError as exc:
+        raise DashboardServiceUnavailableError(
+            f"Reset credit read upstream proxy route unavailable: {exc.reason}",
+            code="account_reset_credit_upstream_route_unavailable",
+        ) from exc
+    except ResetCreditFetchError as exc:
+        raise _translate_fetch_error(exc) from exc
+    fetched_at = datetime.now(timezone.utc)
+    # A deletion or re-import into another upstream identity committed during
+    # the fetch makes this observation describe an account the caller no
+    # longer addresses; refuse it rather than report it as fresh.
+    current = await context.repository.get_by_id_fresh(account_id)
+    if current is None or current.delete_requested_at is not None:
+        raise DashboardNotFoundError("Account not found", code="account_not_found")
+    if current.chatgpt_account_id != intended_chatgpt_account_id:
+        raise DashboardConflictError(
+            "Reset credit account identity changed", code="account_reset_credit_identity_changed"
+        )
+    return RateLimitResetCreditsRefreshResponse.model_validate(
+        {**build_snapshot(credits_response).model_dump(), "account_id": account_id, "fetched_at": fetched_at}
+    )
 
 
 @router.post(
@@ -381,7 +449,11 @@ async def _redeem_soonest_reset_credit_locked(
             redeem_request_id=redeem_request_id,
             credit_id=pending_credit_id,
         )
-    if cached_credit is None and pending_credit_id is None:
+    # A caller-approved target carries its own evidence: only the fresh
+    # authoritative fetch below may refuse it, never a stale or absent local
+    # snapshot. Untargeted requests keep the cached-availability fast path.
+    targeted = expected_credit_id is not None or expected_credit_expires_at is not None
+    if cached_credit is None and pending_credit_id is None and not targeted:
         raise DashboardConflictError("No available reset credit", code="no_available_reset_credit")
 
     access_token = encryptor.decrypt(redeem_account.access_token_encrypted)

@@ -137,6 +137,7 @@ class UsageRefreshReceipt:
     reset_at: int | None
     recorded_at: datetime
     usage_id: int
+    used_percent: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -829,7 +830,9 @@ class UsageUpdater:
         if not account.routing_held:
             await self._recover_quota_status_from_usage(account, primary=primary, secondary=secondary, monthly=monthly)
         receipts = tuple(
-            UsageRefreshReceipt(entry.window or "primary", entry.reset_at, entry.recorded_at, entry.id)
+            UsageRefreshReceipt(
+                entry.window or "primary", entry.reset_at, entry.recorded_at, entry.id, entry.used_percent
+            )
             for entry in entries
             if isinstance(entry, UsageHistory) and entry.id is not None
         )

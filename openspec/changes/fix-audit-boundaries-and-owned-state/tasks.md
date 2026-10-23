@@ -34,3 +34,9 @@
 - [x] Synchronize normative specs/context with implemented behavior and validate OpenSpec strictly.
 - [x] Run relevant final focused checks and source hygiene checks; leave all source unstaged.
 - [x] Preserve exact final manifest, patch/archive, compatibility interfaces, limits and terminal handles in the assigned author evidence directory; return the pen once to Setup B.
+
+## 6. Five supplier capabilities
+
+- [x] Map the five operator capabilities against this candidate; prove the existing reauth-required hold and caller-expected routing writes with protective mutations instead of reimplementing them.
+- [x] Witness right-reason REDs for held refill readings, expected-target discovery past a stale or absent cache, the explicit fresh read and its identity race, and expectations dropped by the untargeted consume; correct each and restore every protective mutation exactly.
+- [x] Synchronize specs/context, validate strictly and preserve the author manifest; independent review, CI and delivery remain Setup B-owned.

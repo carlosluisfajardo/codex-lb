@@ -9,6 +9,7 @@ The source audit at divergent main b8512db1 reports eleven authentication, forwa
 - Establish hard sticky ownership atomically and refresh soft bindings only while the observed owner still matches.
 - Propagate SQLite reset-claim ownership loss to the body, fence consume admission, and clean up a committed claim when acquisition is cancelled.
 - Bind the first dashboard reset selection to caller expectations; expose held-account refresh freshness, conditional routing/state transitions and exact snapshot-bound pin deletion.
+- Return the persisted held-account refill reading, let expected-target consume reach its authoritative fetch past a stale or absent cache, add an explicit fresh reset-credit read, and refuse caller expectations on the untargeted usage-reset consume.
 
 ## Capabilities
 

@@ -728,16 +728,24 @@ class AccountsService:
         self._assert_routing_expectation(account, request.expected)
         if self._usage_updater is None:
             raise AccountStateTransitionError("Usage refresh is unavailable")
+        # Keep the polled upstream identity as a value: the refresh updates this
+        # account object in place, so it cannot witness a replacement later.
+        polled_chatgpt_account_id = account.chatgpt_account_id
         result = await self._usage_updater.force_refresh_result(account)
         current = await self._repo.get_by_id_fresh(account_id)
         if current is None or current.delete_requested_at is not None:
             return None
         self._assert_routing_expectation(current, request.expected)
+        if current.chatgpt_account_id != polled_chatgpt_account_id:
+            raise AccountStateTransitionError("Account identity changed during usage refresh; reread before retrying")
+        # Without an expected reset the caller asks what this poll persisted for
+        # the window, which is how a refill with a not-yet-known reset is read.
         receipt = next(
             (
                 entry
                 for entry in result.receipts
-                if entry.window == request.window and entry.reset_at == request.expected_reset_at
+                if entry.window == request.window
+                and (request.expected_reset_at is None or entry.reset_at == request.expected_reset_at)
             ),
             None,
         )
@@ -752,6 +760,7 @@ class AccountsService:
             reset_at=receipt.reset_at if receipt else None,
             usage_id=receipt.usage_id if receipt else None,
             recorded_at=receipt.recorded_at if receipt else None,
+            used_percent=receipt.used_percent if receipt else None,
         )
 
     async def delete_account(self, account_id: str, *, delete_history: bool = False) -> bool:

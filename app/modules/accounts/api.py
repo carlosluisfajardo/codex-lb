@@ -155,6 +155,16 @@ async def consume_account_usage_reset_credit(
     principal: DashboardPrincipal = Depends(require_dashboard_permission(Permission.ACCOUNTS_WRITE)),
     context: AccountsContext = Depends(get_accounts_context),
 ) -> AccountUsageResetConsumeResponse:
+    if payload is not None and (
+        payload.expected_credit_id is not None or payload.expected_credit_expires_at is not None
+    ):
+        # This upstream consume names no credit, so it cannot honor an approved
+        # target; refuse rather than spend whichever credit upstream picks.
+        raise DashboardBadRequestError(
+            "Usage reset consume cannot enforce an expected reset credit; "
+            "use the rate-limit-reset-credits consume endpoint",
+            code="reset_credit_expectation_unsupported",
+        )
     try:
         result = await context.service.consume_usage_reset_credit(
             account_id,
