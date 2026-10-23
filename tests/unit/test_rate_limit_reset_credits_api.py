@@ -1212,7 +1212,9 @@ async def test_serialize_reset_credit_redeem_propagates_sqlite_claim_timeout(
         async with serialize_reset_credit_redeem("acc_1", session=cast(Any, _FakeSqliteSession())):
             raise AssertionError("locked section must not run after a claim timeout")
 
-    assert released == []
+    # Acquisition may have committed before raising during session cleanup.
+    # Exact-holder release is safe even when this attempt never won the row.
+    assert released == ["acc_1"]
 
 
 @pytest.mark.asyncio

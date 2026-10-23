@@ -53,8 +53,12 @@ from app.modules.accounts.schemas import (
     AccountOpenCodeAuthExportAccount,
     AccountProbeResponse,
     AccountRequestUsage,
+    AccountRoutingExpectation,
+    AccountRoutingStateResponse,
     AccountSummary,
     AccountTrendsResponse,
+    AccountUsageRefreshRequest,
+    AccountUsageRefreshResponse,
     AccountUsageResetConsumeResponse,
     AccountUsageResetCredits,
     AccountUsageResetCreditsResponse,
@@ -67,6 +71,7 @@ from app.modules.limit_warmup.repository import LimitWarmupRepository
 from app.modules.proxy.account_cache import (
     clear_account_routing_unavailable,
     get_account_selection_cache,
+    get_routing_availability_cache,
     mark_account_routing_unavailable,
     propagate_account_routing_change,
 )
@@ -581,7 +586,7 @@ class AccountsService:
             return False
         return True
 
-    async def reactivate_account(self, account_id: str) -> bool:
+    async def reactivate_account(self, account_id: str, expected: AccountRoutingExpectation | None = None) -> bool:
         account = await self._repo.get_by_id(account_id)
         if account is None:
             return False
@@ -590,6 +595,7 @@ class AccountsService:
             # and about to be removed — report it as gone rather than racing
             # the deletion worker back to ACTIVE.
             return False
+        self._assert_routing_expectation(account, expected)
         if account.status == AccountStatus.REAUTH_REQUIRED:
             raise AccountStateTransitionError("Account requires re-authentication and cannot be reactivated directly")
         result = await self._repo.update_status_if_current(
@@ -602,19 +608,23 @@ class AccountsService:
             expected_deactivation_reason=account.deactivation_reason,
             expected_reset_at=account.reset_at,
             expected_blocked_at=account.blocked_at,
+            expected_routing_policy=expected.routing_policy if expected else None,
+            expected_routing_held=expected.routing_held if expected else None,
         )
         if not result:
             raise AccountStateTransitionError("Account state changed; retry the operation")
         if result:
-            clear_account_routing_unavailable(account_id)
+            if not account.routing_held:
+                clear_account_routing_unavailable(account_id)
             get_account_selection_cache().invalidate()
             await propagate_account_routing_change()
         return result
 
-    async def pause_account(self, account_id: str) -> bool:
+    async def pause_account(self, account_id: str, expected: AccountRoutingExpectation | None = None) -> bool:
         account = await self._get_visible_account(account_id)
         if account is None:
             return False
+        self._assert_routing_expectation(account, expected)
         if account.status in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
             raise AccountStateTransitionError(f"Account is {account.status.value} and cannot be paused")
         result = await self._repo.update_status_if_current(
@@ -627,6 +637,8 @@ class AccountsService:
             expected_deactivation_reason=account.deactivation_reason,
             expected_reset_at=account.reset_at,
             expected_blocked_at=account.blocked_at,
+            expected_routing_policy=expected.routing_policy if expected else None,
+            expected_routing_held=expected.routing_held if expected else None,
         )
         if not result:
             raise AccountStateTransitionError("Account state changed; retry the operation")
@@ -650,11 +662,106 @@ class AccountsService:
             get_account_selection_cache().invalidate()
         return result
 
-    async def set_routing_policy(self, account_id: str, routing_policy: str) -> bool:
-        result = await self._repo.update_routing_policy(account_id, routing_policy)
+    async def set_routing_policy(
+        self, account_id: str, routing_policy: str, expected: AccountRoutingExpectation | None = None
+    ) -> bool:
+        account = await self._get_visible_account(account_id)
+        if account is None:
+            return False
+        self._assert_routing_expectation(account, expected)
+        result = await self._repo.update_routing_policy(
+            account_id,
+            routing_policy,
+            expected_status=AccountStatus(expected.status) if expected else None,
+            expected_routing_policy=expected.routing_policy if expected else None,
+            expected_routing_held=expected.routing_held if expected else None,
+        )
+        if not result and expected is not None:
+            raise AccountStateTransitionError("Account routing state changed; reread before retrying")
         if result:
             get_account_selection_cache().invalidate()
+            await propagate_account_routing_change()
         return result
+
+    @staticmethod
+    def _assert_routing_expectation(account: Account, expected: AccountRoutingExpectation | None) -> None:
+        if expected is not None and (
+            account.status.value != expected.status
+            or account.routing_policy != expected.routing_policy
+            or bool(account.routing_held) != expected.routing_held
+        ):
+            raise AccountStateTransitionError("Account routing state changed; reread before retrying")
+
+    async def set_routing_hold(
+        self, account_id: str, held: bool, expected: AccountRoutingExpectation
+    ) -> AccountRoutingStateResponse | None:
+        account = await self._get_visible_account(account_id)
+        if account is None:
+            return None
+        self._assert_routing_expectation(account, expected)
+        changed = await self._repo.update_routing_hold_if_current(
+            account_id,
+            held,
+            expected_status=AccountStatus(expected.status),
+            expected_routing_policy=expected.routing_policy,
+            expected_routing_held=expected.routing_held,
+        )
+        if not changed:
+            raise AccountStateTransitionError("Account routing state changed; reread before retrying")
+        await get_routing_availability_cache().refresh_from_db()
+        if held:
+            mark_account_routing_unavailable(account_id)
+        elif account.status not in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED):
+            clear_account_routing_unavailable(account_id)
+        get_account_selection_cache().invalidate()
+        await propagate_account_routing_change()
+        return AccountRoutingStateResponse(
+            account_id=account_id, status=expected.status, routing_policy=expected.routing_policy, routing_held=held
+        )
+
+    async def refresh_usage_window(
+        self, account_id: str, request: AccountUsageRefreshRequest
+    ) -> AccountUsageRefreshResponse | None:
+        account = await self._get_visible_account(account_id)
+        if account is None:
+            return None
+        self._assert_routing_expectation(account, request.expected)
+        if self._usage_updater is None:
+            raise AccountStateTransitionError("Usage refresh is unavailable")
+        # Keep the polled upstream identity as a value: the refresh updates this
+        # account object in place, so it cannot witness a replacement later.
+        polled_chatgpt_account_id = account.chatgpt_account_id
+        result = await self._usage_updater.force_refresh_result(account)
+        current = await self._repo.get_by_id_fresh(account_id)
+        if current is None or current.delete_requested_at is not None:
+            return None
+        self._assert_routing_expectation(current, request.expected)
+        if current.chatgpt_account_id != polled_chatgpt_account_id:
+            raise AccountStateTransitionError("Account identity changed during usage refresh; reread before retrying")
+        # Without an expected reset the caller asks what this poll persisted for
+        # the window, which is how a refill with a not-yet-known reset is read.
+        receipt = next(
+            (
+                entry
+                for entry in result.receipts
+                if entry.window == request.window
+                and (request.expected_reset_at is None or entry.reset_at == request.expected_reset_at)
+            ),
+            None,
+        )
+        return AccountUsageRefreshResponse(
+            account_id=account_id,
+            status=current.status.value,
+            routing_policy=current.routing_policy,
+            routing_held=bool(current.routing_held),
+            refreshed=result.fetch_succeeded and receipt is not None,
+            fetch_succeeded=result.fetch_succeeded,
+            window=request.window,
+            reset_at=receipt.reset_at if receipt else None,
+            usage_id=receipt.usage_id if receipt else None,
+            recorded_at=receipt.recorded_at if receipt else None,
+            used_percent=receipt.used_percent if receipt else None,
+        )
 
     async def delete_account(self, account_id: str, *, delete_history: bool = False) -> bool:
         # Fast path: stamp the pending-deletion marker (terminal status, hidden

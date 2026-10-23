@@ -4,13 +4,13 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import Field
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit.service import AuditActor, AuditService, AuditTarget
@@ -43,18 +43,21 @@ from app.core.exceptions import (
 )
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError
 from app.core.utils.shared_future import _await_cleanup_deferring_cancellation
-from app.db.models import Account, AccountStatus
+from app.db.models import Account, AccountStatus, ResetCreditRedeemClaim
 from app.dependencies import AccountsContext, get_accounts_context
 from app.modules.accounts.auth_manager import AuthManager
+from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.schemas import AccountUsageResetConsumeRequest
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.rate_limit_reset_credits.redeem_coordination import (
+    RedeemClaimLostError,
     RedeemClaimTimeoutError,
     acquire_redeem_claim,
     get_pinned_redeem_credit_id,
     new_redeem_claim_holder_id,
     pin_redeem_request,
     release_redeem_claim,
+    renew_redeem_claim,
     renew_redeem_claim_periodically,
 )
 from app.modules.rate_limit_reset_credits.store import (
@@ -99,6 +102,11 @@ class RateLimitResetCreditsSnapshotResponse(DashboardModel):
     available_count: int = 0
     nearest_expires_at: datetime | None = None
     credits: list[ResetCreditItemResponse] = Field(default_factory=list)
+
+
+class RateLimitResetCreditsRefreshResponse(RateLimitResetCreditsSnapshotResponse):
+    account_id: str
+    fetched_at: datetime
 
 
 class ConsumeResetCreditResponseSchema(DashboardModel):
@@ -150,6 +158,69 @@ async def get_rate_limit_reset_credits(
 
 
 @router.post(
+    "/{account_id}/rate-limit-reset-credits/refresh",
+    response_model=RateLimitResetCreditsRefreshResponse,
+)
+async def refresh_rate_limit_reset_credits(
+    account_id: str,
+    _write_access=Depends(require_dashboard_permission(Permission.ACCOUNTS_WRITE)),
+    context: AccountsContext = Depends(get_accounts_context),
+) -> RateLimitResetCreditsRefreshResponse:
+    """Read the account's reset credits from upstream now, for inspection only.
+
+    Paused, held and reauthentication-required accounts stay unservable: this
+    read neither consumes nor changes policy, hold or the cached snapshot, and
+    status changes only through existing credential-refresh failure handling.
+    Every success comes from this request's fetch; a failed fetch is an error,
+    never an older snapshot.
+    """
+    account = await context.repository.get_by_id(account_id)
+    if account is None or account.delete_requested_at is not None:
+        raise DashboardNotFoundError("Account not found", code="account_not_found")
+    if account.status == AccountStatus.DEACTIVATED or not account.chatgpt_account_id:
+        raise DashboardConflictError("Account cannot read reset credits", code="account_not_reset_credit_applicable")
+    intended_chatgpt_account_id = account.chatgpt_account_id
+    auth_manager = context.service._auth_manager
+    try:
+        read_account = await auth_manager.ensure_fresh(account, force=False) if auth_manager is not None else account
+        route = await _resolve_reset_credit_route(read_account)
+        credits_response = await fetch_reset_credits(
+            TokenEncryptor().decrypt(read_account.access_token_encrypted),
+            read_account.chatgpt_account_id,
+            route=route,
+            allow_direct_egress=route is None,
+        )
+    except RefreshError as exc:
+        if exc.is_permanent:
+            get_account_selection_cache().invalidate()
+        raise DashboardConflictError(
+            f"Reset credit read could not refresh account credentials: {exc.message}",
+            code="account_reset_credit_refresh_failed",
+        ) from exc
+    except UpstreamProxyRouteError as exc:
+        raise DashboardServiceUnavailableError(
+            f"Reset credit read upstream proxy route unavailable: {exc.reason}",
+            code="account_reset_credit_upstream_route_unavailable",
+        ) from exc
+    except ResetCreditFetchError as exc:
+        raise _translate_fetch_error(exc) from exc
+    fetched_at = datetime.now(timezone.utc)
+    # A deletion or re-import into another upstream identity committed during
+    # the fetch makes this observation describe an account the caller no
+    # longer addresses; refuse it rather than report it as fresh.
+    current = await context.repository.get_by_id_fresh(account_id)
+    if current is None or current.delete_requested_at is not None:
+        raise DashboardNotFoundError("Account not found", code="account_not_found")
+    if current.chatgpt_account_id != intended_chatgpt_account_id:
+        raise DashboardConflictError(
+            "Reset credit account identity changed", code="account_reset_credit_identity_changed"
+        )
+    return RateLimitResetCreditsRefreshResponse.model_validate(
+        {**build_snapshot(credits_response).model_dump(), "account_id": account_id, "fetched_at": fetched_at}
+    )
+
+
+@router.post(
     "/{account_id}/rate-limit-reset-credits/consume",
     response_model=ConsumeResetCreditResponseSchema,
 )
@@ -178,6 +249,8 @@ async def consume_rate_limit_reset_credit(
             refresh_usage=_build_refresh_usage_callback(context),
             resolve_route=_resolve_reset_credit_route,
             redeem_request_id=payload.redeem_request_id if payload is not None else None,
+            expected_credit_id=payload.expected_credit_id if payload is not None else None,
+            expected_credit_expires_at=payload.expected_credit_expires_at if payload is not None else None,
         )
     except RefreshError as exc:
         if exc.is_permanent:
@@ -225,13 +298,17 @@ async def _redeem_soonest_reset_credit(
     expected_credit_expires_at: datetime | None = None,
 ) -> _RedeemResetCreditOutcome:
     _assert_account_can_redeem_reset_credit(account)
+    expected_identity = (account.id, account.chatgpt_account_id)
     effective_fetch_fn = fetch_fn or fetch_reset_credits
     effective_consume_fn = consume_fn or consume_reset_credit
 
     try:
-        async with serialize_reset_credit_redeem(account.id, session=lock_session):
+        async with serialize_reset_credit_redeem(account.id, session=lock_session) as assert_claim_owned:
+            account = await _reload_redeem_account(account, session=lock_session, expected_identity=expected_identity)
             return await _redeem_soonest_reset_credit_locked(
                 account=account,
+                lock_session=lock_session,
+                expected_identity=expected_identity,
                 store=store,
                 encryptor=encryptor,
                 effective_fetch_fn=effective_fetch_fn,
@@ -243,7 +320,13 @@ async def _redeem_soonest_reset_credit(
                 skip_if_redeem_request_pinned=skip_if_redeem_request_pinned,
                 expected_credit_id=expected_credit_id,
                 expected_credit_expires_at=expected_credit_expires_at,
+                assert_claim_owned=assert_claim_owned,
             )
+    except RedeemClaimLostError as exc:
+        raise DashboardConflictError(
+            "Reset credit redemption lost its claim; retain the request ID to reconcile any in-flight consume",
+            code="reset_credit_redeem_claim_lost",
+        ) from exc
     except RedeemClaimTimeoutError as exc:
         raise DashboardConflictError(
             "Another reset credit redemption is already in progress for this account",
@@ -276,22 +359,36 @@ async def serialize_reset_credit_redeem(
             # live holders keep the lease renewed via a heartbeat task so a
             # legitimately slow redemption is not taken over mid-section.
             holder_id = new_redeem_claim_holder_id()
-            await acquire_redeem_claim(account_id, holder_id)
-            heartbeat = asyncio.create_task(
-                renew_redeem_claim_periodically(account_id, holder_id),
-                name=f"reset-credit-redeem-claim-heartbeat:{account_id}",
-            )
+
+            async def assert_claim_owned() -> str:
+                try:
+                    owned = await renew_redeem_claim(account_id, holder_id)
+                except Exception as exc:
+                    raise RedeemClaimLostError("Reset-credit consume admission could not establish ownership") from exc
+                if not owned:
+                    raise RedeemClaimLostError("Reset-credit consume admission lost its claim")
+                return holder_id
+
             try:
-                yield
+                await acquire_redeem_claim(account_id, holder_id)
+                try:
+                    async with asyncio.TaskGroup() as tasks:
+                        heartbeat = tasks.create_task(
+                            renew_redeem_claim_periodically(account_id, holder_id),
+                            name=f"reset-credit-redeem-claim-heartbeat:{account_id}",
+                        )
+                        try:
+                            yield assert_claim_owned
+                        finally:
+                            heartbeat.cancel()
+                except ExceptionGroup as failures:
+                    # Keep the existing single-body domain exception surface.
+                    # Multiple simultaneous failures remain explicitly grouped.
+                    if len(failures.exceptions) == 1:
+                        raise failures.exceptions[0] from failures
+                    raise
             finally:
-
-                async def cleanup_redeem_claim() -> None:
-                    heartbeat.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await heartbeat
-                    await release_redeem_claim(account_id, holder_id)
-
-                cancellation = await _await_cleanup_deferring_cancellation(cleanup_redeem_claim())
+                cancellation = await _await_cleanup_deferring_cancellation(release_redeem_claim(account_id, holder_id))
                 if cancellation is not None:
                     raise cancellation
             return
@@ -313,6 +410,8 @@ async def _acquire_postgresql_reset_credit_redeem_lock(session: AsyncSession, ac
 async def _redeem_soonest_reset_credit_locked(
     *,
     account: Account,
+    lock_session: AsyncSession | None,
+    expected_identity: tuple[str, str | None],
     store: RateLimitResetCreditsStore,
     encryptor: TokenEncryptor,
     effective_fetch_fn: FetchFn,
@@ -324,6 +423,7 @@ async def _redeem_soonest_reset_credit_locked(
     skip_if_redeem_request_pinned: bool,
     expected_credit_id: str | None,
     expected_credit_expires_at: datetime | None,
+    assert_claim_owned: Callable[[], Awaitable[str]] | None = None,
 ) -> _RedeemResetCreditOutcome:
     redeem_account = account
     if auth_manager is not None:
@@ -349,7 +449,11 @@ async def _redeem_soonest_reset_credit_locked(
             redeem_request_id=redeem_request_id,
             credit_id=pending_credit_id,
         )
-    if cached_credit is None and pending_credit_id is None:
+    # A caller-approved target carries its own evidence: only the fresh
+    # authoritative fetch below may refuse it, never a stale or absent local
+    # snapshot. Untargeted requests keep the cached-availability fast path.
+    targeted = expected_credit_id is not None or expected_credit_expires_at is not None
+    if cached_credit is None and pending_credit_id is None and not targeted:
         raise DashboardConflictError("No available reset credit", code="no_available_reset_credit")
 
     access_token = encryptor.decrypt(redeem_account.access_token_encrypted)
@@ -396,6 +500,22 @@ async def _redeem_soonest_reset_credit_locked(
         # leaves a durable pin any replica can reuse.
         credit_id = await pin_redeem_request(account.id, redeem_request_id, credit.id)
 
+    pinned_credit = next((item for item in credits_response.credits if item.id == credit_id), None)
+    if (expected_credit_id is not None and expected_credit_id != credit_id) or (
+        expected_credit_expires_at is not None
+        and (pinned_credit is None or not _same_credit_expiry(pinned_credit.expires_at, expected_credit_expires_at))
+    ):
+        raise DashboardConflictError("Target reset credit changed", code="target_reset_credit_changed")
+    claim_holder_id = await assert_claim_owned() if assert_claim_owned is not None else None
+    # Credential, route, fetch, pin and claim-renewal awaits can outlive the
+    # account's eligibility. Observe its state and the SQLite claim together
+    # after renewal, so this final read cannot silently outlive ownership.
+    await _reload_redeem_account(
+        redeem_account,
+        session=lock_session,
+        expected_identity=expected_identity,
+        claim_holder_id=claim_holder_id,
+    )
     try:
         result = await effective_consume_fn(
             access_token,
@@ -440,6 +560,50 @@ async def _redeem_soonest_reset_credit_locked(
         available_count_before=credits_response.available_count,
         available_count_after=available_count_after,
     )
+
+
+async def _reload_redeem_account(
+    account: Account,
+    *,
+    session: AsyncSession | None,
+    expected_identity: tuple[str, str | None],
+    claim_holder_id: str | None = None,
+) -> Account:
+    # The supplied session also owns PostgreSQL's transaction advisory lock.
+    # A real SELECT refreshes its identity map rather than reusing the account
+    # loaded before serialization. Sessionless helper callers retain their
+    # caller-owned account object and the same eligibility checks.
+    if session is not None and claim_holder_id is not None:
+        observation = await session.execute(
+            select(Account, ResetCreditRedeemClaim.holder_id, ResetCreditRedeemClaim.expires_at)
+            .outerjoin(ResetCreditRedeemClaim, ResetCreditRedeemClaim.account_id == Account.id)
+            .where(Account.id == expected_identity[0])
+            .execution_options(populate_existing=True)
+        )
+        row = observation.one_or_none()
+        current = row[0] if row is not None else None
+        if row is not None:
+            holder_id, expires_at = row[1], row[2]
+            # The SELECT can itself await past the observed deadline. Check
+            # its full-precision UTC expiry only after that await returns.
+            if (
+                holder_id != claim_holder_id
+                or expires_at is None
+                or expires_at.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc)
+            ):
+                raise RedeemClaimLostError("Reset-credit consume admission lost its claim during account read")
+    else:
+        current = (
+            await AccountsRepository(session).get_by_id_fresh(expected_identity[0]) if session is not None else account
+        )
+    if current is None or current.delete_requested_at is not None:
+        raise DashboardNotFoundError("Account not found", code="account_not_found")
+    if (current.id, current.chatgpt_account_id) != expected_identity:
+        raise DashboardConflictError(
+            "Reset credit account identity changed", code="account_reset_credit_identity_changed"
+        )
+    _assert_account_can_redeem_reset_credit(current)
+    return current
 
 
 def _assert_account_can_redeem_reset_credit(account: Account) -> None:

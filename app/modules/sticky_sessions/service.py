@@ -12,12 +12,14 @@ from app.modules.proxy.sticky_repository import (
     is_reserved_sticky_session_key,
 )
 from app.modules.settings.repository import SettingsRepository
-from app.modules.sticky_sessions.schemas import StickySessionSortBy, StickySessionSortDir
+from app.modules.sticky_sessions.schemas import StickySessionSnapshot, StickySessionSortBy, StickySessionSortDir
 
 
 @dataclass(frozen=True, slots=True)
 class StickySessionEntryData:
     key: str
+    account_id: str
+    ownership_generation: str | None
     display_name: str
     kind: StickySessionKind
     created_at: datetime
@@ -66,6 +68,7 @@ class StickySessionsService:
         kind: StickySessionKind | None = None,
         stale_only: bool = False,
         account_query: str | None = None,
+        account_id: str | None = None,
         key_query: str | None = None,
         sort_by: StickySessionSortBy = "updated_at",
         sort_dir: StickySessionSortDir = "desc",
@@ -90,12 +93,14 @@ class StickySessionsService:
             kind=effective_kind,
             updated_before=stale_cutoff if stale_only else None,
             account_query=normalized_account_query,
+            account_id=account_id,
             key_query=normalized_key_query,
         )
         rows = await self._repository.list_entries(
             kind=effective_kind,
             updated_before=stale_cutoff if stale_only else None,
             account_query=normalized_account_query,
+            account_id=account_id,
             key_query=normalized_key_query,
             sort_by=sort_by,
             sort_dir=sort_dir,
@@ -136,6 +141,16 @@ class StickySessionsService:
 
         return StickySessionsDeleteData(deleted=deleted, failed=failed)
 
+    async def delete_snapshot(self, entries: Sequence[StickySessionSnapshot]) -> StickySessionsDeleteData:
+        deleted = await self._repository.delete_snapshot(entries)
+        deleted_set = set(deleted)
+        failed = [
+            StickySessionDeleteFailureData(key=entry.key, kind=entry.kind, reason="changed_or_missing")
+            for entry in entries
+            if (entry.key, entry.kind) not in deleted_set
+        ]
+        return StickySessionsDeleteData(deleted=deleted, failed=failed)
+
     async def delete_filtered_entries(
         self,
         *,
@@ -174,6 +189,8 @@ class StickySessionsService:
             is_stale = expires_at <= utcnow()
         return StickySessionEntryData(
             key=sticky_session.key,
+            account_id=sticky_session.account_id,
+            ownership_generation=sticky_session.ownership_generation,
             display_name=row.display_name,
             kind=sticky_session.kind,
             created_at=sticky_session.created_at,

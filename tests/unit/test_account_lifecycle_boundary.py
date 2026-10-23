@@ -18,6 +18,8 @@ _ALLOWED = {
     "db/models.py",
     "db/alembic/versions/20261005_000000_add_account_lifecycle_preferences.py",
     "db/alembic/versions/20261005_010000_merge_account_lifecycle_and_keyless_priority.py",
+    # Names the merge revision above as its parent only.
+    "db/alembic/versions/20261022_000000_add_routing_hold_and_sticky_generation.py",
 }
 
 

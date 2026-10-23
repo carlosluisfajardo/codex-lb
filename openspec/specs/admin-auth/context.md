@@ -64,3 +64,7 @@ Password login and TOTP verification: max 8 attempts per 60-second window per cl
 ## Audit Logging
 
 Events: `login_success`, `login_failed`, `totp_enabled`, `totp_disabled`, `settings_changed`. Stored in `audit_logs` table via `AuditService.log_async()`.
+
+## Audit boundary and ownership interfaces
+
+Trusted dashboard-header admission uses the preserved socket peer in both the sanitizer and resolver. A loopback proxy may forward a public client address without losing its own trust, while an external peer cannot gain trust by forwarding loopback. This differs from the projected client address used for ordinary logging.

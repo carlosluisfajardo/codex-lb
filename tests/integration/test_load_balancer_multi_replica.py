@@ -9,17 +9,20 @@ CAS-wrote the flip back, erasing the marking replica's rate-limit state.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import update
 
 from app.core.balancer import RATE_LIMITED_MIN_COOLDOWN_SECONDS
+from app.core.balancer import logic as balancer_logic
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus
+from app.db.models import Account, AccountStatus, StickySession, StickySessionKind
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
@@ -102,6 +105,135 @@ async def _fetch_account(account_id: str) -> Account:
         assert account is not None
         await session.refresh(account)
         return account
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disjoint_scope", [False, True])
+async def test_simultaneous_first_hard_owner_reconciles_to_durable_winner(db_setup, monkeypatch, disjoint_scope):
+    first, second = _make_account("first-owner-a"), _make_account("first-owner-b")
+    await _seed_accounts_with_usage((first, 10, 10), (second, 10, 10))
+    balancers = [LoadBalancer(_repo_factory), LoadBalancer(_repo_factory)]
+    missing_reads = 0
+    both_missing, both_drawn = asyncio.Event(), asyncio.Event()
+    original_read = StickySessionsRepository.get_account_id_and_abandonment
+    original_select = LoadBalancer._select_with_stickiness
+    draws: list[str] = []
+    random_draws = 0
+
+    async def synchronize_missing(self, key, **kwargs):
+        nonlocal missing_reads
+        observed = await original_read(self, key, **kwargs)
+        if key == "raced-hard-owner" and observed.account_id is None and missing_reads < 2:
+            missing_reads += 1
+            if missing_reads == 2:
+                both_missing.set()
+            await asyncio.wait_for(both_missing.wait(), 2)
+        return observed
+
+    def choose_different(states, weights, k):
+        nonlocal random_draws
+        chosen = states[random_draws % len(states)]
+        random_draws += 1
+        return [chosen]
+
+    async def synchronize_draws(self, **kwargs):
+        outcome = await original_select(self, **kwargs)
+        assert outcome.selection.account is not None
+        draws.append(outcome.selection.account.account_id)
+        if len(draws) == 2:
+            both_drawn.set()
+        await asyncio.wait_for(both_drawn.wait(), 2)
+        return outcome
+
+    monkeypatch.setattr(StickySessionsRepository, "get_account_id_and_abandonment", synchronize_missing)
+    monkeypatch.setattr(LoadBalancer, "_select_with_stickiness", synchronize_draws)
+    monkeypatch.setattr(balancer_logic.random, "choices", choose_different)
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            *(
+                balancer.select_account(
+                    sticky_key="raced-hard-owner",
+                    sticky_kind=StickySessionKind.CODEX_SESSION,
+                    sticky_source="turn_state",
+                    lease_kind="stream",
+                    account_ids=[account.id] if disjoint_scope else None,
+                )
+                for balancer, account in zip(balancers, [first, second], strict=True)
+            )
+        ),
+        5,
+    )
+    try:
+        assert missing_reads == 2
+        assert len(draws) == 2 and draws[0] != draws[1]
+        async with SessionLocal() as session:
+            winner = await StickySessionsRepository(session).get_account_id(
+                "raced-hard-owner", kind=StickySessionKind.CODEX_SESSION
+            )
+        dispatched = [result.account.id for result in results if result.account is not None]
+        assert dispatched == [winner] * (1 if disjoint_scope else 2)
+        for balancer, result in zip(balancers, results, strict=True):
+            assert sum(runtime.inflight_streams for runtime in balancer._runtime.values()) == int(
+                result.account is not None
+            )
+    finally:
+        for balancer, result in zip(balancers, results, strict=True):
+            await balancer.release_account_lease(result.lease)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initialize_seed", [False, True])
+async def test_delayed_soft_refresh_preserves_concurrent_rebinding(db_setup, monkeypatch, initialize_seed):
+    first, second = _make_account("soft-a"), _make_account("soft-b")
+    await _seed_accounts_with_usage((first, 10, 10), (second, 10, 10))
+    async with SessionLocal() as session:
+        await StickySessionsRepository(session).upsert("soft-refresh", first.id, kind=StickySessionKind.STICKY_THREAD)
+        await session.execute(
+            update(StickySession)
+            .where(StickySession.key == "soft-refresh")
+            .values(updated_at=utcnow() - timedelta(seconds=120))
+        )
+        await session.commit()
+    balancer = LoadBalancer(_repo_factory)
+    ready, release = asyncio.Event(), asyncio.Event()
+    original_persist = balancer._persist_selection_state
+
+    async def delay_before_mapping(*args, **kwargs):
+        result = await original_persist(*args, **kwargs)
+        ready.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(balancer, "_persist_selection_state", delay_before_mapping)
+    task = asyncio.create_task(
+        balancer.select_account(
+            sticky_key="soft-refresh",
+            sticky_kind=StickySessionKind.STICKY_THREAD,
+            sticky_max_age_seconds=3600,
+            sticky_source="thread_header" if initialize_seed else None,
+            sticky_seed_key="seed-from-refresh" if initialize_seed else None,
+            sticky_seed_kind=StickySessionKind.CODEX_SESSION if initialize_seed else None,
+        )
+    )
+    try:
+        await asyncio.wait_for(ready.wait(), 2)
+        async with SessionLocal() as session:
+            await StickySessionsRepository(session).upsert(
+                "soft-refresh", second.id, kind=StickySessionKind.STICKY_THREAD
+            )
+        release.set()
+        result = await asyncio.wait_for(task, 2)
+        assert result.account is not None and result.account.id == first.id
+        async with SessionLocal() as session:
+            repo = StickySessionsRepository(session)
+            assert await repo.get_account_id("soft-refresh", kind=StickySessionKind.STICKY_THREAD) == second.id
+            if initialize_seed:
+                assert await repo.get_account_id("seed-from-refresh", kind=StickySessionKind.CODEX_SESSION) is None
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

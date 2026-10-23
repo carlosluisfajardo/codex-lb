@@ -74,3 +74,7 @@ Source-qualified markers leave the legacy timestamp NULL, so an older binary
 safely restores conservative hard ownership during rollback. Dropping the scope
 column loses only restart-recovery state; it does not make the retained owner
 mobile.
+
+## Audit boundary and ownership interfaces
+
+Snapshot cleanup starts with an exact accountId-filtered listing and sends selected key/kind/accountId/ownershipGeneration entries to POST /api/sticky-sessions/delete-snapshot. It never expands the snapshot into new pins. A generation changes on ownership upsert or delete/recreate; nullable legacy rows cannot qualify. Current-generation writers are required: an old binary rewriting a generated row does not maintain this protocol. Legacy delete/delete-filtered routes retain their existing semantics and are not the snapshot interface.

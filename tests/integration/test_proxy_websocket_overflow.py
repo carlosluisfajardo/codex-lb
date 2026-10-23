@@ -40,6 +40,7 @@ from app.db.session import SessionLocal, sqlite_writer_section
 from app.dependencies import get_proxy_service_for_app
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService
+from app.modules.proxy._service.websocket import mixin as websocket_mixin_module
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.affinity import _codex_backend_identity
 from app.modules.proxy.model_source_pins import (
@@ -288,6 +289,14 @@ def _attach_fake_subscription_upstream(monkeypatch: pytest.MonkeyPatch, upstream
 
     monkeypatch.setattr(proxy_module.ProxyService, "_select_websocket_connect_account", select_account)
     monkeypatch.setattr(proxy_module.ProxyService, "_try_open_websocket_connect_attempt", open_attempt)
+    # This synthetic account has no database row, so the routing snapshot
+    # cannot list it; model only its availability at the per-frame fence.
+    routing_unavailable = websocket_mixin_module.is_account_routing_unavailable
+    monkeypatch.setattr(
+        websocket_mixin_module,
+        "is_account_routing_unavailable",
+        lambda account_id: account_id != account.id and routing_unavailable(account_id),
+    )
 
 
 # --- handshake: 426 only on evidence ----------------------------------------------------------------------

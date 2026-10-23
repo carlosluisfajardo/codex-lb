@@ -788,6 +788,8 @@ class AccountsRepository:
         expected_reset_at: int | None = None,
         expected_blocked_at: int | None | object = _UNSET,
         expected_refresh_token_encrypted: bytes | None = None,
+        expected_routing_policy: str | None = None,
+        expected_routing_held: bool | None = None,
     ) -> bool:
         async with sqlite_writer_section():
             values: dict[str, object | None] = {
@@ -825,6 +827,10 @@ class AccountsRepository:
                 # re-auth/import rotates the token ciphertext without touching
                 # status/reason/reset, and this write must lose that race.
                 stmt = stmt.where(Account.refresh_token_encrypted == expected_refresh_token_encrypted)
+            if expected_routing_policy is not None:
+                stmt = stmt.where(Account.routing_policy == expected_routing_policy)
+            if expected_routing_held is not None:
+                stmt = stmt.where(Account.routing_held == expected_routing_held)
             result = await self._session.execute(stmt)
             updated_id = result.scalar_one_or_none()
             if updated_id is not None and self._hard_sticky_outage_started(expected_status, status):
@@ -984,9 +990,17 @@ class AccountsRepository:
             await self._session.commit()
             return result.scalar_one_or_none() is not None
 
-    async def update_routing_policy(self, account_id: str, routing_policy: str) -> bool:
+    async def update_routing_policy(
+        self,
+        account_id: str,
+        routing_policy: str,
+        *,
+        expected_status: AccountStatus | None = None,
+        expected_routing_policy: str | None = None,
+        expected_routing_held: bool | None = None,
+    ) -> bool:
         async with sqlite_writer_section():
-            result = await self._session.execute(
+            stmt = (
                 update(Account)
                 .where(Account.id == account_id)
                 # Marked-for-deletion rows are gone from the operator's
@@ -994,6 +1008,38 @@ class AccountsRepository:
                 # synchronous delete did once the row was removed.
                 .where(Account.delete_requested_at.is_(None))
                 .values(routing_policy=routing_policy)
+                .returning(Account.id)
+            )
+            if expected_status is not None:
+                stmt = stmt.where(Account.status == expected_status)
+            if expected_routing_policy is not None:
+                stmt = stmt.where(Account.routing_policy == expected_routing_policy)
+            if expected_routing_held is not None:
+                stmt = stmt.where(Account.routing_held == expected_routing_held)
+            result = await self._session.execute(stmt)
+            await self._session.commit()
+            return result.scalar_one_or_none() is not None
+
+    async def update_routing_hold_if_current(
+        self,
+        account_id: str,
+        held: bool,
+        *,
+        expected_status: AccountStatus,
+        expected_routing_policy: str,
+        expected_routing_held: bool,
+    ) -> bool:
+        async with sqlite_writer_section():
+            result = await self._session.execute(
+                update(Account)
+                .where(
+                    Account.id == account_id,
+                    Account.delete_requested_at.is_(None),
+                    Account.status == expected_status,
+                    Account.routing_policy == expected_routing_policy,
+                    Account.routing_held == expected_routing_held,
+                )
+                .values(routing_held=held)
                 .returning(Account.id)
             )
             await self._session.commit()

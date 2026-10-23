@@ -27,6 +27,8 @@ def _account(
         reset_at=reset_at,
         blocked_at=blocked_at,
         delete_requested_at=None,
+        routing_policy="normal",
+        routing_held=False,
     )
 
 
@@ -51,6 +53,8 @@ async def test_pause_account_uses_conditional_status_update() -> None:
         expected_deactivation_reason=None,
         expected_reset_at=None,
         expected_blocked_at=None,
+        expected_routing_policy=None,
+        expected_routing_held=None,
     )
     repo.update_status.assert_not_called()
 

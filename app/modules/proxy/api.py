@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from functools import partial
 from json import JSONDecodeError
 from typing import Any, Final, Literal, Protocol, TypeVar, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import anyio
@@ -369,7 +370,7 @@ from app.modules.proxy.types import (
     RateLimitWindowSnapshotData,
 )
 from app.modules.rate_limit_reset_credits.api import serialize_reset_credit_redeem
-from app.modules.rate_limit_reset_credits.redeem_coordination import RedeemClaimTimeoutError
+from app.modules.rate_limit_reset_credits.redeem_coordination import RedeemClaimLostError, RedeemClaimTimeoutError
 from app.modules.rate_limit_reset_credits.store import get_rate_limit_reset_credits_store
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.mappers import usage_history_to_window_row
@@ -1972,7 +1973,9 @@ def _translate_v1_reset_credit_refresh_error(exc: RefreshError) -> HTTPException
 
 
 @asynccontextmanager
-async def _serialize_v1_reset_credit_redeem(account_id: str, *, session: AsyncSession) -> AsyncIterator[None]:
+async def _serialize_v1_reset_credit_redeem(
+    account_id: str, *, session: AsyncSession
+) -> AsyncIterator[Callable[[], Awaitable[None]] | None]:
     """Serialize the v1 redeem section, mapping claim contention to the OpenAI envelope.
 
     The shared serializer raises ``RedeemClaimTimeoutError`` on SQLite claim
@@ -1981,8 +1984,12 @@ async def _serialize_v1_reset_credit_redeem(account_id: str, *, session: AsyncSe
     dashboard one.
     """
     try:
-        async with serialize_reset_credit_redeem(account_id, session=session):
-            yield
+        async with serialize_reset_credit_redeem(account_id, session=session) as assert_claim_owned:
+            yield assert_claim_owned
+    except RedeemClaimLostError as exc:
+        raise HTTPException(
+            status_code=409, detail="Reset credit redemption lost its claim; reconcile any in-flight consume"
+        ) from exc
     except RedeemClaimTimeoutError as exc:
         raise HTTPException(
             status_code=409,
@@ -2054,7 +2061,7 @@ async def v1_redeem_reset_credit(
             raise HTTPException(status_code=403, detail="Account is outside the API key pool")
         account_id = account.id
 
-        async with _serialize_v1_reset_credit_redeem(account_id, session=session):
+        async with _serialize_v1_reset_credit_redeem(account_id, session=session) as assert_claim_owned:
             try:
                 route = await _resolve_reset_credit_route(session, account_id)
             except UpstreamProxyRouteError as exc:
@@ -2079,6 +2086,8 @@ async def v1_redeem_reset_credit(
             )
             if credit is None:
                 raise HTTPException(status_code=409, detail="Requested reset credit is unavailable")
+            if assert_claim_owned is not None:
+                await assert_claim_owned()
             try:
                 result = await consume_reset_credit(
                     access_token,
@@ -8769,6 +8778,40 @@ def _required_capability_values(headers: Mapping[str, str]) -> tuple[str, ...]:
     return tuple(value for name, value in headers.items() if name.lower() == normalized_name)
 
 
+def _keyless_websocket_origin_allowed(websocket: WebSocket) -> bool:
+    headers = websocket.headers
+    if "origin" not in headers and "sec-fetch-site" not in headers:
+        return True
+    fetch_sites = headers.getlist("sec-fetch-site")
+    if fetch_sites and (len(fetch_sites) != 1 or fetch_sites[0].strip().lower() not in {"same-origin", "none"}):
+        return False
+    origins = headers.getlist("origin")
+    if not origins:
+        return True
+    if len(origins) != 1:
+        return False
+    try:
+        origin = urlsplit(origins[0].strip())
+        expected = urlsplit(str(websocket.url))
+        scheme = {"ws": "http", "wss": "https"}.get(expected.scheme)
+        default_port = 443 if scheme == "https" else 80
+        return (
+            scheme is not None
+            and origin.scheme == scheme
+            and origin.hostname == expected.hostname
+            and origin.hostname is not None
+            and (origin.port if origin.port is not None else default_port)
+            == (expected.port if expected.port is not None else default_port)
+            and origin.username is None
+            and origin.password is None
+            and origin.path in {"", "/"}
+            and not origin.query
+            and not origin.fragment
+        )
+    except ValueError:
+        return False
+
+
 async def _validate_proxy_websocket_request(
     websocket: WebSocket,
     *,
@@ -8791,6 +8834,15 @@ async def _validate_proxy_websocket_request(
         return None, JSONResponse(
             status_code=exc.status_code,
             content=openai_error(exc.code, exc.message, error_type=exc.error_type),
+        )
+    if api_key is None and not _keyless_websocket_origin_allowed(websocket):
+        return None, JSONResponse(
+            status_code=403,
+            content=openai_error(
+                "cross_site_request_rejected",
+                "Cross-site keyless WebSocket requests are not allowed",
+                error_type="access_error",
+            ),
         )
     if capability_header_values and not allow_required_capability:
         return api_key, JSONResponse(

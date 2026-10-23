@@ -178,3 +178,9 @@ short windows, or evaluated for a quota the plan does not have.
 Settlement is discarded if newer replica-local runtime activity arrives while
 that snapshot is loading, preventing an older probe success from clearing a
 later failure.
+
+## Audit boundary and ownership interfaces
+
+A routing hold is independent of authentication status and the normal/burn_first/preserve policy. For example, a usable reauth_required account can be held without hiding its warning. Hold writes require expected status, routingPolicy and routingHeld; routing-policy, pause and reactivate accept the same optional tuple. Consumers protecting caller ownership must supply it. Existing legacy writes without expectations remain compatible. Replica availability snapshots and account selection both enforce holds. Older binaries cannot enforce this new column, so rollback needs operator handling of retained holds.
+
+Availability refreshes carry a local generation. A successfully published refresh supersedes older in-flight reads, including reads suspended during session close. A later refresh that merely starts cannot discard a completed hold's observation while it remains pending or fails. Reset supersedes all reads already in flight. Ordinary reauthentication clearing cannot erase the published hold; bridge checks remain in memory without a per-request database read.

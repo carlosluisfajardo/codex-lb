@@ -1257,7 +1257,7 @@ class LoadBalancer:
                 # before PAUSED/DEACTIVATED/etc. can manufacture uniqueness.
                 continuity_owner_candidates = scoped_accounts
             if model and not accounts:
-                if not all_accounts:
+                if not all_accounts or not pre_model_filter_accounts:
                     selection_inputs = _SelectionInputs(
                         accounts=[],
                         latest_primary={},
@@ -1266,21 +1266,6 @@ class LoadBalancer:
                         continuity_owner_candidates=[
                             _clone_account(account) for account in continuity_owner_candidates
                         ],
-                        sticky_mutation_authority_account_ids=sticky_mutation_authority_account_ids,
-                        quota_planner_settings=quota_planner_settings,
-                        runtime_accounts=[_clone_account(account) for account in all_accounts],
-                    )
-                    await self._selection_inputs_cache.set(
-                        _clone_selection_inputs(selection_inputs), key=cache_key, generation=load_generation
-                    )
-                    return selection_inputs
-                if not pre_model_filter_accounts:
-                    selection_inputs = _SelectionInputs(
-                        accounts=[],
-                        latest_primary={},
-                        latest_secondary={},
-                        latest_monthly={},
-                        continuity_owner_candidates=[],
                         sticky_mutation_authority_account_ids=sticky_mutation_authority_account_ids,
                         quota_planner_settings=quota_planner_settings,
                         runtime_accounts=[_clone_account(account) for account in all_accounts],
@@ -2945,7 +2930,11 @@ def _filter_accounts_for_model_with_catalog_evidence(
 
 
 def _selectable_accounts(accounts: list[Account]) -> list[Account]:
-    return [account for account in accounts if account.status not in (AccountStatus.DEACTIVATED, AccountStatus.PAUSED)]
+    return [
+        account
+        for account in accounts
+        if not account.routing_held and account.status not in (AccountStatus.DEACTIVATED, AccountStatus.PAUSED)
+    ]
 
 
 def _mapped_model_has_registry_entry(model: str | None) -> bool:

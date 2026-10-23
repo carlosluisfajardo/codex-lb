@@ -464,6 +464,7 @@ from app.modules.proxy._service.websocket.overflow import (
     bounce_pinned_or_anchored_websocket_turn,
 )
 from app.modules.proxy._service.websocket.protocol import _WebSocketServiceProtocol
+from app.modules.proxy.account_cache import is_account_routing_unavailable
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
     _is_synthesized_turn_state,
@@ -2819,10 +2820,19 @@ class _WebSocketMixin:
                     if text_data is not None:
                         archive_request_id = None if request_state is None else request_state.archive_request_id
                         if request_state is not None and payload is not None and _is_websocket_response_create(payload):
-                            if account is None or not _bind_websocket_request_dispatch_owner(
-                                request_state,
-                                account_id=account.id,
-                                exact_request_text=text_data,
+                            # A retained socket bypasses selection. Pause/hold
+                            # can also commit during admission or capacity waits,
+                            # so fence every new frame here with no intervening
+                            # await before send. Reject only this unsent frame;
+                            # neither its anchors nor other in-flight work move.
+                            if (
+                                account is None
+                                or is_account_routing_unavailable(account.id)
+                                or not _bind_websocket_request_dispatch_owner(
+                                    request_state,
+                                    account_id=account.id,
+                                    exact_request_text=text_data,
+                                )
                             ):
                                 raise ProxyResponseError(
                                     502,

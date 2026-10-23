@@ -42,6 +42,10 @@ class RedeemClaimTimeoutError(Exception):
     """The per-account redeem claim stayed held past the acquisition timeout."""
 
 
+class RedeemClaimLostError(Exception):
+    """The holder can no longer prove an unexpired redemption claim."""
+
+
 def new_redeem_claim_holder_id() -> str:
     return uuid.uuid4().hex
 
@@ -109,23 +113,58 @@ async def renew_redeem_claim(
     *,
     lease_seconds: float = REDEEM_CLAIM_LEASE_SECONDS,
 ) -> bool:
-    """Extend the holder's lease; False when the row is no longer held by this holder."""
-    now = datetime.now(UTC)
+    """Extend a still-live lease; never resurrect an expired holder."""
     session = SessionLocal()
     try:
-        result = await session.execute(
+        # A no-op write takes the database's writer/row lock and returns the
+        # current deadline without extending it. Read the clock AFTER this
+        # await: both a Python timestamp and database statement/transaction
+        # NOW() can predate a lock wait. Concurrent heartbeat and admission
+        # renewals serialize here instead of spuriously losing a read/CAS race.
+        locked = await session.execute(
             update(ResetCreditRedeemClaim)
             .where(
                 ResetCreditRedeemClaim.account_id == account_id,
                 ResetCreditRedeemClaim.holder_id == holder_id,
             )
-            .values(expires_at=now + timedelta(seconds=lease_seconds))
+            .values(expires_at=ResetCreditRedeemClaim.expires_at)
+            .returning(ResetCreditRedeemClaim.expires_at)
+        )
+        previous_expiry = locked.scalar_one_or_none()
+        now = datetime.now(UTC)
+        if previous_expiry is None:
+            await session.rollback()
+            return False
+        # SQLite returns naive UTC DateTime values; preserve all microseconds.
+        previous_expiry_utc = (
+            previous_expiry.replace(tzinfo=UTC) if previous_expiry.tzinfo is None else previous_expiry.astimezone(UTC)
+        )
+        if previous_expiry_utc <= now:
+            await session.rollback()
+            return False
+        expires_at = now + timedelta(seconds=lease_seconds)
+        result = await session.execute(
+            update(ResetCreditRedeemClaim)
+            .where(
+                ResetCreditRedeemClaim.account_id == account_id,
+                ResetCreditRedeemClaim.holder_id == holder_id,
+                ResetCreditRedeemClaim.expires_at == previous_expiry,
+            )
+            .values(expires_at=expires_at)
             .returning(ResetCreditRedeemClaim.account_id)
         )
+        renewed = result.scalar_one_or_none() is not None
+        # Keep the lock until this post-write check and commit/rollback. If
+        # the extension awaited past the OLD deadline, none of its tentative
+        # bytes become visible and neither heartbeat nor consume admission wins.
+        checked_at = datetime.now(UTC)
+        if not renewed or previous_expiry_utc <= checked_at or expires_at <= checked_at:
+            await session.rollback()
+            return False
         await session.commit()
-        return result.scalar_one_or_none() is not None
     finally:
         await close_session(session)
+    return renewed and expires_at > datetime.now(UTC)
 
 
 async def renew_redeem_claim_periodically(
@@ -141,29 +180,18 @@ async def renew_redeem_claim_periodically(
     ``expires_at`` every ``renew_interval_seconds`` (a fraction of the lease)
     so a legitimately slow redemption — usage fetch retries plus the upstream
     consume can exceed one lease — is not taken over by a second process.
-    Transient renewal errors are logged and retried on the next tick; a renew
-    reporting the row gone means an expired claim was already taken over, so
-    the loop stops (exclusivity is lost and lease takeover semantics apply).
-    The caller cancels this task before releasing the claim.
+    A failed or uncertain renewal raises to the owning task group, which stops
+    the body. The caller cancels this task before releasing the exact holder.
+    Cancellation of an in-flight external consume does not prove its outcome.
     """
     while True:
         await asyncio.sleep(renew_interval_seconds)
         try:
             renewed = await renew_redeem_claim(account_id, holder_id, lease_seconds=lease_seconds)
-        except Exception:
-            logger.warning(
-                "reset-credit redeem claim renewal failed account_id=%s (retrying next tick)",
-                account_id,
-                exc_info=True,
-            )
-            continue
+        except Exception as exc:
+            raise RedeemClaimLostError("Reset-credit claim renewal could not establish ownership") from exc
         if not renewed:
-            logger.warning(
-                "reset-credit redeem claim lost before renewal account_id=%s holder_id=%s",
-                account_id,
-                holder_id,
-            )
-            return
+            raise RedeemClaimLostError("Reset-credit claim expired or changed owner")
 
 
 async def release_redeem_claim(account_id: str, holder_id: str) -> None:

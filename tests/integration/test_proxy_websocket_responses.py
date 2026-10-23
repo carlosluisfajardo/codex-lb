@@ -142,6 +142,15 @@ def _assert_upstream_payloads(sent_text: list[str], expected: list[dict[str, Any
 
 
 @pytest.fixture(autouse=True)
+def _synthetic_transport_accounts_are_routing_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These transport/ownership tests replace selection with synthetic accounts
+    # that have no database rows. Model their selected-account availability at
+    # the same boundary. The separate reused-WebSocket routing suite uses real
+    # private rows, actual pause/hold endpoints and the unmocked routing cache.
+    monkeypatch.setattr(websocket_mixin_module, "is_account_routing_unavailable", lambda _account_id: False)
+
+
+@pytest.fixture(autouse=True)
 def _stub_request_logging(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_write_request_log(self, **kwargs):
         del self, kwargs

@@ -126,3 +126,11 @@ does not count as evidence that the account is healthy.
 
 - [#676 - initial bug report on `/wham/usage` vs. Settings UI divergence](https://github.com/Soju06/codex-lb/issues/676)
 - [#677 - dashboard per-account force-probe action](https://github.com/Soju06/codex-lb/issues/677)
+
+## Audit boundary and ownership interfaces
+
+POST /api/accounts/{id}/usage-refresh takes window, expectedResetAt and the caller's expected routing tuple. fetchSucceeded describes the fetch; refreshed requires that operation's persisted window/reset match and returns its usageId and recordedAt. A primary-only response cannot prove secondary freshness. No cached timestamp substitutes for the operation receipt, and refresh never releases a routing hold. Secondary-only snapshots now carry fresh credits when no writable primary/monthly row can carry them.
+
+expectedResetAt is optional. Without it, refreshed proves that this operation persisted the requested window and the response carries that row's resetAt, usedPercent, usageId and recordedAt; a caller detects a refill by the new reset and reading while a paused or held account stays unservable. With it, the exact-reset rule above still applies. The untargeted usage-reset consume names no credit upstream, so it refuses expectedCreditId or expectedCreditExpiresAt rather than ignoring them; exact-target callers use the reset-credit consume.
+
+The poll's chatgpt account ID is kept as a value before the fetch because the refresh updates the account object in place, so that object cannot witness a replacement. If the identity changed by the time the receipt would be returned, the request conflicts instead of certifying the previous identity's reading. As with every usage refresh, that reading's row is still appended under the local account ID.

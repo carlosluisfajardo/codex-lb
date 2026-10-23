@@ -350,6 +350,7 @@ class _StickyMutation:
     # write time and may then omit the statement entirely; a mutation that
     # rebinds, deletes, or must initialize a seed mapping never carries it.
     refresh_skip_deadline: datetime | None = None
+    refresh_owner_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -564,6 +565,9 @@ async def run_sticky_selection_path(
                 routing_tunables=routing_tunables,
                 model=request.model,
             )
+            runtime_versions = {
+                state.account_id: owner._runtime.get(state.account_id, RuntimeState()).version for state in states
+            }
             if retired_legacy_owner_account_ids:
                 # Retirement is authoritative even when this selector loaded a
                 # pre-retirement account snapshot (or another replica still has
@@ -1061,9 +1065,10 @@ async def run_sticky_selection_path(
                             selected.id,
                             kind=lease_kind,
                             estimated_tokens=estimated_lease_tokens,
-                            # Keep the reservation token intact until
-                            # persistence commits the recovery admission.
-                            record_selection=not selected_reserved_probe,
+                            # The guarded synchronization below records ordinary
+                            # selection; probes record it after persistence. An
+                            # own-lease version bump must not invalidate either CAS.
+                            record_selection=False,
                             api_key_id=api_key_id,
                         )
 
@@ -1083,6 +1088,7 @@ async def run_sticky_selection_path(
                         owner._sync_runtime_state(
                             account,
                             state,
+                            expected_version=runtime_versions[state.account_id],
                             # A selected probe remains provisional through DB
                             # persistence. Its reservation is committed below;
                             # advancing last_selected_at here would make later
@@ -1191,6 +1197,40 @@ async def run_sticky_selection_path(
             and selection_error_code is None
             and (selected_snapshot is not None or result.account is None)
         )
+        first_hard_owner_published = False
+        if (
+            should_persist_sticky_mutation
+            and selected_snapshot is not None
+            and sticky_kind == StickySessionKind.CODEX_SESSION
+            and not bare_session_key
+            and sticky_existing_account_id is None
+            and not sticky_continuity_abandoned
+        ):
+            try:
+                async with owner._repo_factory() as repos:
+                    durable_owner = await repos.sticky_sessions.insert_if_absent(
+                        sticky_key, selected_snapshot.id, sticky_kind
+                    )
+            except BaseException:
+                await owner.release_account_lease(selected_lease)
+                async with owner._runtime_lock:
+                    owner._release_due_probe_reservation_locked(probe_reservation)
+                raise
+            if durable_owner != selected_snapshot.id:
+                await owner.release_account_lease(selected_lease)
+                selected_lease = None
+                selected_snapshot = None
+                async with owner._runtime_lock:
+                    owner._release_due_probe_reservation_locked(probe_reservation)
+                if attempt >= MAX_SELECTION_ATTEMPTS:
+                    return _direct_error(
+                        account=None,
+                        error_message="Hard affinity ownership changed during admission",
+                        error_code="continuity_owner_conflict",
+                    )
+                selection_inputs = await load_selection_inputs()
+                continue
+            first_hard_owner_published = True
         if selected_snapshot is not None and reserved_probe_admitted and should_persist_sticky_mutation:
             reservation_committed = False
             assert sticky_kind is not None
@@ -1201,7 +1241,7 @@ async def run_sticky_selection_path(
             # owner, so the rollback restores become no-ops and are skipped
             # symmetrically). The probe path deliberately never initializes a
             # seed, so only the deadline gates the skip.
-            probe_refresh_write_skipped = _sticky_refresh_write_skippable(
+            probe_refresh_write_skipped = first_hard_owner_published or _sticky_refresh_write_skippable(
                 sticky_mutation,
                 initialize_seed_key=None,
             )
@@ -1345,7 +1385,7 @@ async def run_sticky_selection_path(
                     )
                 await asyncio.sleep(0)
                 continue
-        if should_persist_sticky_mutation and not reserved_probe_admitted:
+        if should_persist_sticky_mutation and not reserved_probe_admitted and not first_hard_owner_published:
             # Sticky decisions stay provisional until cap classification,
             # final lease admission, account-state persistence, and the
             # probe CAS (when present) all succeed. Applying one final
@@ -1455,6 +1495,7 @@ async def _select_with_stickiness(
             mutation = _StickyMutation(
                 account_id=persist_account_id,
                 refresh_skip_deadline=refresh_skip_deadline,
+                refresh_owner_id=existing if persist_account_id == existing and not reallocate_sticky else None,
             )
         return _StickySelectionOutcome(selection=selection, mutation=mutation, effective_states=effective_states)
 
@@ -1834,6 +1875,15 @@ async def _persist_sticky_mutation(
 ) -> None:
     if mutation.account_id is None:
         await sticky_repo.delete(sticky_key, kind=sticky_kind)
+        return
+    if mutation.refresh_owner_id is not None:
+        await sticky_repo.refresh_if_current(
+            sticky_key,
+            kind=sticky_kind,
+            expected_account_id=mutation.refresh_owner_id,
+            seed_key=initialize_seed_key,
+            seed_kind=initialize_seed_kind,
+        )
         return
     if initialize_seed_key is not None:
         if initialize_seed_kind is None:

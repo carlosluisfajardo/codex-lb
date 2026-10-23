@@ -66,8 +66,18 @@ def _make_sticky_repo(existing_account_id: str | None = None) -> AsyncMock:
     repo = AsyncMock()
     repo.get_account_id = AsyncMock(return_value=existing_account_id)
     repo.upsert = AsyncMock()
+    repo.refresh_if_current = AsyncMock()
     repo.delete = AsyncMock()
     return repo
+
+
+def _assert_pinned_owner_refreshed(repo: AsyncMock, owner_id: str) -> None:
+    # Retaining the observed owner refreshes only that ownership; it never
+    # upserts, so it cannot resurrect or rebind a concurrently changed row.
+    repo.upsert.assert_not_called()
+    repo.refresh_if_current.assert_awaited_once_with(
+        "key1", kind=StickySessionKind.PROMPT_CACHE, expected_account_id=owner_id, seed_key=None, seed_kind=None
+    )
 
 
 async def _invoke_stickiness(
@@ -325,7 +335,7 @@ async def test_all_accounts_exhausted_keeps_pinned_no_thrashing():
     assert result.account is not None
     assert result.account.account_id == "a"
     repo.delete.assert_not_called()
-    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+    _assert_pinned_owner_refreshed(repo, "a")
 
 
 @pytest.mark.asyncio
@@ -448,7 +458,7 @@ async def test_pool_exhausted_single_account_keeps_pinned():
     assert result.account is not None
     assert result.account.account_id == "a"
     repo.delete.assert_not_called()
-    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+    _assert_pinned_owner_refreshed(repo, "a")
 
 
 @pytest.mark.asyncio
@@ -468,7 +478,7 @@ async def test_pool_exhausted_with_custom_threshold():
     assert result.account is not None
     assert result.account.account_id == "a"
     repo.delete.assert_not_called()
-    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+    _assert_pinned_owner_refreshed(repo, "a")
 
 
 @pytest.mark.asyncio
@@ -569,7 +579,7 @@ async def test_grace_period_returns_pinned_when_reset_imminent():
 
     assert result.account is not None
     assert result.account.account_id == "a"
-    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+    _assert_pinned_owner_refreshed(repo, "a")
 
 
 @pytest.mark.asyncio
@@ -607,7 +617,7 @@ async def test_grace_period_keeps_rate_limited_pinned_account_even_when_usage_is
     assert result.account is not None
     assert result.account.account_id == "a"
     repo.delete.assert_not_called()
-    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+    _assert_pinned_owner_refreshed(repo, "a")
 
 
 @pytest.mark.asyncio
@@ -744,7 +754,7 @@ async def test_reauth_required_pinned_account_preserves_owner():
 
     assert result.account is not None
     assert result.account.account_id == "a"
-    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+    _assert_pinned_owner_refreshed(repo, "a")
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +910,7 @@ async def test_budget_threshold_95_no_reallocation_at_85_percent():
     assert result.account is not None
     assert result.account.account_id == "a"
     repo.delete.assert_not_called()
-    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+    _assert_pinned_owner_refreshed(repo, "a")
 
 
 @pytest.mark.asyncio
@@ -1142,7 +1152,7 @@ async def test_burn_first_reallocation_only_when_burn_first_is_selectable():
     assert result.account is not None
     assert result.account.account_id == "a"
     repo.delete.assert_not_called()
-    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+    _assert_pinned_owner_refreshed(repo, "a")
 
 
 # ---------------------------------------------------------------------------
@@ -1191,7 +1201,7 @@ async def test_refresh_skippable_false_pinned_retention_still_refreshes():
 
     assert result.account is not None
     assert result.account.account_id == "a"
-    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+    _assert_pinned_owner_refreshed(repo, "a")
 
 
 @pytest.mark.asyncio
@@ -1272,7 +1282,7 @@ async def test_refresh_skippable_reset_when_existing_owner_not_prefetched():
 
     assert result.account is not None
     assert result.account.account_id == "a"
-    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+    _assert_pinned_owner_refreshed(repo, "a")
 
 
 @pytest.mark.asyncio
@@ -1293,7 +1303,7 @@ async def test_refresh_skip_deadline_expired_at_persist_time_still_refreshes():
 
     assert result.account is not None
     assert result.account.account_id == "a"
-    repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+    _assert_pinned_owner_refreshed(repo, "a")
 
 
 def test_refresh_write_skippable_guards_seed_and_delete_and_deadline():

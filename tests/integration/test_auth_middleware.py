@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta
+from uuid import uuid4
 
 import pyotp
 import pytest
@@ -21,6 +22,7 @@ from app.db.models import (
     Account,
     AccountStatus,
     ApiKeyLimit,
+    DashboardIdentity,
     DashboardSettings,
     DashboardUser,
     LimitType,
@@ -1136,6 +1138,60 @@ async def test_trusted_header_mode_scrubs_untrusted_proxy_header(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {"remote_user": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("socket_peer", "forwarded_peer", "trusted"),
+    [("203.0.113.11", "127.0.0.1", False), ("127.0.0.1", "203.0.113.11", True)],
+)
+async def test_trusted_header_uses_socket_peer_through_complete_app(
+    app_instance: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    socket_peer: str,
+    forwarded_peer: str,
+    trusted: bool,
+) -> None:
+    _set_dashboard_auth_env(monkeypatch, mode=DashboardAuthMode.TRUSTED_HEADER, trust_proxy_headers=True)
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
+    get_settings.cache_clear()
+    actor = "proxy-admin@example.invalid"
+    async with SessionLocal() as session:
+        user = DashboardUser(
+            id=str(uuid4()), username="proxy-admin", role_id=PRESET_ROLE_IDS[PresetRoleSlug.ADMIN], role_source="manual"
+        )
+        session.add(user)
+        await session.flush()
+        session.add(
+            DashboardIdentity(user_id=user.id, provider="trusted_header", provider_key="default", subject=actor)
+        )
+        await session.commit()
+
+    @app_instance.get("/audit-proxy-header")
+    async def echo_header(request: Request) -> dict[str, str | None]:
+        return {
+            "actor": request.headers.get("Remote-User"),
+            "projected": request.client.host if request.client else None,
+        }
+
+    # The app's dashboard catch-all precedes routes appended by this probe.
+    app_instance.router.routes.insert(0, app_instance.router.routes.pop())
+
+    async with app_instance.router.lifespan_context(app_instance):
+        async with AsyncClient(
+            transport=ASGITransport(app=app_instance, client=(socket_peer, 12345)), base_url="http://testserver"
+        ) as client:
+            headers = {"Remote-User": actor, "X-Forwarded-For": forwarded_peer}
+            observed = await client.get("/audit-proxy-header", headers=headers)
+            session_response = await client.get("/api/dashboard-auth/session", headers=headers)
+            settings_response = await client.get("/api/settings", headers=headers)
+
+    assert observed.status_code == 200
+    assert observed.json()["projected"] == forwarded_peer
+    assert observed.json()["actor"] == (actor if trusted else None)
+    assert session_response.status_code == 200
+    assert session_response.json()["authenticated"] is trusted
+    assert settings_response.status_code == (200 if trusted else 401)
 
 
 @pytest.mark.asyncio

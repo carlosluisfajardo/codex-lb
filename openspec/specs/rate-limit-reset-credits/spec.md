@@ -131,6 +131,7 @@ The system SHALL expose a dashboard endpoint `POST /api/accounts/{account_id}/ra
 
 #### Scenario: Consume with no available credit returns a client error
 - **GIVEN** an account whose cached snapshot reports `available_count: 0` (or has no snapshot)
+- **AND** the request carries neither an expected credit identity or expiry nor a durably pinned `redeem_request_id`
 - **WHEN** the operator invokes `POST /api/accounts/{id}/rate-limit-reset-credits/consume`
 - **THEN** the endpoint returns a `409` (or equivalent client-error) without calling upstream
 
@@ -331,3 +332,62 @@ The dashboard setting `rate_limit_reset_credits_refresh_enabled` (a nullable `da
 - **WHEN** an operator sets `rate_limit_reset_credits_refresh_enabled` to `true` in the dashboard
 - **THEN** refresh cycles fetch again and `provenance.rate_limit_reset_credits_refresh_enabled.source` is `dashboard`
 
+### Requirement: SQLite lease loss stops the owning redemption
+Expired claims MUST NOT be renewed into ownership. Failed or uncertain renewal MUST stop the owning body. Dashboard and v1 consume MUST re-establish current claim ownership immediately before admission. Cleanup MUST cover durable acquisition before return, release only the exact holder and preserve cancellation.
+#### Scenario: Ownership is lost during fetch
+- **WHEN** the claim expires or a successor takes it during pre-consume fetch
+- **THEN** the old body cannot admit consume and cannot release the successor
+#### Scenario: Renewal awaits past the old deadline
+- **WHEN** the claim expires while renewal waits for the write lock or its extension statement
+- **THEN** renewal is refused without committing an extended deadline
+- **AND** consume admission is refused while a successor remains able to acquire the expired claim
+#### Scenario: Cancellation follows acquisition commit
+- **WHEN** cancellation arrives after durable commit but before acquire returns
+- **THEN** exact-holder cleanup runs and cancellation remains observable
+#### Scenario: Renewal uncertainty preserves an unknown outcome
+- **WHEN** renewal fails after an attempt has been pinned
+- **THEN** the body stops and the durable pin remains for reconciliation
+- **AND** cancellation does not assert whether external consume succeeded
+
+### Requirement: Expected reset targets constrain first selection and retries
+Dashboard consume SHALL accept `expectedCreditId` and `expectedCreditExpiresAt`. Supplied expectations MUST constrain authoritative first selection and its durable admission pin. A conflicting existing or concurrently won pin MUST conflict before consume. A request carrying either expectation MUST reach the authoritative pre-consume fetch even when the local snapshot is stale, empty or absent; only that fetch, a durable pin or the eligibility and claim checks may refuse it. Requests without expectations SHALL retain supported selection/retry behavior, including the cached-availability refusal.
+#### Scenario: Approved credit disappears
+- **WHEN** another actor consumes the approved credit before the first request
+- **THEN** a later credit cannot be silently selected
+#### Scenario: Durable pin contradicts approval
+- **WHEN** an existing or concurrently established pin conflicts with expected identity or expiry
+- **THEN** consume is refused and the pin remains unchanged
+#### Scenario: Stale or absent cache cannot refuse an approved target
+- **WHEN** the local snapshot is empty or absent but upstream lists the expected credit
+- **THEN** the request fetches upstream and consumes exactly that credit
+- **AND** a fetch lacking the expected credit or expiry still refuses without consume or pin
+
+### Requirement: Dashboard redemption revalidates account eligibility after waits
+The shared dashboard and automatic redemption helper MUST re-read the authoritative account after acquiring redemption serialization and again after pre-consume credential, route, fetch, pin and claim-renewal waits. Before dispatch, the account MUST still exist, lack a pending-deletion marker, retain the intended local and upstream account identity, and satisfy the existing reset-redemption eligibility predicate. A routing hold alone MUST NOT make an otherwise eligible account ineligible. Refusal MUST preserve committed account state, settle the owned claim and retain any existing request pin for reconciliation. The final database observation does not make the subsequent external consume atomic with later account mutations.
+#### Scenario: Account becomes ineligible while waiting for serialization
+- **WHEN** a pause or other non-redeemable status commits while redemption waits for its predecessor
+- **THEN** the waiter refuses before credential or upstream work and does not consume a credit
+#### Scenario: Account changes during pre-consume work
+- **WHEN** an account becomes non-redeemable, is deleted or changes identity during credential, route, fetch or admission-renewal waits
+- **THEN** the final account check refuses fresh consume without overwriting that change
+#### Scenario: Independently held account remains eligible for redemption
+- **WHEN** an otherwise eligible account has an independent routing hold
+- **THEN** redemption retains the supported exact-credit, request-pin and claim-ownership behavior
+#### Scenario: Claim ownership changes during final account observation
+- **WHEN** the SQLite claim expires or changes holder while the final account read awaits
+- **THEN** account eligibility and the exact claim holder/deadline are observed in one SELECT
+- **AND** the observed deadline is checked after that await, without another await before consume admission
+- **AND** lost ownership refuses consume, retains the request pin and cannot release a successor claim
+
+### Requirement: Explicit fresh reset-credit reads prove their upstream observation
+`POST /api/accounts/{id}/rate-limit-reset-credits/refresh` SHALL require dashboard account write access and SHALL read one account's reset credits from upstream, including paused, routing-held and reauthentication-required accounts whose credentials remain usable. A success MUST come only from that request's fetch and MUST return the existing snapshot fields with `accountId` and `fetchedAt`. A fetch, credential or route failure MUST be an error response, never an empty or cached snapshot. The read MUST NOT consume, pin, change policy or hold, or replace the cached snapshot, and MUST NOT change status except through the existing credential-refresh failure handling. Deactivated or identity-less accounts MUST be refused before upstream work. The account MUST be re-read after the fetch: deletion MUST return not found and a changed upstream account identity MUST conflict instead of returning the observation.
+#### Scenario: Fresh empty differs from failure and stale cache
+- **WHEN** the cache still lists a credit and upstream returns no credits or fails
+- **THEN** the response reports the fresh empty result with its fetch time, or an error for the failure
+- **AND** the cached snapshot is unchanged
+#### Scenario: Held account is inspected while serving stays blocked
+- **WHEN** a paused or reauthentication-required account with a routing hold is read
+- **THEN** routing excludes it throughout the fetch and its status, policy and hold are unchanged
+#### Scenario: Identity changes during the fetch
+- **WHEN** the account is deleted or re-imported into another upstream identity before the fetch returns
+- **THEN** the observation is refused instead of being returned as fresh
