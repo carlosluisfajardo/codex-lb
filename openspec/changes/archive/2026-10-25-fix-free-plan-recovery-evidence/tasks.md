@@ -1,0 +1,5 @@
+- [x] Observe the exact synthetic-primary discriminator fail on maintained source.
+- [x] Restrict freshness evidence to applicable windows without weakening block fences.
+- [x] Cover valid post-block recovery, same-second and newer-runtime negatives.
+- [x] Retain unchanged exhaustion/reset-history protections and product-path coverage.
+- [x] Run focused checks, mutation proof and strict spec validation before archive.

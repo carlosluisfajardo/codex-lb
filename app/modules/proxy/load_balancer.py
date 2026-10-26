@@ -2829,6 +2829,9 @@ def _rate_limited_freshness_entry(
         long_window_entry.used_percent is not None and float(long_window_entry.used_percent) < 100.0
     ):
         return None
+    # Legacy synthetic primary rows cannot prove recovery for a plan with no primary capacity.
+    if usage_core.capacity_for_plan(account.plan_type, "primary") == 0.0:
+        return long_window_entry
     if long_window_entry is not None and long_window_entry.window == "monthly":
         return long_window_entry
     if primary_entry is None:

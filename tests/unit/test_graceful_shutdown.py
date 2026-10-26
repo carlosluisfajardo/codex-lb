@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Iterator
 from importlib import import_module
 
 import pytest
+from starlette.types import Message
 
 from app.core.shutdown import wait_for_tasks_to_drain
 from app.main import (
@@ -873,8 +875,12 @@ async def test_in_flight_middleware_tracks_websocket_connections() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/responses", "/backend-api/codex/responses", "/dashboard/ws"])
+@pytest.mark.parametrize("existing", [0, 1])
 async def test_in_flight_middleware_checks_websocket_drain_after_registration(
     monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    existing: int,
 ) -> None:
     app_called = False
 
@@ -883,24 +889,46 @@ async def test_in_flight_middleware_checks_websocket_drain_after_registration(
         app_called = True
 
     def observe_drain_after_registration() -> bool:
-        assert shutdown_state.get_in_flight() == 1
+        assert shutdown_state.get_in_flight() == existing + 1
         return True
 
     monkeypatch.setattr(shutdown_state, "is_draining", observe_drain_after_registration)
     middleware = InFlightMiddleware(inner_app)
-    sent_messages: list[dict[str, object]] = []
+    sent_messages: list[Message] = []
 
     async def ws_receive():  # noqa: ANN202
+        assert shutdown_state.get_in_flight() == existing
         return {"type": "websocket.connect"}
 
     async def ws_send(msg):  # noqa: ANN001, ANN202
         sent_messages.append(msg)
 
-    await middleware({"type": "websocket", "path": "/v1/responses"}, ws_receive, ws_send)
-
-    assert app_called is False
-    assert sent_messages == [{"type": "websocket.close", "code": 1013, "reason": "Server is draining"}]
-    assert shutdown_state.get_in_flight() == 0
+    if existing:
+        shutdown_state.increment_in_flight()
+    try:
+        await middleware({"type": "websocket", "path": path}, ws_receive, ws_send)
+        assert app_called is False
+        assert [message["type"] for message in sent_messages] == [
+            "websocket.http.response.start",
+            "websocket.http.response.body",
+        ]
+        assert sent_messages[0]["status"] == 503
+        headers = dict(sent_messages[0]["headers"])
+        assert headers[b"retry-after"] == b"5"
+        assert headers[b"content-type"] == b"application/json"
+        body = json.loads(sent_messages[1]["body"])
+        if path.startswith(("/v1/", "/backend-api/")):
+            assert body["error"] == {
+                "code": "proxy_unavailable",
+                "type": "server_error",
+                "message": "Server is draining",
+            }
+        else:
+            assert body == {"detail": "Server is draining"}
+        assert shutdown_state.get_in_flight() == existing
+    finally:
+        if existing:
+            shutdown_state.decrement_in_flight()
 
 
 @pytest.mark.asyncio
@@ -939,7 +967,7 @@ async def test_in_flight_middleware_rejects_new_websocket_during_drain() -> None
     async def ws_receive():  # noqa: ANN202
         return {"type": "websocket.connect"}
 
-    sent_messages: list[dict[str, object]] = []
+    sent_messages: list[Message] = []
 
     async def ws_send(msg):  # noqa: ANN001, ANN202
         sent_messages.append(msg)
@@ -947,7 +975,9 @@ async def test_in_flight_middleware_rejects_new_websocket_during_drain() -> None
     await middleware({"type": "websocket", "path": "/v1/responses"}, ws_receive, ws_send)
 
     assert app_called is False
-    assert sent_messages == [{"type": "websocket.close", "code": 1013, "reason": "Server is draining"}]
+    assert sent_messages[0]["type"] == "websocket.http.response.start"
+    assert sent_messages[0]["status"] == 503
+    assert dict(sent_messages[0]["headers"])[b"retry-after"] == b"5"
     assert shutdown_state.get_in_flight() == 0
 
 

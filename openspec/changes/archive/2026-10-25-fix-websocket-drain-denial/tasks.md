@@ -1,0 +1,6 @@
+- [x] Observe HTTP-denial expectations fail on the real middleware and gated route.
+- [x] Reuse the existing HTTP-denial and retry-header helpers.
+- [x] Prove proxy/generic envelopes and preservation of an existing registration.
+- [x] Preserve real accepted-turn finalization and close1012 in the route test.
+- [x] Mutation-walk the denial event and retry header, then run scoped checks.
+- [x] Sync the canonical requirement and validate before archiving.

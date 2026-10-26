@@ -6,6 +6,13 @@ from types import ModuleType
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from app.core.resilience.overload import (
+    deny_websocket_with_http_response,
+    is_proxy_path,
+    local_unavailable_error,
+    merge_retry_after_headers,
+)
+
 _DRAIN_ALLOWED_HTTP_PATHS = frozenset(
     {
         "/health/live",
@@ -60,7 +67,16 @@ class InFlightMiddleware:
             shutdown_state.increment_in_flight()
             if shutdown_state.is_draining():
                 shutdown_state.decrement_in_flight()
-                await send({"type": "websocket.close", "code": 1013, "reason": "Server is draining"})
+                message = "Server is draining"
+                await deny_websocket_with_http_response(
+                    receive,
+                    send,
+                    status_code=503,
+                    payload=local_unavailable_error(message)
+                    if is_proxy_path(scope.get("path", ""))
+                    else {"detail": message},
+                    headers=merge_retry_after_headers(),
+                )
                 return
 
             if scope.get("path", "") not in _IN_FLIGHT_WEBSOCKET_PATHS:
