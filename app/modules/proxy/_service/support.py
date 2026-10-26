@@ -1552,6 +1552,14 @@ def _http_bridge_session_supports_service_tier(
     return account_plan_matches_allowed(account_plan, allowed_plans)
 
 
+@dataclass(frozen=True, slots=True)
+class _WebSocketEmptyPrewarmInput:
+    """The complete input of an empty prewarm that inherited no anchored context."""
+
+    item_count: int
+    fingerprint: str
+
+
 @dataclass(slots=True)
 class _WebSocketContinuityState:
     last_completed_input_count: int = 0
@@ -1562,6 +1570,12 @@ class _WebSocketContinuityState:
     last_proven_tool_call_types: dict[str, str] = field(default_factory=dict)
     responses_lite_model: str | None = None
     responses_lite_response_id: str | None = None
+    # Completed empty prewarms by downstream-visible response id, oldest first.
+    # They are never turn progress. ``None`` marks a prewarm whose input is not
+    # its whole context (it was anchored, or carried no list input).
+    empty_prewarm_inputs: dict[str, _WebSocketEmptyPrewarmInput | None] = field(default_factory=dict)
+    # Once an entry is evicted, an unknown anchor may be that prewarm.
+    empty_prewarm_inputs_evicted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
