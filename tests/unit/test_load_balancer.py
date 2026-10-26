@@ -3648,6 +3648,59 @@ def test_state_from_account_rate_limited_checks_primary_freshness(monkeypatch):
     assert state.status == AccountStatus.RATE_LIMITED
 
 
+@pytest.mark.parametrize("with_primary", [False, True])
+@pytest.mark.parametrize(
+    "recorded_offset,runtime_offset,long_used,expected",
+    [
+        (-140, -130, 10.0, AccountStatus.RATE_LIMITED),
+        (-130, -130, 10.0, AccountStatus.RATE_LIMITED),
+        (-1, -130, 10.0, AccountStatus.ACTIVE),
+        (-20, -10, 10.0, AccountStatus.RATE_LIMITED),
+        (-1, -130, 100.0, AccountStatus.RATE_LIMITED),
+    ],
+)
+def test_free_plan_synthetic_primary_cannot_prove_post_block_recovery(
+    monkeypatch, with_primary, recorded_offset, runtime_offset, long_used, expected
+):
+    now = 1_700_000_000.0
+    blocked = now - 130
+    deadline = int(now + 7200)
+    monkeypatch.setattr("time.time", lambda: now)
+    account = _make_test_account(
+        status=AccountStatus.RATE_LIMITED, reset_at=deadline, blocked_at=int(blocked), plan_type="free"
+    )
+    assert usage_core.capacity_for_plan(account.plan_type, "primary") == 0.0
+    synthetic_primary = _make_test_usage(
+        window="primary",
+        used_percent=10.0,
+        window_minutes=43200,
+        reset_at=int(now + 86400),
+        recorded_at=_epoch_to_naive_utc(now - 1),
+    )
+    long_window = _make_test_usage(
+        window="secondary",
+        used_percent=long_used,
+        reset_at=int(now + 86400),
+        recorded_at=_epoch_to_naive_utc(now + recorded_offset),
+    )
+    state = _state_from_account(
+        account=account,
+        primary_entry=synthetic_primary if with_primary else None,
+        secondary_entry=long_window,
+        runtime=RuntimeState(blocked_at=now + runtime_offset, cooldown_until=now - 1, reset_at=deadline),
+    )
+    assert state.status == expected
+    assert state.reset_at == (None if expected == AccountStatus.ACTIVE else deadline)
+    if runtime_offset == -130:
+        background = background_recovery_state_from_account(
+            account=account,
+            primary_entry=synthetic_primary if with_primary else None,
+            secondary_entry=long_window,
+            blocked_window_reset=True,
+        )
+        assert background.status == state.status
+
+
 @pytest.mark.parametrize("primary_used", [10.0, 100.0])
 def test_state_from_account_rate_limited_requires_available_primary(monkeypatch, primary_used):
     now = 1_700_000_000.0

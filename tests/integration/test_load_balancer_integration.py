@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -14,11 +14,12 @@ from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.proxy.account_cache import get_account_selection_cache
-from app.modules.proxy.load_balancer import LoadBalancer
+from app.modules.proxy.load_balancer import LoadBalancer, RuntimeState
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.sticky_repository import StickySessionsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
+from tests.simulation.virtual_time import VirtualClock
 
 pytestmark = pytest.mark.integration
 
@@ -34,6 +35,100 @@ async def _repo_factory() -> AsyncIterator[ProxyRepositories]:
             api_keys=ApiKeysRepository(session),
             additional_usage=AdditionalUsageRepository(session),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observed_block", [False, True])
+async def test_free_plan_selection_requires_applicable_post_block_usage(db_setup, monkeypatch, observed_block):
+    now_epoch = 1_700_000_000
+    monkeypatch.setattr("time.time", lambda: float(now_epoch))
+    now = datetime.fromtimestamp(now_epoch, timezone.utc).replace(tzinfo=None)
+    blocked = now_epoch - 130
+    deadline = now_epoch + 7200
+    encryptor = TokenEncryptor()
+    accounts = [
+        Account(
+            id=account_id,
+            email=f"{account_id}@example.com",
+            plan_type=plan,
+            access_token_encrypted=encryptor.encrypt("synthetic access"),
+            refresh_token_encrypted=encryptor.encrypt("synthetic refresh"),
+            id_token_encrypted=encryptor.encrypt("synthetic id"),
+            last_refresh=now,
+            status=status,
+            blocked_at=blocked if plan == "free" else None,
+            reset_at=deadline if plan == "free" else None,
+        )
+        for account_id, plan, status in [
+            ("free-recovery", "free", AccountStatus.RATE_LIMITED),
+            ("usable-replacement", "plus", AccountStatus.ACTIVE),
+        ]
+    ]
+    async with SessionLocal() as session:
+        for account in accounts:
+            await AccountsRepository(session).upsert(account)
+        usage = UsageRepository(session)
+        await usage.add_entry(
+            account_id=accounts[0].id,
+            window="primary",
+            used_percent=10.0,
+            window_minutes=43200,
+            reset_at=now_epoch + 86400,
+            recorded_at=now - timedelta(seconds=1),
+        )
+        await usage.add_entry(
+            account_id=accounts[0].id,
+            window="secondary",
+            used_percent=10.0,
+            window_minutes=10080,
+            reset_at=now_epoch + 86400,
+            recorded_at=now - timedelta(seconds=140),
+        )
+        await usage.add_entry(
+            account_id=accounts[1].id,
+            window="primary",
+            used_percent=20.0,
+            window_minutes=300,
+            reset_at=now_epoch + 3600,
+            recorded_at=now,
+        )
+
+    balancer = LoadBalancer(_repo_factory, clock=VirtualClock(epoch_value=float(now_epoch)))
+    if observed_block:
+        balancer._runtime[accounts[0].id] = RuntimeState(
+            blocked_at=float(blocked),
+            cooldown_until=now_epoch - 1,
+            reset_at=float(deadline),
+        )
+    for _ in range(2):
+        pinned = await balancer.select_account(
+            required_account_id=accounts[0].id,
+            required_account_is_ownership_constraint=True,
+        )
+        assert pinned.account is None
+        available = await balancer.select_account()
+        assert available.account is not None
+        assert available.account.id == accounts[1].id
+    async with SessionLocal() as session:
+        stored = await session.get(Account, accounts[0].id)
+        assert stored is not None
+        assert stored.status == AccountStatus.RATE_LIMITED
+        assert stored.reset_at == deadline
+        await UsageRepository(session).add_entry(
+            account_id=accounts[0].id,
+            window="secondary",
+            used_percent=10.0,
+            window_minutes=10080,
+            reset_at=now_epoch + 86400,
+            recorded_at=now - timedelta(seconds=1),
+        )
+    get_account_selection_cache().invalidate()
+    recovered = await balancer.select_account(account_ids={accounts[0].id})
+    if observed_block:
+        assert recovered.account is not None
+        assert recovered.account.id == accounts[0].id
+    else:
+        assert recovered.account is None
 
 
 @pytest.mark.asyncio

@@ -193,7 +193,7 @@ Foreground proxy account selection MUST NOT reject an otherwise active account s
 
 When upstream returns rate-limit or quota-exhaustion evidence for a selected account, the proxy MUST apply that penalty to the selected upstream account identity. The proxy MUST NOT invent model-scoped, transport-scoped, or request-kind-scoped upstream cooldown semantics unless upstream documentation or captured upstream response metadata proves that narrower upstream scope.
 
-Upstream `rate_limit_exceeded` and `usage_limit_reached` responses MUST retain the account's rate-limit classification and persisted reset deadline. Early recovery from usage evidence MUST require available quota, not freshness alone: the primary sample MUST report less than 100% usage, or its reset MUST have elapsed with a newer available long-window sample. An applicable exhausted long-window sample MUST NOT clear the rate-limit hold. Peer replicas without runtime evidence of the current block MUST continue to honor the persisted deadline. These recovery rules MUST NOT change pre-visible failover eligibility or the upstream error code surfaced to the client.
+Upstream `rate_limit_exceeded` and `usage_limit_reached` responses MUST retain the account's rate-limit classification and persisted reset deadline. Early recovery from usage evidence MUST require available quota, not freshness alone. For plans with primary capacity, the primary sample MUST report less than 100% usage, or its reset MUST have elapsed with a newer available long-window sample. For zero-primary-capacity plans, post-block freshness MUST come from an applicable available long-window sample; a legacy synthetic primary row MUST NOT prove recovery. An applicable exhausted long-window sample MUST NOT clear the rate-limit hold. Peer replicas without runtime evidence of the current block MUST continue to honor the persisted deadline. These recovery rules MUST NOT change pre-visible failover eligibility or the upstream error code surfaced to the client.
 
 After the quota debounce expires, a fresh applicable long-window sample at 100% MUST preserve an explicit quota-exhausted state when no usable credit override exists. When that exhausted sample supplies its reset time, routing MUST use that observed long-window reset instead of an earlier fallback deadline.
 
@@ -280,6 +280,23 @@ When a fresh applicable exhausted sample omits reset metadata, an elapsed fallba
 - **AND** the latest exhausted long-window row is stale or not unambiguously post-block
 - **WHEN** routing evaluates the account
 - **THEN** that row does not replace or remove the persisted fallback deadline
+
+
+#### Scenario: Synthetic Free-plan primary does not clear a newer block
+
+- **GIVEN** a Free account has a future rate-limit deadline and an elapsed local cooldown
+- **AND** an available applicable long-window sample predates its newest block
+- **AND** a legacy synthetic primary row is newer than that block
+- **WHEN** routing evaluates the account
+- **THEN** the account remains rate-limited
+- **AND** a hard-owner request is not moved to another account
+
+#### Scenario: Applicable Free-plan long-window evidence permits recovery
+
+- **GIVEN** the marking replica has an elapsed cooldown for the current block
+- **WHEN** an available applicable long-window sample strictly postdates the newest block
+- **THEN** the existing recovery policy can clear the block
+- **AND** a same-integer-second sample does not qualify
 
 ### Requirement: Upstream rejections of the request payload are account neutral
 

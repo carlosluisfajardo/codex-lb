@@ -1,0 +1,7 @@
+# Scope and evidence
+
+The fork already contains upstream2078; it is not ported again. A concrete new discriminator from open2048's problem space proved the Free-plan legacy synthetic-primary gap: wrong ACTIVE instead of RATE_LIMITED while applicable long-window evidence predates the newest block. The correction adds only a plan-applicable selection branch in the existing helper, preserving credit/reset-history/newer-runtime fences.
+
+Ten unit rows cover no primary, same-second refusal, applicable positive, exhausted long window, newer unpersisted runtime block and background agreement when the same reset-history proof is supplied. A real repository/public LoadBalancer selection test fails with the three-line correction removed: the marking replica wrongly selects the hard owner, while an empty-runtime peer countercase remains blocked. With the correction, repeated owner-constrained selection refuses, ordinary selection chooses the usable replacement, persisted status/deadline remain blocked, and fresh applicable evidence permits the marking replica to recover. The test neither relaxes ownership nor opens network transport.
+
+The initial selection fixture froze only the injected clock and incorrectly allowed unrelated real-clock normalization to see an expired historical deadline; its failure is excluded. The corrected fixture freezes the shared epoch too. Its observed red is one failed marking-replica case and one passing peer control. No broader2048 refactor or credit policy change is included.
