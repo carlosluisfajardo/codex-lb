@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,6 +12,7 @@ from app.core.auth.refresh import RefreshError
 from app.core.openai.model_registry import get_model_registry
 from app.core.usage.models import UsagePayload
 from app.modules.accounts import api as accounts_api
+from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.schemas import AccountProbeResponse
 from app.modules.accounts.service import AccountsService
 from app.modules.usage.updater import AccountRefreshResult, UsageUpdater
@@ -50,6 +52,97 @@ async def test_probe_missing_account_returns_404(async_client):
     assert response.status_code == 404
     body = response.json()
     assert body["error"]["code"] == "account_not_found"
+
+
+@pytest.mark.asyncio
+async def test_probe_route_omits_unsupported_output_limit(async_client, monkeypatch):
+    events: list[str] = []
+    requests: list[tuple[str, dict[str, Any], str | None]] = []
+
+    async def _ensure_fresh(self, account, *, force=False):
+        assert force is False
+        events.append("credentials")
+        return account
+
+    async def _force_refresh(self, account, *, access_token_override=None):
+        assert account.id == account_id
+        assert access_token_override is None
+        events.append("usage")
+        return AccountRefreshResult(usage_written=False, fetch_succeeded=True)
+
+    async def _settle(*, account_id: str, http_status: int):
+        events.append("settlement")
+
+    class _Response:
+        def __init__(self, status: int):
+            self.status = status
+
+        async def __aenter__(self):
+            events.append("response-enter")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            events.append("response-exit")
+            return False
+
+    class _Session:
+        def post(self, url: str, **kwargs: Any):
+            events.append("post")
+            body = kwargs["json"]
+            requests.append((url, body, kwargs["headers"].get("chatgpt-account-id")))
+            return _Response(400 if "max_output_tokens" in body else 200)
+
+    class _Lease:
+        async def __aenter__(self):
+            events.append("lease-enter")
+            return _Session()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            events.append("lease-exit")
+            return False
+
+    record_probe_result = AsyncMock(side_effect=_settle)
+    proxy_service = type("_ProbeRecorder", (), {"record_account_probe_result": record_probe_result})()
+    monkeypatch.setattr(AuthManager, "ensure_fresh", _ensure_fresh)
+    monkeypatch.setattr("app.modules.accounts.service.lease_http_session", lambda: _Lease())
+    monkeypatch.setattr(UsageUpdater, "force_refresh_result", _force_refresh)
+    monkeypatch.setattr(accounts_api, "get_proxy_service_for_app", lambda app: proxy_service)
+
+    account_id = await _import_test_account(
+        async_client, email="probe-wire-body@example.com", account_id="acc_probe_wire_body"
+    )
+    events.clear()
+    response = await async_client.post(f"/api/accounts/{account_id}/probe", json={"model": "gpt-5.5-test"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["probeStatusCode"] == 200
+    assert body["status"] == "probed"
+    assert body["accountId"] == account_id
+    assert body["accountStatusBefore"] == body["accountStatusAfter"] == "active"
+    assert "usageRefreshSucceeded" not in body
+    assert len(requests) == 1
+    url, payload, upstream_account_id = requests[0]
+    assert url.endswith("/backend-api/codex/responses")
+    assert upstream_account_id == "acc_probe_wire_body"
+    assert payload == {
+        "model": "gpt-5.5-test",
+        "instructions": "Respond with a single dot.",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "."}]}],
+        "stream": True,
+        "store": False,
+    }
+    assert events == [
+        "credentials",
+        "lease-enter",
+        "post",
+        "response-enter",
+        "response-exit",
+        "lease-exit",
+        "usage",
+        "settlement",
+    ]
+    record_probe_result.assert_awaited_once_with(account_id=account_id, http_status=200)
 
 
 @pytest.mark.asyncio
