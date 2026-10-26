@@ -53,12 +53,12 @@ The project-owned Uvicorn server MUST commit graceful drain before Uvicorn close
 
 ### Requirement: Graceful drain closes WebSocket admission
 
-Once graceful drain begins, the application MUST reject every new external WebSocket connection before invoking the route handler. A Responses WebSocket scope admitted before the barrier MUST remain tracked until its handler exits. Other WebSocket protocols MUST receive the same late-admission rejection but MUST NOT hold the Responses in-flight counter for their full connection lifetime.
+Once graceful drain begins, the application MUST reject every new external WebSocket connection before invoking the route handler, with HTTP503 and `Retry-After: 5`. Proxy paths MUST receive an OpenAI error envelope with code `proxy_unavailable`, type `server_error`, and message `Server is draining`; other paths MUST receive `{"detail":"Server is draining"}`. A Responses WebSocket scope admitted before the barrier MUST remain tracked until its handler exits. Other WebSocket protocols MUST receive the same late-admission rejection but MUST NOT hold the Responses in-flight counter for their full connection lifetime.
 
 #### Scenario: New WebSocket arrives during drain
 
 - **WHEN** a new WebSocket connection scope arrives after drain has begun
-- **THEN** the application rejects the connection without invoking its route handler
+- **THEN** the application rejects the connection with HTTP503, `Retry-After: 5`, and the appropriate JSON body without invoking its route handler
 - **AND** the rejected connection does not increase the in-flight count
 
 #### Scenario: WebSocket crosses the drain barrier
