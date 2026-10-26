@@ -298,6 +298,7 @@ from app.modules.proxy._service.support import (
     _websocket_request_can_replay_before_visible_output,
     _WebSocketContinuityAnchor,
     _WebSocketContinuityState,
+    _WebSocketEmptyPrewarmInput,
     _WebSocketReceiveTimeout,
     _WebSocketRequestState,
     _WebSocketUpstreamControl,
@@ -374,6 +375,9 @@ _WEBSOCKET_STALE_PREVIOUS_RESPONSE_CACHE_LIMIT = 4096
 # on the real monotonic clock instead of a per-turn injected clock; the
 # simulation harness never reaches it (its fake turns carry no stale anchor).
 _websocket_stale_previous_response_index: dict[tuple[str, str | None], float] = {}
+# Empty prewarm proofs kept per continuity state; evicting one makes the
+# session's unknown anchors fail closed instead of growing without bound.
+_WEBSOCKET_EMPTY_PREWARM_INPUT_LIMIT = 16
 
 
 def _clear_websocket_stale_previous_response_cache() -> None:
@@ -788,20 +792,31 @@ def _websocket_client_previous_response_full_resend_is_retry_safe(
         return False
     if not _websocket_input_items_are_self_contained_fresh_replay(input_items):
         return False
-    if (
-        continuity_state is not None
-        and continuity_state.last_completed_response_id == previous_response_id
-        and (
+    if continuity_state is None:
+        return True
+    if previous_response_id in continuity_state.empty_prewarm_inputs:
+        # The prewarm alone may carry the tools, instructions, and history the
+        # follow-up omits. Only a resend of its complete input survives dropping
+        # the anchor; a resend equal to that input is already complete.
+        prewarm_input = continuity_state.empty_prewarm_inputs[previous_response_id]
+        return (
+            prewarm_input is not None
+            and len(input_items) >= prewarm_input.item_count
+            and _facade()._fingerprint_input_items(input_items[: prewarm_input.item_count]) == prewarm_input.fingerprint
+        )
+    if continuity_state.last_completed_response_id == previous_response_id:
+        if (
             continuity_state.last_completed_input_count > 0
             or continuity_state.last_completed_input_prefix_fingerprint is not None
-        )
-    ):
-        return _facade()._input_prefix_matches_stored_context(
-            input_value,
-            stored_count=continuity_state.last_completed_input_count,
-            stored_fingerprint=continuity_state.last_completed_input_prefix_fingerprint,
-        )
-    return True
+        ):
+            return _facade()._input_prefix_matches_stored_context(
+                input_value,
+                stored_count=continuity_state.last_completed_input_count,
+                stored_fingerprint=continuity_state.last_completed_input_prefix_fingerprint,
+            )
+        return True
+    # An evicted prewarm proof is indistinguishable from an unknown anchor.
+    return not continuity_state.empty_prewarm_inputs_evicted
 
 
 def _record_websocket_continuity_completion(
@@ -831,6 +846,39 @@ def _record_websocket_continuity_completion(
     continuity_state.last_pending_function_call_ids = list(request_state.pending_function_call_ids)
     continuity_state.last_pending_tool_call_types = dict(request_state.pending_tool_call_types)
     continuity_state.last_proven_tool_call_types = dict(request_state.proven_tool_call_types)
+
+
+def _record_websocket_empty_prewarm_completion(
+    continuity_state: _WebSocketContinuityState,
+    *,
+    request_state: _WebSocketRequestState,
+    response_id: str | None,
+) -> None:
+    """Record an empty prewarm's replay proof without treating it as turn progress."""
+    # A replayed prewarm keeps exposing its original id downstream, so a
+    # follow-up can only reference that id, never the hidden upstream one.
+    visible_response_id = request_state.replay_downstream_response_id or response_id
+    if visible_response_id is None:
+        return
+    prewarm_input: _WebSocketEmptyPrewarmInput | None = None
+    # Only an input sent without the client's own anchor is the prewarm's whole
+    # context. An anchored prewarm also inherited its anchor's history, which no
+    # fingerprint of its own (delta) input can prove.
+    if (
+        (request_state.previous_response_id is None or request_state.proxy_injected_previous_response_id)
+        and request_state.input_item_count > 0
+        and request_state.input_full_fingerprint is not None
+    ):
+        prewarm_input = _WebSocketEmptyPrewarmInput(
+            item_count=request_state.input_item_count,
+            fingerprint=request_state.input_full_fingerprint,
+        )
+    prewarm_inputs = continuity_state.empty_prewarm_inputs
+    prewarm_inputs.pop(visible_response_id, None)
+    prewarm_inputs[visible_response_id] = prewarm_input
+    while len(prewarm_inputs) > _WEBSOCKET_EMPTY_PREWARM_INPUT_LIMIT:
+        prewarm_inputs.pop(next(iter(prewarm_inputs)))
+        continuity_state.empty_prewarm_inputs_evicted = True
 
 
 def _record_websocket_responses_lite_acceptance(

@@ -27272,6 +27272,307 @@ def test_websocket_client_previous_response_full_resend_retry_allows_self_contai
     )
 
 
+_PREWARM_CONNECTION_HEADERS = {"x-codex-turn-metadata": json.dumps({"request_kind": "prewarm"})}
+
+
+def _prewarm_proof_message(role: str, text: str) -> JsonValue:
+    return {"role": role, "content": [{"type": "input_text", "text": text}]}
+
+
+_PREWARM_PROOF_RULES = _prewarm_proof_message("developer", "workspace rules")
+_PREWARM_PROOF_QUESTION = _prewarm_proof_message("user", "summarize the notes")
+_PREWARM_PROOF_NEXT = _prewarm_proof_message("user", "next question")
+
+
+def _prewarm_proof_service(monkeypatch: pytest.MonkeyPatch) -> tuple[proxy_service.ProxyService, AsyncMock]:
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    record_success = AsyncMock()
+
+    class Settings:
+        trace_channels = frozenset()
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: Settings())
+    monkeypatch.setattr(service._load_balancer, "record_success", record_success)
+    return service, record_success
+
+
+async def _prepare_on_prewarm_connection(
+    service: proxy_service.ProxyService,
+    continuity_state: proxy_service._WebSocketContinuityState,
+    **fields: JsonValue,
+) -> proxy_service._PreparedWebSocketRequest:
+    return await service._prepare_websocket_response_create_request(
+        {"type": "response.create", "model": "gpt-5.4", **fields},
+        headers=_PREWARM_CONNECTION_HEADERS,
+        codex_session_affinity=False,
+        openai_cache_affinity=True,
+        sticky_threads_enabled=False,
+        openai_cache_affinity_max_age_seconds=300,
+        api_key=None,
+        continuity_state=continuity_state,
+    )
+
+
+async def _complete_on_prewarm_connection(
+    service: proxy_service.ProxyService,
+    continuity_state: proxy_service._WebSocketContinuityState,
+    prepared: proxy_service._PreparedWebSocketRequest,
+    *,
+    response_id: str,
+    output_tokens: int,
+) -> None:
+    account = _make_account("acc_ws_prewarm_proof")
+    pending_requests = deque([prepared.request_state])
+    usage = {"input_tokens": 9, "output_tokens": output_tokens, "total_tokens": 9 + output_tokens}
+    for event in (
+        {"type": "response.created", "response": {"id": response_id, "status": "in_progress"}},
+        {"type": "response.completed", "response": {"id": response_id, "status": "completed", "usage": usage}},
+    ):
+        await service._process_upstream_websocket_text(
+            json.dumps(event),
+            account=account,
+            account_id_value=account.id,
+            pending_requests=pending_requests,
+            pending_lock=anyio.Lock(),
+            api_key=None,
+            upstream_control=proxy_service._WebSocketUpstreamControl(),
+            response_create_gate=asyncio.Semaphore(1),
+            continuity_state=continuity_state,
+        )
+    assert not pending_requests
+
+
+def _retained_fresh_replay_input(prepared: proxy_service._PreparedWebSocketRequest) -> JsonValue:
+    request_state = prepared.request_state
+    if not request_state.fresh_upstream_request_is_retry_safe or request_state.fresh_upstream_request_text is None:
+        return None
+    fresh_payload = json.loads(request_state.fresh_upstream_request_text)
+    assert "previous_response_id" not in fresh_payload
+    return fresh_payload["input"]
+
+
+@pytest.mark.parametrize(
+    ("follow_up_input", "retained_input"),
+    [
+        pytest.param([], None, id="zero-items"),
+        pytest.param([_PREWARM_PROOF_RULES], None, id="one-item"),
+        pytest.param([_PREWARM_PROOF_QUESTION, _PREWARM_PROOF_NEXT], None, id="two-item-delta"),
+        pytest.param([_PREWARM_PROOF_QUESTION, _PREWARM_PROOF_RULES], None, id="reordered-input"),
+        pytest.param(
+            [_PREWARM_PROOF_RULES, _PREWARM_PROOF_QUESTION],
+            [_PREWARM_PROOF_RULES, _PREWARM_PROOF_QUESTION],
+            id="exact-complete-input",
+        ),
+        pytest.param(
+            [_PREWARM_PROOF_RULES, _PREWARM_PROOF_QUESTION, _PREWARM_PROOF_NEXT],
+            [_PREWARM_PROOF_RULES, _PREWARM_PROOF_QUESTION, _PREWARM_PROOF_NEXT],
+            id="complete-prefix",
+        ),
+        pytest.param(
+            [
+                _PREWARM_PROOF_RULES,
+                _PREWARM_PROOF_QUESTION,
+                {"type": "function_call_output", "call_id": "call_orphan", "output": "ok"},
+            ],
+            None,
+            id="orphan-tool-output",
+        ),
+        pytest.param(
+            [
+                _PREWARM_PROOF_RULES,
+                _PREWARM_PROOF_QUESTION,
+                {"type": "function_call", "name": "shell_command", "call_id": "call_pair", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_pair", "output": "ok"},
+            ],
+            [
+                _PREWARM_PROOF_RULES,
+                _PREWARM_PROOF_QUESTION,
+                {"type": "function_call", "name": "shell_command", "call_id": "call_pair", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_pair", "output": "ok"},
+            ],
+            id="self-contained-tool-pair",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_websocket_follow_up_of_empty_prewarm_retains_fresh_replay_only_with_its_complete_input(
+    monkeypatch,
+    follow_up_input,
+    retained_input,
+):
+    service, record_success = _prewarm_proof_service(monkeypatch)
+    continuity_state = proxy_service._WebSocketContinuityState()
+    prewarm = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        generate=False,
+        input=[_PREWARM_PROOF_RULES, _PREWARM_PROOF_QUESTION],
+    )
+    await _complete_on_prewarm_connection(
+        service, continuity_state, prewarm, response_id="resp_ws_prewarm", output_tokens=0
+    )
+
+    follow_up = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        previous_response_id="resp_ws_prewarm",
+        input=follow_up_input,
+    )
+
+    assert json.loads(follow_up.text_data)["previous_response_id"] == "resp_ws_prewarm"
+    assert _retained_fresh_replay_input(follow_up) == retained_input
+    # The prewarm proves replay context only; it is never turn progress or success.
+    assert continuity_state.last_completed_response_id is None
+    record_success.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_websocket_follow_up_of_anchored_empty_prewarm_keeps_inherited_context(monkeypatch):
+    service, _record_success = _prewarm_proof_service(monkeypatch)
+    continuity_state = proxy_service._WebSocketContinuityState()
+    added_rules = _prewarm_proof_message("developer", "added rules")
+    turn = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        input=[_PREWARM_PROOF_RULES, _PREWARM_PROOF_QUESTION],
+    )
+    await _complete_on_prewarm_connection(service, continuity_state, turn, response_id="resp_ws_turn", output_tokens=3)
+    prewarm = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        generate=False,
+        previous_response_id="resp_ws_turn",
+        input=[added_rules],
+    )
+    await _complete_on_prewarm_connection(
+        service, continuity_state, prewarm, response_id="resp_ws_prewarm", output_tokens=0
+    )
+
+    delta = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        previous_response_id="resp_ws_prewarm",
+        input=[added_rules, _PREWARM_PROOF_NEXT],
+    )
+    turn_resend = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        previous_response_id="resp_ws_turn",
+        input=[_PREWARM_PROOF_RULES, _PREWARM_PROOF_QUESTION, _PREWARM_PROOF_NEXT],
+    )
+
+    # Repeating the prewarm's own input proves nothing about the history it
+    # inherited from ``resp_ws_turn``; the completed turn keeps its own proof.
+    assert _retained_fresh_replay_input(delta) is None
+    assert _retained_fresh_replay_input(turn_resend) == [
+        _PREWARM_PROOF_RULES,
+        _PREWARM_PROOF_QUESTION,
+        _PREWARM_PROOF_NEXT,
+    ]
+    assert continuity_state.last_completed_response_id == "resp_ws_turn"
+
+
+@pytest.mark.asyncio
+async def test_websocket_follow_up_of_empty_prewarm_without_input_items_keeps_anchor(monkeypatch):
+    service, _record_success = _prewarm_proof_service(monkeypatch)
+    continuity_state = proxy_service._WebSocketContinuityState()
+    prewarm = await _prepare_on_prewarm_connection(service, continuity_state, generate=False, input=[])
+    await _complete_on_prewarm_connection(
+        service, continuity_state, prewarm, response_id="resp_ws_prewarm", output_tokens=0
+    )
+
+    follow_up = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        previous_response_id="resp_ws_prewarm",
+        input=[_PREWARM_PROOF_QUESTION, _PREWARM_PROOF_NEXT],
+    )
+
+    # A prewarm without fingerprinted input items leaves no proof a resend can
+    # match, so its follow-up keeps the anchor.
+    assert _retained_fresh_replay_input(follow_up) is None
+
+
+@pytest.mark.asyncio
+async def test_websocket_later_empty_prewarm_keeps_earlier_prewarm_proof(monkeypatch):
+    service, _record_success = _prewarm_proof_service(monkeypatch)
+    continuity_state = proxy_service._WebSocketContinuityState()
+    tools: JsonValue = {"type": "additional_tools", "role": "developer", "tools": [{"type": "custom", "name": "shell"}]}
+    first_input = [tools, _PREWARM_PROOF_RULES]
+    later_input = [tools, _prewarm_proof_message("developer", "other workspace rules")]
+    for response_id, prewarm_input in (("resp_ws_prewarm_first", first_input), ("resp_ws_prewarm_later", later_input)):
+        prewarm = await _prepare_on_prewarm_connection(service, continuity_state, generate=False, input=prewarm_input)
+        await _complete_on_prewarm_connection(
+            service, continuity_state, prewarm, response_id=response_id, output_tokens=0
+        )
+
+    delta = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        previous_response_id="resp_ws_prewarm_first",
+        input=[_PREWARM_PROOF_QUESTION, _PREWARM_PROOF_NEXT],
+    )
+    resend = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        previous_response_id="resp_ws_prewarm_first",
+        input=[*first_input, _PREWARM_PROOF_QUESTION],
+    )
+
+    assert _retained_fresh_replay_input(delta) is None
+    assert _retained_fresh_replay_input(resend) == [*first_input, _PREWARM_PROOF_QUESTION]
+
+
+@pytest.mark.asyncio
+async def test_websocket_evicted_empty_prewarm_proof_fails_closed(monkeypatch):
+    service, _record_success = _prewarm_proof_service(monkeypatch)
+    continuity_state = proxy_service._WebSocketContinuityState()
+    foreign_delta = [_PREWARM_PROOF_QUESTION, _PREWARM_PROOF_NEXT]
+    before_eviction = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        previous_response_id="resp_ws_other_session",
+        input=foreign_delta,
+    )
+    # An anchor the session never saw keeps the permissive full-resend classification.
+    assert _retained_fresh_replay_input(before_eviction) == foreign_delta
+
+    limit = websocket_helpers_module._WEBSOCKET_EMPTY_PREWARM_INPUT_LIMIT
+    prewarm_inputs = [
+        [_PREWARM_PROOF_RULES, _prewarm_proof_message("user", f"prewarm {index}")] for index in range(limit + 1)
+    ]
+    for index, prewarm_input in enumerate(prewarm_inputs):
+        prewarm = await _prepare_on_prewarm_connection(service, continuity_state, generate=False, input=prewarm_input)
+        await _complete_on_prewarm_connection(
+            service, continuity_state, prewarm, response_id=f"resp_ws_prewarm_{index}", output_tokens=0
+        )
+
+    evicted_resend = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        previous_response_id="resp_ws_prewarm_0",
+        input=[*prewarm_inputs[0], _PREWARM_PROOF_NEXT],
+    )
+    after_eviction = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        previous_response_id="resp_ws_other_session",
+        input=foreign_delta,
+    )
+    retained_resend = await _prepare_on_prewarm_connection(
+        service,
+        continuity_state,
+        previous_response_id=f"resp_ws_prewarm_{limit}",
+        input=[*prewarm_inputs[limit], _PREWARM_PROOF_NEXT],
+    )
+
+    # Once a prewarm's proof is evicted, any anchor the session cannot classify
+    # may be that prewarm, so it fails closed instead of turning permissive.
+    assert _retained_fresh_replay_input(evicted_resend) is None
+    assert _retained_fresh_replay_input(after_eviction) is None
+    assert _retained_fresh_replay_input(retained_resend) == [*prewarm_inputs[limit], _PREWARM_PROOF_NEXT]
+
+
 @pytest.mark.asyncio
 async def test_prepare_websocket_response_create_request_fills_interrupted_pending_tool_outputs(monkeypatch):
     request_logs = _RequestLogsRecorder()

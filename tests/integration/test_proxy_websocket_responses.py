@@ -6879,6 +6879,334 @@ def test_responses_websocket_close_replay_keeps_context_of_turn_chained_to_empty
     assert terminal["response"]["error"]["code"] == "stream_incomplete"
 
 
+def _prewarm_context_message(role: str, text: str) -> dict[str, object]:
+    return {"role": role, "content": [{"type": "input_text", "text": text}]}
+
+
+_PREWARM_CONTEXT_TOOLS: dict[str, object] = {
+    "type": "additional_tools",
+    "role": "developer",
+    "tools": [{"type": "custom", "name": "shell"}],
+}
+_PREWARM_CONTEXT_RULES = _prewarm_context_message("developer", "workspace rules")
+_PREWARM_CONTEXT_ADDED_RULES = _prewarm_context_message("developer", "added rules")
+_PREWARM_CONTEXT_QUESTION = _prewarm_context_message("user", "summarize the notes")
+_PREWARM_CONTEXT_NEXT = _prewarm_context_message("user", "next question")
+_PREWARM_CONNECTION_HEADERS = {
+    "x-codex-turn-metadata": json.dumps(
+        {"request_kind": "prewarm", "turn_id": "turn_prewarm_context"},
+        separators=(",", ":"),
+    )
+}
+
+
+def _prewarm_context_request(**fields: object) -> str:
+    return json.dumps({"type": "response.create", "model": "gpt-5.4", "instructions": "", "stream": True, **fields})
+
+
+def _prewarm_context_turn(response_id: str, *, output_tokens: int) -> list[_FakeUpstreamMessage]:
+    return [
+        _ws_event({"type": "response.created", "response": {"id": response_id, "status": "in_progress"}}),
+        _ws_event(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "status": "completed",
+                    "usage": {"input_tokens": 9, "output_tokens": output_tokens, "total_tokens": 9 + output_tokens},
+                },
+            }
+        ),
+    ]
+
+
+def _patch_prewarm_context_route(
+    monkeypatch: pytest.MonkeyPatch,
+    upstreams: list[_SequencedUpstreamWebSocket],
+    *,
+    api_key: ApiKeyData | None = None,
+) -> list[_SequencedUpstreamWebSocket]:
+    """Serve upstream connects from ``upstreams`` in order and return the ones connected."""
+    connected: list[_SequencedUpstreamWebSocket] = []
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return api_key
+
+    async def fake_connect_proxy_websocket(self, headers, **kwargs):
+        del self, headers, kwargs
+        connected.append(upstreams[len(connected)])
+        account = SimpleNamespace(id="acct_ws_prewarm_context", codex_installation_id="account-installation")
+        return account, connected[-1]
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+    return connected
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/responses", "/backend-api/codex/responses"])
+@pytest.mark.parametrize(
+    ("earlier_turns", "follow_up", "replayed_input"),
+    [
+        pytest.param(
+            [
+                ({"input": [_PREWARM_CONTEXT_RULES, _PREWARM_CONTEXT_QUESTION]}, "resp_ws_turn", 3),
+                (
+                    {
+                        "generate": False,
+                        "previous_response_id": "resp_ws_turn",
+                        "input": [_PREWARM_CONTEXT_ADDED_RULES],
+                    },
+                    "resp_ws_prewarm",
+                    0,
+                ),
+            ],
+            {"previous_response_id": "resp_ws_prewarm", "input": [_PREWARM_CONTEXT_ADDED_RULES, _PREWARM_CONTEXT_NEXT]},
+            None,
+            id="anchored-prewarm-delta",
+        ),
+        pytest.param(
+            [
+                ({"generate": False, "input": [_PREWARM_CONTEXT_TOOLS, _PREWARM_CONTEXT_RULES]}, "resp_ws_prewarm", 0),
+                (
+                    {"generate": False, "input": [_PREWARM_CONTEXT_TOOLS, _PREWARM_CONTEXT_ADDED_RULES]},
+                    "resp_ws_prewarm_later",
+                    0,
+                ),
+            ],
+            {"previous_response_id": "resp_ws_prewarm", "input": [_PREWARM_CONTEXT_QUESTION, _PREWARM_CONTEXT_NEXT]},
+            None,
+            id="earlier-prewarm-delta",
+        ),
+        pytest.param(
+            [({"generate": False, "input": [_PREWARM_CONTEXT_RULES, _PREWARM_CONTEXT_QUESTION]}, "resp_ws_prewarm", 0)],
+            {"previous_response_id": "resp_ws_prewarm", "input": [_PREWARM_CONTEXT_RULES, _PREWARM_CONTEXT_QUESTION]},
+            [_PREWARM_CONTEXT_RULES, _PREWARM_CONTEXT_QUESTION],
+            id="exact-complete-resend",
+        ),
+        pytest.param(
+            [({"generate": False, "input": [_PREWARM_CONTEXT_RULES, _PREWARM_CONTEXT_QUESTION]}, "resp_ws_prewarm", 0)],
+            {
+                "previous_response_id": "resp_ws_prewarm",
+                "input": [_PREWARM_CONTEXT_RULES, _PREWARM_CONTEXT_QUESTION, _PREWARM_CONTEXT_NEXT],
+            },
+            [_PREWARM_CONTEXT_RULES, _PREWARM_CONTEXT_QUESTION, _PREWARM_CONTEXT_NEXT],
+            id="complete-prefix-resend",
+        ),
+    ],
+)
+def test_responses_websocket_close_replay_requires_complete_prewarm_context(
+    endpoint,
+    earlier_turns,
+    follow_up,
+    replayed_input,
+    app_instance,
+    monkeypatch,
+):
+    # Earlier turns complete on the first socket, which then closes before the
+    # follow-up is accepted. Only a follow-up that repeats the whole context of
+    # the prewarm it references may be replayed without that anchor: an anchored
+    # prewarm also inherited its anchor's history, and a later prewarm does not
+    # make an earlier one unknown.
+    first_upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            *(
+                _prewarm_context_turn(response_id, output_tokens=output_tokens)
+                for _request, response_id, output_tokens in earlier_turns
+            ),
+            [_FakeUpstreamMessage("close")],
+        ],
+    )
+    recovered_upstream = _recovered_upstream("resp_ws_prewarm_context_replay")
+    connected = _patch_prewarm_context_route(monkeypatch, [first_upstream, recovered_upstream])
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(endpoint, headers=_PREWARM_CONNECTION_HEADERS) as websocket:
+            for request, _response_id, _output_tokens in earlier_turns:
+                websocket.send_text(_prewarm_context_request(**request))
+                assert json.loads(websocket.receive_text())["type"] == "response.created"
+                assert json.loads(websocket.receive_text())["type"] == "response.completed"
+            websocket.send_text(_prewarm_context_request(**follow_up))
+            events, _disconnect = _receive_until_terminal(websocket)
+
+    anchored_payload = json.loads(first_upstream.sent_text[-1])
+    assert anchored_payload["previous_response_id"] == follow_up["previous_response_id"]
+    assert anchored_payload["input"] == follow_up["input"]
+    if replayed_input is None:
+        assert recovered_upstream.sent_text == []
+        assert connected == [first_upstream]
+        assert events[-1]["type"] == "response.failed"
+        assert events[-1]["response"]["error"]["code"] == "stream_incomplete"
+    else:
+        assert connected == [first_upstream, recovered_upstream]
+        replay_payload = json.loads(recovered_upstream.sent_text[-1])
+        assert "previous_response_id" not in replay_payload
+        assert replay_payload["input"] == replayed_input
+        assert [event["type"] for event in events] == ["response.created", "response.completed"]
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/responses", "/backend-api/codex/responses"])
+def test_responses_websocket_replayed_prewarm_context_proof_follows_visible_response_id(
+    endpoint,
+    app_instance,
+    monkeypatch,
+):
+    # The prewarm is accepted as ``resp_ws_prewarm_visible``, its socket closes,
+    # and the replay completes upstream as ``resp_ws_prewarm_hidden`` while the
+    # client keeps seeing the visible id. The client chains to the visible id,
+    # which the replacement upstream rejects; the delta must not be resent
+    # without the prewarm's context, and the prewarm stays neither account
+    # success nor a previous-response owner.
+    api_key = ApiKeyData(
+        id="key_ws_prewarm_visible",
+        name="prewarm visible id",
+        key_prefix="sk-ws-prewarm",
+        allowed_models=None,
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=proxy_module.utcnow(),
+        last_used_at=None,
+    )
+    first_upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            [
+                _ws_event(
+                    {"type": "response.created", "response": {"id": "resp_ws_prewarm_visible", "status": "in_progress"}}
+                ),
+                _FakeUpstreamMessage("close"),
+            ]
+        ],
+    )
+    replacement_upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            _prewarm_context_turn("resp_ws_prewarm_hidden", output_tokens=0),
+            [
+                _ws_event(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "previous_response_not_found",
+                            "message": "Previous response with id 'resp_ws_prewarm_visible' not found.",
+                            "param": "previous_response_id",
+                        },
+                    }
+                )
+            ],
+        ],
+    )
+    recovered_upstream = _recovered_upstream("resp_ws_prewarm_delta_replay")
+    connected = _patch_prewarm_context_route(
+        monkeypatch,
+        [first_upstream, replacement_upstream, recovered_upstream],
+        api_key=api_key,
+    )
+    reservation_ids: list[str] = []
+    settlements: list[tuple[str, bool]] = []
+    released_reservation_ids: list[str] = []
+    owner_writes: list[str | None] = []
+    record_success = AsyncMock()
+    remember_previous_response_owner = proxy_module.ProxyService._remember_websocket_previous_response_owner
+
+    async def refresh_api_key(self, current_api_key):
+        del self
+        return current_api_key
+
+    async def reserve_api_key_usage(self, current_api_key, **kwargs):
+        del self, kwargs
+        assert current_api_key is api_key
+        reservation_ids.append(f"resv_ws_prewarm_{len(reservation_ids)}")
+        return proxy_module.ApiKeyUsageReservationData(
+            reservation_id=reservation_ids[-1],
+            key_id=api_key.id,
+            model="gpt-5.4",
+        )
+
+    async def settle_api_key_usage(self, current_api_key, reservation, settlement, request_id, **kwargs):
+        del self, current_api_key, request_id, kwargs
+        if reservation is not None:
+            settlements.append((reservation.reservation_id, settlement.record_success))
+        return True
+
+    async def release_api_key_usage(self, reservation):
+        del self
+        if reservation is not None:
+            released_reservation_ids.append(reservation.reservation_id)
+
+    def record_previous_response_owner(self, *, previous_response_id, **kwargs):
+        owner_writes.append(previous_response_id)
+        remember_previous_response_owner(self, previous_response_id=previous_response_id, **kwargs)
+
+    def no_api_key_heartbeat(self, request_state, **kwargs):
+        del self, request_state, kwargs
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_refresh_websocket_api_key_policy", refresh_api_key)
+    monkeypatch.setattr(proxy_module.ProxyService, "_reserve_websocket_api_key_usage", reserve_api_key_usage)
+    monkeypatch.setattr(proxy_module.ProxyService, "_settle_stream_api_key_usage", settle_api_key_usage)
+    monkeypatch.setattr(proxy_module.ProxyService, "_release_websocket_reservation", release_api_key_usage)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_remember_websocket_previous_response_owner",
+        record_previous_response_owner,
+    )
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_start_request_state_api_key_reservation_heartbeat",
+        no_api_key_heartbeat,
+    )
+    monkeypatch.setattr(proxy_module.LoadBalancer, "record_success", record_success)
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(endpoint, headers=_PREWARM_CONNECTION_HEADERS) as websocket:
+            websocket.send_text(
+                _prewarm_context_request(generate=False, input=[_PREWARM_CONTEXT_TOOLS, _PREWARM_CONTEXT_RULES])
+            )
+            prewarm_events, _prewarm_disconnect = _receive_until_terminal(websocket)
+            websocket.send_text(
+                _prewarm_context_request(
+                    previous_response_id="resp_ws_prewarm_visible",
+                    input=[_PREWARM_CONTEXT_QUESTION, _PREWARM_CONTEXT_NEXT],
+                )
+            )
+            follow_up_events, _follow_up_disconnect = _receive_until_terminal(websocket)
+
+    assert [(event["type"], event["response"]["id"]) for event in prewarm_events] == [
+        ("response.created", "resp_ws_prewarm_visible"),
+        ("response.completed", "resp_ws_prewarm_visible"),
+    ]
+    assert json.loads(replacement_upstream.sent_text[0])["input"] == [_PREWARM_CONTEXT_TOOLS, _PREWARM_CONTEXT_RULES]
+    anchored_payload = json.loads(replacement_upstream.sent_text[-1])
+    assert anchored_payload["previous_response_id"] == "resp_ws_prewarm_visible"
+    assert anchored_payload["input"] == [_PREWARM_CONTEXT_QUESTION, _PREWARM_CONTEXT_NEXT]
+    assert recovered_upstream.sent_text == []
+    assert connected == [first_upstream, replacement_upstream]
+    assert follow_up_events[-1]["type"] == "response.failed"
+    assert "resp_ws_prewarm_hidden" not in json.dumps([*prewarm_events, *follow_up_events])
+    # One reservation per logical request, each settled exactly once and never
+    # also released; neither the replayed prewarm nor the failed follow-up
+    # records account success.
+    assert reservation_ids == ["resv_ws_prewarm_0", "resv_ws_prewarm_1"]
+    assert settlements == [("resv_ws_prewarm_0", False), ("resv_ws_prewarm_1", False)]
+    assert released_reservation_ids == []
+    record_success.assert_not_awaited()
+    assert owner_writes == []
+
+
 def test_v1_responses_websocket_masks_invalid_request_previous_response_not_found_without_retry(
     app_instance,
     monkeypatch,
