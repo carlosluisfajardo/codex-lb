@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from importlib import import_module
 
 import pytest
+from starlette.types import Message
 
 from app.core.shutdown import wait_for_tasks_to_drain
 from app.main import (
@@ -780,7 +781,7 @@ async def test_in_flight_middleware_checks_http_drain_after_registration(
 
     monkeypatch.setattr(shutdown_state, "is_draining", observe_drain_after_registration)
     middleware = InFlightMiddleware(inner_app)
-    sent_messages: list[dict[str, object]] = []
+    sent_messages: list[Message] = []
 
     async def receive():  # noqa: ANN202
         return {"type": "http.request", "body": b"", "more_body": False}
@@ -966,7 +967,7 @@ async def test_in_flight_middleware_rejects_new_websocket_during_drain() -> None
     async def ws_receive():  # noqa: ANN202
         return {"type": "websocket.connect"}
 
-    sent_messages: list[dict[str, object]] = []
+    sent_messages: list[Message] = []
 
     async def ws_send(msg):  # noqa: ANN001, ANN202
         sent_messages.append(msg)
