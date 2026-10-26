@@ -781,7 +781,7 @@ async def test_in_flight_middleware_checks_http_drain_after_registration(
 
     monkeypatch.setattr(shutdown_state, "is_draining", observe_drain_after_registration)
     middleware = InFlightMiddleware(inner_app)
-    sent_messages: list[Message] = []
+    sent_messages: list[dict[str, object]] = []
 
     async def receive():  # noqa: ANN202
         return {"type": "http.request", "body": b"", "more_body": False}
@@ -894,7 +894,7 @@ async def test_in_flight_middleware_checks_websocket_drain_after_registration(
 
     monkeypatch.setattr(shutdown_state, "is_draining", observe_drain_after_registration)
     middleware = InFlightMiddleware(inner_app)
-    sent_messages: list[dict[str, object]] = []
+    sent_messages: list[Message] = []
 
     async def ws_receive():  # noqa: ANN202
         assert shutdown_state.get_in_flight() == existing
