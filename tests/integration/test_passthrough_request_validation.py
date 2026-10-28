@@ -84,6 +84,26 @@ async def test_responses_routes_reject_non_string_non_array_input_with_400(async
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", _RESPONSES_ROUTES)
+@pytest.mark.parametrize(
+    "include", [["bogus.value"], ["output.encrypted_content", "bogus.value"]], ids=["alone", "mixed"]
+)
+async def test_responses_routes_reject_unknown_include_with_400(async_client, route, include):
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": "hello", "include": include}
+    response = await async_client.post(route, json=payload)
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "message": "Invalid request payload",
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+            "param": "include",
+        }
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("route", "payload", "param"), _DEEP_ROUTE_CASES, ids=_DEEP_ROUTE_IDS)
 async def test_deeply_nested_passthrough_fields_are_rejected_with_400(async_client, route, payload, param):
     # Past pydantic-core's ~250-level serializer limit the request used to
