@@ -114,7 +114,7 @@ from app.modules.proxy.work_admission import AdmissionLease
 from app.modules.request_logs.repository import PreviousResponseOwnerRecord, RequestLogsRepository
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 from app.modules.usage.updater import UsageUpdater
-from tests.simulation.virtual_time import VirtualClock
+from tests.simulation.virtual_time import VirtualClock, VirtualScheduler
 from tests.unit._proxy_test_helpers import runtime_basic_auth_url
 from tests.unit.hypothesis_strategies import json_objects, json_values
 
@@ -36340,6 +36340,407 @@ async def test_relay_upstream_websocket_ordinary_receive_failure_is_stream_incom
     assert handle_stream_error_args is not None
     assert handle_stream_error_args.args[0] is account
     assert handle_stream_error_args.args[2] == "stream_incomplete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backpressure", "upstream_activity_seconds", "ending", "classified_at", "error_code", "status"),
+    [
+        # The idle control's connection closes itself: with no pending turn left
+        # after its terminal frame, the existing 120-second downstream idle
+        # policy closes it before any explicit ending.
+        pytest.param(None, None, None, "idle", "stream_idle_timeout", "error", id="control-upstream-idle"),
+        pytest.param(
+            None, 500.0, "disconnect", "total", "upstream_request_timeout", "error", id="control-total-budget"
+        ),
+        pytest.param(
+            "held_send_lock", None, "cancel", "ending", "stream_incomplete", "cancelled", id="held-send-lock-cancel"
+        ),
+        pytest.param(
+            "held_send_lock",
+            None,
+            "disconnect",
+            "ending",
+            "client_disconnected",
+            "cancelled",
+            id="held-send-lock-disconnect",
+        ),
+        pytest.param(
+            "blocked_write", None, "cancel", "ending", "stream_incomplete", "cancelled", id="blocked-write-cancel"
+        ),
+        pytest.param(
+            "blocked_write",
+            None,
+            "disconnect",
+            "ending",
+            "client_disconnected",
+            "cancelled",
+            id="blocked-write-disconnect",
+        ),
+    ],
+)
+async def test_proxy_responses_websocket_downstream_backpressure_keeps_receive_budgets_and_settles_owners(
+    monkeypatch: pytest.MonkeyPatch,
+    backpressure: str | None,
+    upstream_activity_seconds: float | None,
+    ending: str | None,
+    classified_at: str,
+    error_code: str,
+    status: str,
+) -> None:
+    """Drive downstream backpressure through the actual relay owner path under virtual time.
+
+    The original 600-second idle and 7200-second total budgets bound upstream
+    receive waits; the two controls prove both fire through this harness. While
+    shielded terminal delivery waits on a held send lock or a blocked write, the
+    reader arms no receive wait, so neither budget ends the turn. Cancellation or
+    disconnect then settles every request owner after the bounded
+    task-cancellation wait without cancelling the delivery's sole owner, which
+    stays drain-visible until its write resolves.
+    """
+    clock = VirtualClock(monotonic_value=1_000.0)
+    scheduler = VirtualScheduler(clock)
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs), clock=clock, scheduler=scheduler)
+    settings = _make_proxy_settings()
+    settings.stream_idle_timeout_seconds = 600.0
+    settings.http_responses_stream_request_budget_seconds = 7200.0
+    settings.sse_keepalive_interval_seconds = 10.0
+    settings.proxy_downstream_websocket_idle_timeout_seconds = 120.0
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    # Only the downstream receive poll is coarsened (1s by default) so two
+    # virtual hours stay cheap; it still re-checks well inside the idle window.
+    monkeypatch.setattr(proxy_service, "_DOWNSTREAM_WEBSOCKET_RECEIVE_POLL_SECONDS", 60.0)
+    handle_stream_error = AsyncMock()
+    monkeypatch.setattr(proxy_service.ProxyService, "_handle_stream_error", handle_stream_error)
+
+    api_key = _make_api_key_data("key_ws_backpressure")
+    reservation = ApiKeyUsageReservationData(reservation_id="resv_ws_backpressure", key_id=api_key.id, model="gpt-5.1")
+
+    class _ApiKeyStore:
+        """API-key repository boundary; the reservation lifecycle stays production code."""
+
+        def __init__(self) -> None:
+            self.reserved: list[str] = []
+            self.released: list[str] = []
+            self.finalized: list[str] = []
+
+        def __call__(self, _repository: object) -> Self:
+            return self
+
+        async def get_key_by_id(self, key_id: str) -> ApiKeyData:
+            assert key_id == api_key.id
+            return api_key
+
+        async def enforce_limits_for_request(self, key_id: str, **_kwargs: object) -> ApiKeyUsageReservationData:
+            self.reserved.append(key_id)
+            return reservation
+
+        async def touch_usage_reservation(self, reservation_id: str) -> bool:
+            return reservation_id == reservation.reservation_id
+
+        async def release_usage_reservation(self, reservation_id: str) -> None:
+            self.released.append(reservation_id)
+
+        async def finalize_usage_reservation(self, reservation_id: str, **_kwargs: object) -> None:
+            self.finalized.append(reservation_id)
+
+    api_key_store = _ApiKeyStore()
+    monkeypatch.setattr(proxy_service, "ApiKeysService", api_key_store)
+    monkeypatch.setattr(websocket_mixin, "ApiKeysService", api_key_store)
+
+    response_id = "resp_ws_backpressure"
+    request_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.1",
+            "instructions": "",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "backpressure"}]}],
+            "stream": True,
+        },
+        separators=(",", ":"),
+    )
+
+    def upstream_event(event_type: str) -> SimpleNamespace:
+        text = json.dumps(
+            {"type": event_type, "response": {"id": response_id, "status": "in_progress"}},
+            separators=(",", ":"),
+        )
+        return SimpleNamespace(kind="text", text=text, data=None, close_code=None, error=None)
+
+    class _Upstream:
+        """Answers the create, then stays silent or sends lifecycle activity on the virtual clock."""
+
+        def __init__(self) -> None:
+            self.sent_text: list[str] = []
+            self.pressure_at_send: tuple[int, int, float] | None = None
+            self.closed = False
+            self._frames: deque[SimpleNamespace] = deque()
+            self._changed = asyncio.Event()
+            self._next_activity_at: float | None = None
+
+        async def send_text(self, text: str) -> None:
+            self.sent_text.append(text)
+            self.pressure_at_send = await service._load_balancer.account_pressure_snapshot(account.id)
+            self._frames.append(upstream_event("response.created"))
+            if upstream_activity_seconds is not None:
+                self._next_activity_at = clock.monotonic() + upstream_activity_seconds
+            self._changed.set()
+
+        async def send_bytes(self, _data: bytes) -> None:
+            raise AssertionError("binary upstream send is not expected")
+
+        async def receive(self) -> SimpleNamespace:
+            # Keepalive ticks cancel this wait; a cancelled wait neither
+            # consumes nor reschedules the next frame.
+            while True:
+                if self._frames:
+                    return self._frames.popleft()
+                if self.closed:
+                    return SimpleNamespace(kind="close", text=None, data=None, close_code=1000, error=None)
+                if self._next_activity_at is None:
+                    self._changed.clear()
+                    await self._changed.wait()
+                elif clock.monotonic() < self._next_activity_at:
+                    await scheduler.sleep(self._next_activity_at - clock.monotonic())
+                else:
+                    assert upstream_activity_seconds is not None
+                    self._next_activity_at += upstream_activity_seconds
+                    return upstream_event("response.in_progress")
+
+        async def close(self) -> None:
+            self.closed = True
+            self._changed.set()
+
+    class _Downstream:
+        """Downstream transport whose writes can block until the test resolves them."""
+
+        def __init__(self) -> None:
+            self.request_delivered = False
+            self.write_attempts: list[str] = []
+            self.sent_text: list[str] = []
+            self.writes_released = asyncio.Event()
+            self.disconnect_requested = asyncio.Event()
+            self.transport_closed = False
+            self.close_calls: list[tuple[int, str | None]] = []
+
+        async def receive(self) -> dict[str, object]:
+            if not self.request_delivered:
+                self.request_delivered = True
+                return {"type": "websocket.receive", "text": request_text}
+            await self.disconnect_requested.wait()
+            return {"type": "websocket.disconnect"}
+
+        async def send_text(self, text: str) -> None:
+            self.write_attempts.append(text)
+            await self.writes_released.wait()
+            if self.transport_closed:
+                raise RuntimeError("synthetic downstream transport closed")
+            self.sent_text.append(text)
+
+        async def send_bytes(self, _data: bytes) -> None:
+            raise AssertionError("binary downstream relay is not expected")
+
+        async def close(self, code: int = 1000, reason: str | None = None) -> None:
+            self.close_calls.append((code, reason))
+            self.transport_closed = True
+
+    account = _make_account("acc_ws_backpressure")
+    upstream = _Upstream()
+    downstream = _Downstream()
+    if backpressure != "blocked_write":
+        downstream.writes_released.set()
+    release_send_lock = asyncio.Event()
+    turn = SimpleNamespace(
+        connects=0,
+        request_state=None,
+        create_owners_at_connect=None,
+        response_create_gate=None,
+        pending_requests=None,
+        upstream_control=None,
+        reader=None,
+        lock_holder=None,
+    )
+
+    async def hold_send_lock(client_send_lock: anyio.Lock) -> None:
+        # A competing downstream sender that holds the send lock until released.
+        async with client_send_lock:
+            await release_send_lock.wait()
+
+    async def connect(_self: object, _headers: object, **kwargs: object) -> tuple[Account, UpstreamWebSocket]:
+        request_state = cast(proxy_service._WebSocketRequestState, kwargs["request_state"])
+        # Account selection hands the connection its stream lease this way.
+        request_state.websocket_stream_lease = await service._load_balancer.acquire_account_lease(
+            account.id,
+            kind="stream",
+        )
+        turn.connects += 1
+        turn.request_state = request_state
+        turn.create_owners_at_connect = (
+            request_state.response_create_gate_acquired,
+            request_state.response_create_admission is not None,
+        )
+        turn.response_create_gate = request_state.response_create_gate
+        if backpressure == "held_send_lock":
+            turn.lock_holder = asyncio.create_task(hold_send_lock(cast(anyio.Lock, kwargs["client_send_lock"])))
+        return account, cast(UpstreamWebSocket, upstream)
+
+    relay_upstream_messages = service._relay_upstream_websocket_messages
+
+    async def observed_relay(*args: Any, **kwargs: Any) -> None:
+        # Pass-through that only exposes the reader task and its shared owners.
+        turn.pending_requests = kwargs["pending_requests"]
+        turn.upstream_control = kwargs["upstream_control"]
+        turn.reader = asyncio.current_task()
+        await relay_upstream_messages(*args, **kwargs)
+
+    monkeypatch.setattr(proxy_service.ProxyService, "_connect_proxy_websocket", connect)
+    monkeypatch.setattr(service, "_relay_upstream_websocket_messages", observed_relay)
+
+    stages = ("idle", "total", "ending")
+
+    async def assert_classification(reached: str | None) -> None:
+        await scheduler.drain()
+        classified = reached is not None and stages.index(classified_at) <= stages.index(reached)
+        failed_codes = [
+            event["response"]["error"]["code"]
+            for event in map(json.loads, downstream.sent_text)
+            if event["type"] == "response.failed"
+        ]
+        assert list(turn.pending_requests) == ([] if classified else [turn.request_state])
+        assert [(row["status"], row["error_code"]) for row in request_logs.calls] == (
+            [(status, error_code)] if classified else []
+        )
+        assert api_key_store.released == ([reservation.reservation_id] if classified else [])
+        assert failed_codes == ([error_code] if classified and backpressure is None else [])
+
+    scope = scheduler.create_task(
+        service.proxy_responses_websocket(
+            cast(WebSocket, downstream),
+            {},
+            codex_session_affinity=False,
+            openai_cache_affinity=False,
+            api_key=api_key,
+        ),
+        name="test-websocket-backpressure-scope",
+    )
+    try:
+        await scheduler.drain()
+        request_state = cast(proxy_service._WebSocketRequestState, turn.request_state)
+        gate = cast(asyncio.Semaphore, turn.response_create_gate)
+        assert request_state.started_at == clock.monotonic()
+        assert turn.connects == 1
+        assert api_key_store.reserved == [api_key.id]
+        # The create gate and turn admission were held through connect, and the
+        # account create lease beside the connection stream lease at dispatch.
+        assert turn.create_owners_at_connect == (True, True)
+        assert upstream.pressure_at_send == (1, 1, 0.0)
+        assert len(upstream.sent_text) == 1
+        assert request_state.response_id == response_id
+        await assert_classification(None)
+
+        await scheduler.advance(599.0)
+        await assert_classification(None)
+        await scheduler.advance(1.0)
+        await assert_classification("idle")
+        await scheduler.advance(6_599.0)
+        await assert_classification("idle")
+        await scheduler.advance(1.0)
+        await assert_classification("total")
+        assert clock.monotonic() == request_state.started_at + 7_200.0
+
+        terminal_task: asyncio.Task[Any] | None = None
+        if backpressure is not None:
+            # Past both budgets, the reader still waits on shielded delivery of
+            # response.created and no relay timeout or keepalive has fired.
+            terminal_task = turn.upstream_control.terminal_message_task
+            assert terminal_task is not None
+            assert not terminal_task.done()
+            assert not turn.reader.done()
+            # A held lock stops delivery before the transport; a blocked write
+            # has entered it. Neither has delivered anything.
+            assert [json.loads(text)["type"] for text in downstream.write_attempts] == (
+                ["response.created"] if backpressure == "blocked_write" else []
+            )
+            assert downstream.sent_text == []
+            assert request_state.api_key_reservation is reservation
+            # response.created returned the create gate and the account create
+            # lease before delivery; the connection stream lease is still held.
+            assert not gate.locked()
+            assert await service._load_balancer.account_pressure_snapshot(account.id) == (0, 1, 0.0)
+
+        if ending == "cancel":
+            scope.cancel()
+        elif ending == "disconnect":
+            downstream.disconnect_requested.set()
+        await scheduler.advance(0.5)
+        # The reader waits for owned delivery only within the bounded
+        # task-cancellation timeout before scope cleanup settles the turn.
+        assert scope.done() is (backpressure is None)
+        await scheduler.advance(0.5)
+        assert scope.done()
+        if ending == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await scope
+        else:
+            assert await scope is None
+        await assert_classification("ending")
+
+        assert turn.reader.done()
+        assert upstream.closed is True
+        assert len(upstream.sent_text) == 1
+        # A pending or backpressured turn is never closed by the downstream
+        # idle policy; only the settled idle control reaches it.
+        idle_close = (1001, proxy_service._DOWNSTREAM_WEBSOCKET_IDLE_CLOSE_REASON)
+        assert (idle_close in downstream.close_calls) is (ending is None)
+        assert request_logs.calls[0]["account_id"] == account.id
+        assert api_key_store.finalized == []
+        assert request_state.api_key_reservation is None
+        assert request_state.api_key_reservation_heartbeat_task is None
+        assert await service._load_balancer.account_pressure_snapshot(account.id) == (0, 0, 0.0)
+        assert not gate.locked()
+        await gate.acquire()
+        # Exactly one create permit remains: settlement never released it twice.
+        assert gate.locked()
+        gate.release()
+        if terminal_task is not None:
+            handle_stream_error.assert_not_awaited()
+            # The sole owner of the blocked delivery was not cancelled and
+            # remains visible to shutdown persistence draining.
+            assert not terminal_task.done()
+            assert terminal_task in service._background_cleanup_tasks
+            assert await service.drain_persistence_tasks(timeout_seconds=0) is False
+
+        downstream.transport_closed = True
+        downstream.writes_released.set()
+        release_send_lock.set()
+        if turn.lock_holder is not None:
+            await turn.lock_holder
+        await scheduler.drain()
+        if terminal_task is not None:
+            assert terminal_task.done()
+            assert [json.loads(text)["type"] for text in downstream.write_attempts] == ["response.created"]
+            assert downstream.sent_text == []
+        assert await service.drain_persistence_tasks(timeout_seconds=0) is True
+        assert scheduler.owned_tasks == frozenset()
+        assert scheduler.pending_timers == 0
+        # The late delivery failure finds nothing left to settle a second time.
+        await assert_classification("ending")
+        assert await service._load_balancer.account_pressure_snapshot(account.id) == (0, 0, 0.0)
+        assert turn.connects == 1
+        assert api_key_store.reserved == [api_key.id]
+    finally:
+        downstream.transport_closed = True
+        downstream.writes_released.set()
+        downstream.disconnect_requested.set()
+        release_send_lock.set()
+        if not scope.done():
+            scope.cancel()
+        await scheduler.advance(10.0)
+        await scheduler.cancel_owned_tasks()
+        if turn.lock_holder is not None:
+            await turn.lock_holder
 
 
 @pytest.mark.asyncio
