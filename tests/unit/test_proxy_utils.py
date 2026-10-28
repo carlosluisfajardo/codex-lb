@@ -36556,6 +36556,8 @@ async def test_proxy_responses_websocket_downstream_backpressure_keeps_receive_b
         connects=0,
         request_state=None,
         create_owners_at_connect=None,
+        admission=None,
+        admission_at_connect=None,
         response_create_gate=None,
         pending_requests=None,
         upstream_control=None,
@@ -36581,6 +36583,12 @@ async def test_proxy_responses_websocket_downstream_backpressure_keeps_receive_b
             request_state.response_create_gate_acquired,
             request_state.response_create_admission is not None,
         )
+        # Retain the original process-wide admission lease. While this
+        # reference lives, AdmissionLease.__del__ cannot hand its permit back,
+        # so only an explicit release() can satisfy the release checks.
+        admission = cast(AdmissionLease, request_state.response_create_admission)
+        turn.admission = admission
+        turn.admission_at_connect = (admission._released, cast(asyncio.Semaphore, admission._semaphore)._value)
         turn.response_create_gate = request_state.response_create_gate
         if backpressure == "held_send_lock":
             turn.lock_holder = asyncio.create_task(hold_send_lock(cast(anyio.Lock, kwargs["client_send_lock"])))
@@ -36615,6 +36623,13 @@ async def test_proxy_responses_websocket_downstream_backpressure_keeps_receive_b
         assert api_key_store.released == ([reservation.reservation_id] if classified else [])
         assert failed_codes == ([error_code] if classified and backpressure is None else [])
 
+    def assert_admission_released() -> None:
+        # response.created explicitly released the retained lease, returning
+        # its one permit, and cleared the request field.
+        assert turn.request_state.response_create_admission is None
+        assert turn.admission._released is True
+        assert turn.admission._semaphore._value == settings.proxy_response_create_limit
+
     scope = scheduler.create_task(
         service.proxy_responses_websocket(
             cast(WebSocket, downstream),
@@ -36635,10 +36650,15 @@ async def test_proxy_responses_websocket_downstream_backpressure_keeps_receive_b
         # The create gate and turn admission were held through connect, and the
         # account create lease beside the connection stream lease at dispatch.
         assert turn.create_owners_at_connect == (True, True)
+        # The original admission lease was active at connect: unreleased and
+        # holding one permit of the process-wide response-create gate.
+        assert isinstance(turn.admission, AdmissionLease)
+        assert turn.admission_at_connect == (False, settings.proxy_response_create_limit - 1)
         assert upstream.pressure_at_send == (1, 1, 0.0)
         assert len(upstream.sent_text) == 1
         assert request_state.response_id == response_id
         await assert_classification(None)
+        assert_admission_released()
 
         await scheduler.advance(599.0)
         await assert_classification(None)
@@ -36699,6 +36719,7 @@ async def test_proxy_responses_websocket_downstream_backpressure_keeps_receive_b
         assert request_state.api_key_reservation is None
         assert request_state.api_key_reservation_heartbeat_task is None
         assert await service._load_balancer.account_pressure_snapshot(account.id) == (0, 0, 0.0)
+        assert_admission_released()
         assert not gate.locked()
         await gate.acquire()
         # Exactly one create permit remains: settlement never released it twice.
@@ -36730,6 +36751,7 @@ async def test_proxy_responses_websocket_downstream_backpressure_keeps_receive_b
         assert await service._load_balancer.account_pressure_snapshot(account.id) == (0, 0, 0.0)
         assert turn.connects == 1
         assert api_key_store.reserved == [api_key.id]
+        assert_admission_released()
     finally:
         downstream.transport_closed = True
         downstream.writes_released.set()
