@@ -750,26 +750,42 @@ def test_responses_normalizes_tool_choice_web_search_preview(tool_choice):
     assert request.tool_choice == {"type": "web_search"}
 
 
-def test_responses_rejects_invalid_include_value():
+@pytest.mark.parametrize(
+    ("include", "rejected"),
+    [
+        (["message.output_text.logprobs", "bad.include.value"], "bad.include.value"),
+        (["output.encrypted_content", "bogus.value"], "bogus.value"),
+    ],
+)
+def test_responses_rejects_invalid_include_value(include, rejected):
     payload = {
         "model": "gpt-5.1",
         "instructions": "hi",
         "input": [],
-        "include": ["message.output_text.logprobs", "bad.include.value"],
+        "include": include,
     }
-    with pytest.raises(ValueError, match="Unsupported include value"):
+    with pytest.raises(ValueError, match=f"Unsupported include value: {re.escape(rejected)}"):
         ResponsesRequest.model_validate(payload)
 
 
-def test_responses_accepts_known_include_values():
+@pytest.mark.parametrize(
+    "include",
+    [
+        ["reasoning.encrypted_content", "web_search_call.action.sources"],
+        ["output.encrypted_content"],
+        ["reasoning.encrypted_content", "output.encrypted_content"],
+    ],
+)
+def test_responses_accepts_known_include_values(include):
     payload = {
         "model": "gpt-5.1",
         "instructions": "hi",
         "input": [],
-        "include": ["reasoning.encrypted_content", "web_search_call.action.sources"],
+        "include": include,
     }
     request = ResponsesRequest.model_validate(payload)
-    assert request.include == ["reasoning.encrypted_content", "web_search_call.action.sources"]
+    assert request.include == include
+    assert request.to_payload()["include"] == include
 
 
 def test_responses_accepts_previous_response_id_without_conversation():

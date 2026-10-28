@@ -260,6 +260,44 @@ async def test_responses_prohibit_explicit_priority_service_tier(async_client, m
 
 
 @pytest.mark.parametrize(
+    "include", [["output.encrypted_content"], ["reasoning.encrypted_content", "output.encrypted_content"]]
+)
+@pytest.mark.parametrize("path", ["/backend-api/codex/responses", "/v1/responses"])
+@pytest.mark.asyncio
+async def test_responses_forward_output_encrypted_content_include(
+    async_client, monkeypatch, path: str, include: list[str]
+):
+    auth_json = _make_auth_json("acc_output_encrypted_content", "output-encrypted-content@example.com")
+    response = await async_client.post(
+        "/api/accounts/import",
+        files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")},
+    )
+    assert response.status_code == 200
+
+    seen_payload: dict[str, object] = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, **kwargs):
+        del headers, access_token, account_id, kwargs
+        seen_payload.update(payload.to_payload())
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_output_encrypted_content",'
+            '"object":"response","status":"completed","output":[]}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    async with async_client.stream(
+        "POST",
+        path,
+        json={"model": "gpt-5.6-sol", "instructions": "", "input": [], "stream": True, "include": include},
+    ) as response:
+        assert response.status_code == 200
+        _ = [line async for line in response.aiter_lines() if line]
+
+    assert seen_payload["include"] == include
+
+
+@pytest.mark.parametrize(
     "path",
     ["/backend-api/codex/responses/compact", "/v1/responses/compact"],
 )
