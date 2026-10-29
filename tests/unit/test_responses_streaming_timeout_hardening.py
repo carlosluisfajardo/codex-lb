@@ -297,8 +297,12 @@ async def test_http_sse_timeout_attribution_uses_received_bytes(
             if activity == "transport_error"
             else "upstream_request_timeout"
         )
-        assert terminal["response"]["error"]["code"] == expected
-        assert terminal["response"]["id"] == "req_byte_attribution"
+        response = terminal["response"]
+        assert isinstance(response, dict)
+        error = response["error"]
+        assert isinstance(error, dict)
+        assert error["code"] == expected
+        assert response["id"] == "req_byte_attribution"
         assert len(calls) == 1
         sent_headers = {name.lower(): value for name, value in calls[0]["headers"].items()}
         assert sent_headers["chatgpt-account-id"] == "fixture-account"
