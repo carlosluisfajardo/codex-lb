@@ -32872,6 +32872,235 @@ async def test_process_upstream_websocket_text_does_not_fresh_retry_injected_too
 
 
 @pytest.mark.asyncio
+async def test_websocket_denied_injected_anchor_without_fresh_replay_fails_once_without_account_penalty(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_ws_denied_injected_anchor")
+    api_key = _make_api_key_data("key_ws_denied_injected_anchor")
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_ws_denied_injected_anchor",
+        key_id=api_key.id,
+        model="gpt-5.1",
+    )
+    settle_usage = AsyncMock(return_value=True)
+    handle_stream_error = AsyncMock()
+    record_success = AsyncMock()
+
+    class Settings:
+        trace_channels = frozenset()
+
+    monkeypatch.setattr(websocket_helpers_module, "_websocket_stale_previous_response_index", {})
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: Settings())
+    monkeypatch.setattr(service, "_reserve_websocket_api_key_usage", AsyncMock(return_value=reservation))
+    monkeypatch.setattr(service, "_refresh_websocket_api_key_policy", AsyncMock(return_value=api_key))
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", settle_usage)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+    monkeypatch.setattr(service._load_balancer, "record_success", record_success)
+
+    user_input: JsonValue = {"role": "user", "content": [{"type": "input_text", "text": "run the fixture"}]}
+    # The resend repeats the stored prefix but omits the call item, so the
+    # proxy anchors it while the retained full body is unsafe to replay.
+    tool_output: JsonValue = {"type": "function_call_output", "call_id": "call_denied_anchor", "output": "done"}
+    continuity_state = proxy_service._WebSocketContinuityState(
+        last_completed_input_count=1,
+        last_completed_response_id="resp_denied_injected_anchor",
+        last_completed_input_prefix_fingerprint=proxy_service._fingerprint_input_items([user_input]),
+    )
+
+    async def prepare_turn() -> Any:
+        return await service._prepare_websocket_response_create_request(
+            cast(
+                dict[str, JsonValue],
+                {"type": "response.create", "model": "gpt-5.1", "input": [user_input, tool_output]},
+            ),
+            headers={"session_id": "sid_ws_denied_injected_anchor"},
+            codex_session_affinity=True,
+            openai_cache_affinity=True,
+            sticky_threads_enabled=False,
+            openai_cache_affinity_max_age_seconds=300,
+            api_key=api_key,
+            continuity_state=continuity_state,
+        )
+
+    prepared = await prepare_turn()
+    request_state = prepared.request_state
+    assert json.loads(prepared.text_data)["previous_response_id"] == "resp_denied_injected_anchor"
+    assert request_state.proxy_injected_previous_response_id is True
+    assert request_state.fresh_upstream_request_text is None
+    request_state.request_text = prepared.text_data
+    request_state.awaiting_response_created = True
+    upstream_control = proxy_service._WebSocketUpstreamControl()
+
+    downstream_text = await service._process_upstream_websocket_text(
+        json.dumps(
+            {
+                "type": "error",
+                "status": 400,
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "previous_response_not_found",
+                    "message": "Previous response with id 'resp_denied_injected_anchor' not found.",
+                    "param": "previous_response_id",
+                },
+            },
+            separators=(",", ":"),
+        ),
+        account=account,
+        account_id_value=account.id,
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        api_key=api_key,
+        upstream_control=upstream_control,
+        response_create_gate=asyncio.Semaphore(1),
+        continuity_state=continuity_state,
+        codex_session_affinity=True,
+    )
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
+
+    downstream_event = json.loads(downstream_text)
+    assert downstream_event["type"] == "response.failed"
+    assert downstream_event["response"]["error"]["code"] == proxy_service.PREVIOUS_RESPONSE_NOT_FOUND_CODE
+    assert "resp_denied_injected_anchor" not in downstream_text
+    assert upstream_control.replay_request_state is None
+    assert upstream_control.retire_after_drain is False
+    handle_stream_error.assert_not_awaited()
+    record_success.assert_not_awaited()
+    settle_usage.assert_awaited_once()
+    settle_call = settle_usage.await_args
+    assert settle_call is not None
+    assert settle_call.args[1] is reservation
+    assert settle_call.args[2].account_health_error is False
+    [failure_log] = request_logs.calls
+    assert failure_log["status"] == "error"
+    assert failure_log["error_code"] == proxy_service.PREVIOUS_RESPONSE_NOT_FOUND_CODE
+    assert failure_log["failure_phase"] == "upstream"
+    assert cast(str, failure_log["failure_detail"]).startswith(
+        "previous_response_not_found previous_response_source=proxy_injected fresh_replay_available=false "
+    )
+
+    # The client's retry of the same turn must not carry the denied anchor again.
+    retried = await prepare_turn()
+
+    retried_payload = json.loads(retried.text_data)
+    assert "previous_response_id" not in retried_payload
+    assert retried_payload["input"] == [user_input, tool_output]
+    assert retried.request_state.proxy_injected_previous_response_id is False
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_denied_injected_anchor_without_fresh_replay_settles_without_account_penalty(monkeypatch):
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_bridge_denied_injected_anchor")
+    api_key = _make_api_key_data("key_bridge_denied_injected_anchor")
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_bridge_denied_injected_anchor",
+        key_id=api_key.id,
+        model="gpt-5.4",
+    )
+    settle_usage = AsyncMock(return_value=True)
+    handle_stream_error = AsyncMock()
+    record_success = AsyncMock()
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", settle_usage)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+    monkeypatch.setattr(service._load_balancer, "record_success", record_success)
+
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req_bridge_denied_injected_anchor",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key=api_key,
+        api_key_reservation=reservation,
+        started_at=0.0,
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        transport="http",
+        request_text=json.dumps(
+            {
+                "type": "response.create",
+                "model": "gpt-5.4",
+                "previous_response_id": "resp_bridge_denied_injected_anchor",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+            },
+            separators=(",", ":"),
+        ),
+        previous_response_id="resp_bridge_denied_injected_anchor",
+        proxy_injected_previous_response_id=True,
+    )
+    # A soft key keeps the hard-key retry circuit and its durable store out of
+    # this settlement; account health is decided by the shared finalizer.
+    session = proxy_service._HTTPBridgeSession(
+        key=proxy_service._HTTPBridgeSessionKey("prompt_cache", "bridge-denied-injected-anchor", None),
+        headers={},
+        affinity=proxy_service._AffinityPolicy(),
+        request_model="gpt-5.4",
+        account=account,
+        upstream=AsyncMock(),
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=1,
+        last_used_at=0.0,
+        idle_ttl_seconds=30.0,
+    )
+    cast(Any, session.upstream).archive_received = MagicMock()
+
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "error",
+                "status": 400,
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "previous_response_not_found",
+                    "message": "Previous response with id 'resp_bridge_denied_injected_anchor' not found.",
+                    "param": "previous_response_id",
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
+
+    assert request_state.event_queue is not None
+    event_block = await request_state.event_queue.get()
+    assert event_block is not None
+    assert await request_state.event_queue.get() is None
+    downstream_event = parse_sse_data_json(event_block)
+    assert isinstance(downstream_event, dict)
+    downstream_response = cast(dict[str, JsonValue], downstream_event["response"])
+    downstream_error = cast(dict[str, JsonValue], downstream_response["error"])
+    assert downstream_error["code"] == "stream_incomplete"
+    assert downstream_error["message"] == "Upstream websocket closed before response.completed"
+    handle_stream_error.assert_not_awaited()
+    record_success.assert_not_awaited()
+    settle_usage.assert_awaited_once()
+    settle_call = settle_usage.await_args
+    assert settle_call is not None
+    assert settle_call.args[1] is reservation
+    assert settle_call.args[2].account_health_error is False
+    assert session.upstream_control.retire_after_drain is False
+    assert request_state.replay_count == 0
+    assert list(session.pending_requests) == []
+    [failure_log] = request_logs.calls
+    assert failure_log["status"] == "error"
+    assert failure_log["account_id"] == account.id
+    assert failure_log["error_code"] == "stream_incomplete"
+    assert failure_log["error_message"] == "Upstream websocket closed before response.completed"
+    assert failure_log["failure_phase"] == "upstream"
+    assert failure_log["failure_detail"] == (
+        "previous_response_not_found "
+        "previous_response_source=proxy_injected fresh_replay_available=false "
+        "owner_lookup_source=unknown owner_lookup_outcome=unknown "
+        "previous_response_age_seconds=unknown same_session=unknown"
+    )
+    assert failure_log["upstream_error_code"] == "previous_response_not_found"
+
+
+@pytest.mark.asyncio
 async def test_process_upstream_websocket_text_maps_previous_response_usage_limit_to_upstream_unavailable(
     monkeypatch,
 ):
