@@ -499,7 +499,7 @@ ErrorResponse: TypeAlias = aiohttp.ClientResponse | ErrorResponseProtocol
 
 
 class SSEContentProtocol(Protocol):
-    def iter_chunked(self, size: int) -> "SSEChunkIteratorProtocol": ...
+    def iter_chunked(self, size: int, /) -> "SSEChunkIteratorProtocol": ...
 
 
 class SSEChunkIteratorProtocol(Protocol):
@@ -513,6 +513,14 @@ class SSEResponseProtocol(Protocol):
 
 
 SSEResponse: TypeAlias = aiohttp.ClientResponse | SSEResponseProtocol
+
+
+@dataclass
+class _ActivityTrackingSSEResponse:
+    """Parser view of a Python body with request-local receive activity."""
+
+    content: SSEContentProtocol
+    on_activity: Callable[[], None]
 
 
 class _CodexSSEContent:
@@ -1545,6 +1553,8 @@ async def _iter_sse_events(
         if not chunk:
             continue
 
+        if isinstance(resp, _ActivityTrackingSSEResponse):
+            resp.on_activity()
         buffer.extend(chunk)
         if swallow_lf:
             swallow_lf = False
@@ -3859,6 +3869,16 @@ async def _stream_responses_with_session(
     )
     started_at = time.monotonic()
 
+    def _track_http_body_activity(resp: SSEResponse) -> SSEResponse:
+        if isinstance(resp, NativeEgressResponse):
+            return resp
+
+        def record_activity() -> None:
+            nonlocal last_stream_activity_at
+            last_stream_activity_at = time.monotonic()
+
+        return _ActivityTrackingSSEResponse(resp.content, record_activity)
+
     async def _stream_via_http(
         current_headers: Mapping[str, str],
         current_timeout: aiohttp.ClientTimeout,
@@ -3996,7 +4016,7 @@ async def _stream_responses_with_session(
 
                 async with contextlib.aclosing(
                     _iter_sse_events(
-                        cast(SSEResponse, resp),
+                        _track_http_body_activity(cast(SSEResponse, resp)),
                         effective_idle_timeout,
                         MAX_SSE_EVENT_BYTES,
                     )
@@ -4154,7 +4174,7 @@ async def _stream_responses_with_session(
 
             async with contextlib.aclosing(
                 _iter_sse_events(
-                    resp,
+                    _track_http_body_activity(resp),
                     effective_idle_timeout,
                     MAX_SSE_EVENT_BYTES,
                 )

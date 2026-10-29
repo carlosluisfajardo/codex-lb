@@ -3,12 +3,19 @@ from __future__ import annotations
 import asyncio
 import gc
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
+from app.core.clients import proxy as proxy_module
 from app.core.clients.proxy import ProxyResponseError
+from app.core.config.settings import Settings
+from app.core.openai.requests import ResponsesRequest
 from app.core.resilience.overload import local_overload_error
-from app.core.utils.sse import SSE_KEEPALIVE_FRAME
+from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
+from app.core.utils.sse import SSE_KEEPALIVE_FRAME, parse_sse_data_json
 from app.modules.proxy import api as proxy_api
 from tests.simulation.virtual_time import VirtualClock, VirtualScheduler
 
@@ -153,6 +160,158 @@ async def test_capacity_ready_probe_timeout_uses_virtual_scheduler() -> None:
 
     assert await probe_task is False
     await scheduler.cancel_owned_tasks()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routed", [False, True], ids=["direct", "routed"])
+@pytest.mark.parametrize("activity", ["partial", "complete", "idle", "idle_tie", "cancel", "transport_error"])
+async def test_http_sse_timeout_attribution_uses_received_bytes(
+    monkeypatch: pytest.MonkeyPatch, activity: str, routed: bool
+) -> None:
+    """The real parser distinguishes transport silence from an active total expiry."""
+    clock = VirtualClock()
+    scheduler = VirtualScheduler(clock)
+    received_at: list[float] = []
+    cleanup: list[str] = []
+    calls: list[dict] = []
+    completions: list[dict] = []
+
+    class Body:
+        async def read_delay(self, delay: float) -> None:
+            # Each routed read is bounded by the remaining ORIGINAL total;
+            # the scope ends before yielding a chunk to another reader task.
+            if routed:
+                await scheduler.wait_for(scheduler.sleep(delay), timeout=7200 - clock.monotonic())
+            else:
+                await scheduler.sleep(delay)
+
+        async def iter_chunked(self, _size: int) -> AsyncIterator[bytes]:
+            try:
+                if activity in {"idle", "cancel", "transport_error"}:
+                    received_at.append(clock.monotonic())
+                    yield b'data: {"type":"response.created","padding":"'
+                    if activity == "transport_error":
+                        await self.read_delay(300)
+                        raise proxy_module.aiohttp.ClientPayloadError("fixture truncated response")
+                    await self.read_delay(10_000)
+                else:
+                    for index in range(22 if activity == "idle_tie" else 23):
+                        await self.read_delay(300)
+                        received_at.append(clock.monotonic())
+                        if activity == "complete":
+                            yield b'data: {"type":"response.in_progress","response":{"id":"resp_active"}}\n\n'
+                        elif index == 0:
+                            yield b'data: {"type":"response.created","padding":"'
+                        else:
+                            yield b"x"
+                    await self.read_delay(10_000)
+            finally:
+                cleanup.append("body")
+
+    class Session:
+        @asynccontextmanager
+        async def post(self, url: str, **kwargs):
+            calls.append({"url": url, **kwargs})
+            timeout = kwargs["timeout"]
+            assert timeout.total == 7200
+            assert timeout.sock_read == 600
+            try:
+                with scheduler.fail_after(timeout.total):
+                    yield SimpleNamespace(status=200, headers={}, content=Body())
+            finally:
+                cleanup.append("response")
+
+    class RoutedClient:
+        async def request(self, method: str, url: str, **kwargs):
+            assert method == "POST"
+            assert kwargs["timeout"].total == 7200
+            assert kwargs["timeout"].sock_read == 600
+            calls.append({"url": url, **kwargs})
+            return SimpleNamespace(status=200, headers={}, content=Body(), release=lambda: cleanup.append("response"))
+
+    settings = Settings(
+        upstream_base_url="https://upstream.invalid/backend-api",
+        stream_idle_timeout_seconds=600,
+        http_responses_stream_request_budget_seconds=7200,
+        circuit_breaker_enabled=False,
+    )
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_module, "time", SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(proxy_module, "asyncio", SimpleNamespace(**{**vars(asyncio), "wait": scheduler.wait}))
+    monkeypatch.setattr(proxy_module, "discover_native_egress_client", lambda: None)
+    monkeypatch.setattr(proxy_module, "get_request_id", lambda: "req_byte_attribution")
+    monkeypatch.setattr(proxy_module, "archive_json", lambda **_kwargs: None)
+    monkeypatch.setattr(proxy_module, "archive_text", lambda **_kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: completions.append(kwargs)
+    )
+
+    payload = ResponsesRequest.model_validate(
+        {"model": "gpt-5.1", "instructions": "fixture", "input": "hello", "stream": True}
+    )
+
+    async def collect() -> list[str]:
+        return [
+            event
+            async for event in proxy_module.stream_responses(
+                payload,
+                headers={"x-request-id": "req_byte_attribution"},
+                access_token="fixture-token",
+                account_id="fixture-account",
+                session=cast(proxy_module.aiohttp.ClientSession, Session()),
+                route=(
+                    ResolvedUpstreamRoute(
+                        "proxy", "fixture-pool", ResolvedProxyEndpoint("fixture-endpoint", "http", "proxy.invalid", 80)
+                    )
+                    if routed
+                    else None
+                ),
+                codex_client=cast(proxy_module.CodexClient, RoutedClient()) if routed else None,
+                upstream_stream_transport_override="http",
+                suppress_live_usage=True,
+            )
+        ]
+
+    task = scheduler.create_task(collect())
+    try:
+        await scheduler.advance(
+            600 if activity == "idle" else 300 if activity in {"cancel", "transport_error"} else 7200
+        )
+        if activity == "cancel":
+            assert not task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert cleanup == ["body", "response"]
+            assert len(calls) == 1
+            return
+        assert task.done(), "existing idle/total budget must terminate the real request path"
+        events = await task
+        terminal = parse_sse_data_json(events[-1])
+        assert terminal is not None
+        expected = (
+            "stream_idle_timeout"
+            if activity in {"idle", "idle_tie"}
+            else "upstream_unavailable"
+            if activity == "transport_error"
+            else "upstream_request_timeout"
+        )
+        assert terminal["response"]["error"]["code"] == expected
+        assert terminal["response"]["id"] == "req_byte_attribution"
+        assert len(calls) == 1
+        sent_headers = {name.lower(): value for name, value in calls[0]["headers"].items()}
+        assert sent_headers["chatgpt-account-id"] == "fixture-account"
+        assert cleanup == ["body", "response"]
+        assert completions[-1]["error_code"] == expected
+        assert completions[-1]["retryable_same_contract"] is False
+        if activity == "transport_error":
+            assert completions[-1]["failure_exception_type"] == "ClientPayloadError"
+        if activity in {"partial", "complete"}:
+            assert received_at[-1] >= 6900
+            assert len(events) == (len(received_at) + 1 if activity == "complete" else 1)
+    finally:
+        await scheduler.cancel_owned_tasks()
 
 
 @pytest.mark.asyncio
