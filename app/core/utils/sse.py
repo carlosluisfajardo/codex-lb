@@ -76,20 +76,32 @@ async def inject_sse_keepalives(
             while True:
                 if pending is None:
                     pending = asyncio.create_task(_next_chunk(iterator))
+                idle_timer = asyncio.timeout(interval_seconds)
                 try:
                     # Not ``wait_for(shield(pending))``: Python 3.14's shield
                     # leaks a done-callback onto ``pending`` at every keepalive
                     # timeout, so a quiet upstream accumulates callbacks (and
                     # O(n) remove scans) until the next chunk arrives.
-                    chunk = await wait_on_shared_future(
-                        pending,
-                        timeout=interval_seconds,
-                    )
+                    async with idle_timer:
+                        chunk = await wait_on_shared_future(pending)
                 except asyncio.TimeoutError:
-                    if on_keepalive is not None:
-                        on_keepalive()
-                    yield keepalive_frame
-                    continue
+                    # Rewaiting on a source task that failed with TimeoutError
+                    # would emit heartbeats without suspending the event loop.
+                    if not idle_timer.expired():
+                        raise
+                    if pending.done():
+                        # Timer cancellation can win the waiter race after the
+                        # source settles. Honor that outcome before heartbeats.
+                        try:
+                            chunk = pending.result()
+                        except StopAsyncIteration:
+                            pending = None
+                            break
+                    else:
+                        if on_keepalive is not None:
+                            on_keepalive()
+                        yield keepalive_frame
+                        continue
                 except StopAsyncIteration:
                     pending = None
                     break
