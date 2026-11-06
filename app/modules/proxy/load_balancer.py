@@ -59,7 +59,10 @@ from app.core.resilience.circuit_breaker import are_all_account_circuit_breakers
 from app.core.resilience.degradation import get_status as get_degradation_status
 from app.core.resilience.degradation import set_degraded, set_normal
 from app.core.resilience.toggles import resolve_resilience_toggles
-from app.core.usage.quota import apply_usage_quota
+from app.core.usage.quota import apply_usage_quota, reserve_gate_applies
+from app.core.usage.quota import extract_credit_status as _extract_credit_status
+from app.core.usage.quota import reserve_account_ids as _reserve_account_ids
+from app.core.usage.quota import usage_entry_recorded_after_block as _usage_entry_recorded_after_block
 from app.core.usage.refresh_policy import usage_freshness_horizon_seconds
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import Account, AccountStatus, AdditionalUsageHistory, StickySessionKind, UsageHistory
@@ -150,7 +153,11 @@ from app.modules.proxy._load_balancer.unbound_selection import (
     UnboundSelectionRequest,
     run_unbound_selection_path,
 )
-from app.modules.proxy.account_cache import get_account_selection_cache, mark_account_routing_unavailable
+from app.modules.proxy.account_cache import (
+    get_account_selection_cache,
+    mark_account_routing_unavailable,
+    set_account_reserve_gated,
+)
 from app.modules.proxy.account_eligibility import (
     account_access_token_expires_at,
     all_accounts_require_reauthentication,
@@ -1384,6 +1391,10 @@ class LoadBalancer:
             standard_latest_secondary = await repos.usage.latest_by_account(window="secondary")
             latest_monthly = await repos.usage.latest_by_account(window="monthly")
             if effective_limit_name:
+                reserve_ids = _reserve_account_ids(
+                    accounts, standard_latest_primary, standard_latest_secondary, latest_monthly
+                )
+                accounts = [account for account in accounts if account.id not in reserve_ids]
                 model_allowed_plans = get_model_registry().plan_types_for_model(model) if model else None
                 latest_primary = additional_filter.latest_primary
                 latest_secondary = additional_filter.latest_secondary
@@ -2139,6 +2150,8 @@ def _build_states(
         if routing_policy_override is not None and account.id in ignore_standard_quota_account_ids:
             state.routing_policy = routing_policy_override
         state.ignore_standard_quota = account.id in ignore_standard_quota_account_ids
+        if not state.ignore_standard_quota:
+            set_account_reserve_gated(account.id, state.reserve_gated)
         states.append(state)
         account_map[account.id] = account
     apply_latency_cohort_weights(states, runtime, now=now, model=model, log_transitions=log_weight_transitions)
@@ -2558,6 +2571,8 @@ def _state_from_account(
     effective_used_percent = None if used_percent is None else min(100.0, used_percent + pressure_pct)
     effective_secondary_used_percent = None if secondary_used is None else min(100.0, secondary_used + pressure_pct)
     usage_exhaustion_evidence_status = status in (AccountStatus.QUOTA_EXCEEDED, AccountStatus.RATE_LIMITED)
+    # Quota recovery filters evidence by blocked_at; last-known reserve ownership must survive that filter.
+    reserve_has, reserve_unlimited, reserve_balance = _extract_credit_status(primary_entry, secondary_entry)
 
     return AccountState(
         account_id=account.id,
@@ -2586,6 +2601,13 @@ def _state_from_account(
         routing_policy=routing_policy,
         selection_weight_multiplier=error_rate_weight_multiplier(
             runtime, now, policy=ErrorRateWeightingPolicy(enabled=tunables.error_rate_weighting_enabled)
+        ),
+        reserve_gated=reserve_gate_applies(
+            credits_has=reserve_has,
+            credits_unlimited=reserve_unlimited,
+            credits_balance=reserve_balance,
+            secondary_used_percent=effective_secondary_used_percent,
+            primary_used_percent=effective_used_percent,
         ),
     )
 
@@ -2858,39 +2880,6 @@ def _usage_entry_is_recent_available(entry: _UsageWindowEntry | None, *, now: fl
         and entry.used_percent is not None
         and float(entry.used_percent) < 100.0
     )
-
-
-def _usage_entry_recorded_after_block(entry: _UsageWindowEntry | None, blocked_at: float) -> bool:
-    if entry is None or entry.recorded_at is None:
-        return False
-    recorded_at = entry.recorded_at
-    if recorded_at.tzinfo is None:
-        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
-    # Persistence truncates block timestamps to whole seconds. A sample
-    # within that same second cannot prove it was captured after the block.
-    return int(recorded_at.timestamp()) > int(blocked_at)
-
-
-def _extract_credit_status(
-    *entries: _UsageWindowEntry | None,
-    recorded_after: float | None = None,
-) -> tuple[bool | None, bool | None, float | None]:
-    credit_entries: list[UsageHistory] = [
-        entry
-        for entry in entries
-        if isinstance(entry, UsageHistory)
-        and (recorded_after is None or _usage_entry_recorded_after_block(entry, recorded_after))
-        and not (entry.credits_has is None and entry.credits_unlimited is None and entry.credits_balance is None)
-    ]
-    if not credit_entries:
-        return None, None, None
-    entry = max(
-        credit_entries,
-        key=lambda item: item.recorded_at if item.recorded_at is not None else datetime.min,
-    )
-    if entry is not None:
-        return entry.credits_has, entry.credits_unlimited, entry.credits_balance
-    return None, None, None
 
 
 def _usage_entry_is_recent_enough(recorded_at: datetime | None, *, now: float) -> bool:

@@ -182,6 +182,7 @@ class RoutingAvailabilityCache:
 
 _account_selection_cache = AccountSelectionCache()
 _routing_availability_cache = RoutingAvailabilityCache()
+_reserve_gated_account_ids: set[str] = set()
 
 
 def get_account_selection_cache() -> AccountSelectionCache:
@@ -208,10 +209,19 @@ def clear_account_routing_unavailable(account_id: str) -> None:
 
 def clear_all_account_routing_unavailable() -> None:
     _routing_availability_cache.reset()
+    _reserve_gated_account_ids.clear()
 
 
 def is_account_routing_unavailable(account_id: str) -> bool:
-    return _routing_availability_cache.is_unavailable(account_id)
+    return _routing_availability_cache.is_unavailable(account_id) or account_id in _reserve_gated_account_ids
+
+
+def set_account_reserve_gated(account_id: str, gated: bool) -> None:
+    """Publish the latest standard gate verdict to the existing retained-session fence."""
+    if gated:
+        _reserve_gated_account_ids.add(account_id)
+    else:
+        _reserve_gated_account_ids.discard(account_id)
 
 
 async def propagate_account_routing_change() -> bool:

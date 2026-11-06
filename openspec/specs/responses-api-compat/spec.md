@@ -1637,7 +1637,7 @@ personality slugs `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. The alias
 resolver MUST match longer qualified canonical slugs before shorter family prefixes so aliases such as `gpt-5.4-mini-high` and `gpt-5.3-codex-fast` normalize
 to the intended model. Unknown suffix tokens MUST leave the requested model unchanged; `ultra` and `max` are not suffix tokens (they are not effort levels
 every GPT-5-family base supports — `gpt-5.6-luna` advertises no `ultra`), so
-labels such as `gpt-5.6-sol-ultra` pass through unchanged.
+labels such as `gpt-5.6-sol-ultra` pass through unchanged. Alias-derived effort is an intermediate value subject to the catalog-scoped ultra effort floor before upstream forwarding.
 
 #### Scenario: Qualified mini model alias normalizes reasoning
 
@@ -1653,6 +1653,7 @@ labels such as `gpt-5.6-sol-ultra` pass through unchanged.
 
 #### Scenario: GPT-5.6 personality alias normalizes reasoning and service tier
 
+- **GIVEN** no catalog snapshot advertises ultra for the resolved model
 - **WHEN** a client sends a Responses request with `model: "gpt-5.6-sol-extra-high-fast"`
 - **THEN** the forwarded upstream request uses `model: "gpt-5.6-sol"`
 - **AND** the forwarded upstream request uses `reasoning.effort: "high"`
@@ -1665,7 +1666,7 @@ labels such as `gpt-5.6-sol-ultra` pass through unchanged.
 
 ### Requirement: OpenAI-compatible Responses payload sanitation removes provider-specific thinking aliases
 
-The shared OpenAI-compatible Responses sanitation path MUST normalize third-party thinking aliases into the canonical `reasoning` object before upstream forwarding. Unknown provider-specific thinking controls MUST NOT be passed through unchanged to the upstream ChatGPT backend.
+The shared OpenAI-compatible Responses sanitation path MUST normalize third-party thinking aliases into the canonical `reasoning` object before upstream forwarding. Unknown provider-specific thinking controls MUST NOT be passed through unchanged to the upstream ChatGPT backend. The resulting explicit or alias-derived effort remains subject to the catalog-scoped ultra effort floor.
 
 #### Scenario: Shared payload sanitation maps enable_thinking
 
@@ -3902,9 +3903,8 @@ paths that build upstream Responses payloads directly instead of passing
 through the proxy request-policy rewrite — such as automation compact pings —
 MUST apply the same aliasing before dispatch, while persisted automation
 configuration and run history keep the configured client-plane `ultra` value.
-`max`
-and `xhigh` MUST be forwarded verbatim (no `max` → `xhigh` aliasing exists
-upstream).
+`max` MUST be forwarded verbatim (no `max` → `xhigh` aliasing exists upstream).
+`xhigh` MUST be forwarded verbatim unless the catalog-scoped ultra floor raises it to `max`.
 
 #### Scenario: Client-requested ultra forwards as max
 
@@ -10896,3 +10896,13 @@ SDK parser failure.
 - **WHEN** the bridge settles the turn
 - **THEN** it emits one terminal `response.failed` event
 - **AND** that terminal event includes a stable `response.id`
+
+### Requirement: Catalog-scoped ultra effort floor
+
+After model aliases and API-key enforcement, Responses and compact requests whose resolved model advertises `ultra` in the catalog snapshot SHALL use at least `ultra`, serialized by the existing wire alias as `max`. Requests for other models or without a catalog snapshot SHALL retain existing effort handling. The floor SHALL preserve model, service tier, and reasoning summary.
+
+#### Scenario: Lower enforced effort is raised
+- **GIVEN** an API key enforces low effort on a model advertising ultra
+- **WHEN** request policy normalizes the request
+- **THEN** the upstream effort is max
+- **AND** the service tier is unchanged

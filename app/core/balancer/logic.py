@@ -151,6 +151,7 @@ class AccountState:
     # neutral. The balancer derives it from the account's recent upstream
     # error rate. Deterministic strategies ignore it.
     selection_weight_multiplier: float = 1.0
+    reserve_gated: bool = False
 
 
 @dataclass
@@ -573,6 +574,8 @@ def select_account(
             continue
         if state.status == AccountStatus.PAUSED:
             continue
+        if state.reserve_gated:
+            continue
         if _known_expired_reauth(state, current):
             continue
         if state.status == AccountStatus.RATE_LIMITED:
@@ -629,6 +632,7 @@ def select_account(
                     AccountStatus.RATE_LIMITED,
                     AccountStatus.QUOTA_EXCEEDED,
                 )
+                or state.reserve_gated
                 or _known_expired_reauth(state, current)
             )
             and state.account_id not in in_error_backoff_ids
