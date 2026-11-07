@@ -524,6 +524,7 @@ async def test_proxy_compact_success(async_client, monkeypatch):
     monkeypatch.setattr(proxy_module, "core_compact_responses", fake_compact)
 
     primary_reset = int(utcnow().replace(tzinfo=timezone.utc).timestamp()) + 300
+    secondary_reset = primary_reset + 604800
     async with SessionLocal() as session:
         usage_repo = UsageRepository(session)
         await usage_repo.add_entry(
@@ -536,6 +537,14 @@ async def test_proxy_compact_success(async_client, monkeypatch):
             credits_unlimited=False,
             credits_balance=12.5,
         )
+        await usage_repo.add_entry(
+            account_id=expected_account_id,
+            used_percent=10.0,
+            window="secondary",
+            reset_at=secondary_reset,
+            window_minutes=10080,
+            recorded_at=utcnow(),
+        )
 
     payload = {"model": "gpt-5.1", "instructions": "hi", "input": []}
     response = await async_client.post("/backend-api/codex/responses/compact", json=payload)
@@ -546,9 +555,78 @@ async def test_proxy_compact_success(async_client, monkeypatch):
     assert response.headers.get("x-codex-primary-used-percent") == "25.0"
     assert response.headers.get("x-codex-primary-window-minutes") == "300"
     assert response.headers.get("x-codex-primary-reset-at") == str(primary_reset)
+    assert response.headers.get("x-codex-secondary-used-percent") == "10.0"
+    assert response.headers.get("x-codex-secondary-window-minutes") == "10080"
+    assert response.headers.get("x-codex-secondary-reset-at") == str(secondary_reset)
     assert response.headers.get("x-codex-credits-has-credits") == "true"
     assert response.headers.get("x-codex-credits-unlimited") == "false"
     assert response.headers.get("x-codex-credits-balance") == "12.50"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secondary_used", [None, 95.0], ids=["unknown_long_window", "reserve_margin"])
+async def test_proxy_compact_keeps_credits_in_reserve_until_standard_usage_recovers(
+    async_client, monkeypatch, secondary_used
+):
+    email = "compact-reserve@example.com"
+    raw_account_id = "acc_compact_reserve"
+    auth_json = _make_auth_json(raw_account_id, email)
+    response = await async_client.post(
+        "/api/accounts/import",
+        files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")},
+    )
+    assert response.status_code == 200
+    account_id = generate_unique_account_id(raw_account_id, email)
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    async with SessionLocal() as session:
+        usage_repo = UsageRepository(session)
+        await usage_repo.add_entry(
+            account_id=account_id,
+            used_percent=25.0,
+            window="primary",
+            reset_at=now_epoch + 18000,
+            window_minutes=300,
+            recorded_at=now,
+            credits_has=True,
+            credits_unlimited=False,
+            credits_balance=12.5,
+        )
+        if secondary_used is not None:
+            await usage_repo.add_entry(
+                account_id=account_id,
+                used_percent=secondary_used,
+                window="secondary",
+                reset_at=now_epoch + 604800,
+                window_minutes=10080,
+                recorded_at=now,
+            )
+
+    upstream_calls: list[str] = []
+
+    async def fake_compact(payload, headers, access_token, selected_account_id):
+        upstream_calls.append(selected_account_id)
+        return OpenAIResponsePayload.model_validate({"output": []})
+
+    monkeypatch.setattr(proxy_module, "core_compact_responses", fake_compact)
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": []}
+    response = await async_client.post("/backend-api/codex/responses/compact", json=payload)
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "no_accounts"
+    assert upstream_calls == []
+
+    async with SessionLocal() as session:
+        await UsageRepository(session).add_entry(
+            account_id=account_id,
+            used_percent=10.0,
+            window="secondary",
+            reset_at=now_epoch + 604800,
+            window_minutes=10080,
+            recorded_at=now + timedelta(seconds=1),
+        )
+    response = await async_client.post("/backend-api/codex/responses/compact", json=payload)
+    assert response.status_code == 200
+    assert upstream_calls == [raw_account_id]
 
 
 @pytest.mark.asyncio
@@ -840,6 +918,14 @@ async def test_proxy_compact_hides_upstream_quota_for_api_key_clients_when_setti
             credits_unlimited=False,
             credits_balance=12.5,
         )
+        await usage_repo.add_entry(
+            account_id=expected_account_id,
+            used_percent=10.0,
+            window="secondary",
+            reset_at=now_epoch + 604800,
+            window_minutes=10080,
+            recorded_at=now,
+        )
 
     _, key = await _create_api_key(name="compact-hidden", assigned_account_ids=[expected_account_id])
 
@@ -868,6 +954,9 @@ async def test_proxy_compact_hides_upstream_quota_for_api_key_clients_when_setti
     assert response.headers.get("x-codex-primary-used-percent") is None
     assert response.headers.get("x-codex-primary-window-minutes") is None
     assert response.headers.get("x-codex-primary-reset-at") is None
+    assert response.headers.get("x-codex-secondary-used-percent") is None
+    assert response.headers.get("x-codex-secondary-window-minutes") is None
+    assert response.headers.get("x-codex-secondary-reset-at") is None
     assert response.headers.get("x-codex-credits-has-credits") is None
     assert response.headers.get("x-codex-credits-unlimited") is None
     assert response.headers.get("x-codex-credits-balance") is None
