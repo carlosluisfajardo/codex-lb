@@ -10,3 +10,4 @@
 - [x] Separate replica quota recovery from reserve selection, preserving stale/fresh credit checks and proving safe standard-usage recovery.
 - [x] Prove the affected protective assertions with production-only mutations, exact source restoration, and restored green runs.
 - [x] Update the scanner-identified dependency versions and existing renamed contributor identity without unrelated upgrades or duplicate credit.
+- [x] Remediate hosted Rust advisories with narrow compatible pins and lock changes; preserve native features and patches, and discriminate local wire failures against the prior dependency graph.
