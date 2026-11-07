@@ -374,16 +374,104 @@ pub(crate) fn error_chain_has_invalid_certificate(
         {
             return true;
         }
-        current = source.source();
+        // io::Error::source() skips the stored error itself.
+        current = if let Some(error) = source.downcast_ref::<std::io::Error>() {
+            error
+                .get_ref()
+                .map(|cause| cause as &(dyn std::error::Error + 'static))
+        } else {
+            source.source()
+        };
     }
     false
 }
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+    use std::fmt;
+    use std::io;
+
     use reqwest::header::{ACCEPT, ACCEPT_ENCODING};
 
-    use super::forwarded_headers;
+    use super::{error_chain_has_invalid_certificate, forwarded_headers};
+
+    #[derive(Debug)]
+    struct OuterError(Box<dyn Error + Send + Sync>);
+
+    impl fmt::Display for OuterError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("outer transport failure")
+        }
+    }
+
+    impl Error for OuterError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    #[test]
+    fn io_certificate_payload_is_typed() {
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        );
+
+        assert!(error_chain_has_invalid_certificate(&error), "{error:?}");
+    }
+
+    #[test]
+    fn nested_io_certificate_payload_is_typed() {
+        let error = io::Error::other(io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+        ));
+
+        assert!(error_chain_has_invalid_certificate(&error), "{error:?}");
+    }
+
+    #[test]
+    fn ordinary_source_keeps_io_certificate_payload_typed() {
+        let error = OuterError(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName),
+        )));
+
+        assert!(error_chain_has_invalid_certificate(&error), "{error:?}");
+    }
+
+    #[test]
+    fn certificate_looking_messages_are_not_typed_causes() {
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        );
+
+        assert!(!error_chain_has_invalid_certificate(&error), "{error:?}");
+    }
+
+    #[test]
+    fn unrelated_rustls_errors_are_not_certificate_failures() {
+        for cause in [
+            rustls::Error::General("invalid peer certificate: UnknownIssuer".to_owned()),
+            rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure),
+            rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType),
+        ] {
+            let error = io::Error::new(io::ErrorKind::InvalidData, cause);
+            assert!(!error_chain_has_invalid_certificate(&error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_network_errors_are_not_certificate_failures() {
+        for error in [
+            io::Error::from(io::ErrorKind::ConnectionRefused),
+            io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"),
+        ] {
+            assert!(!error_chain_has_invalid_certificate(&error), "{error:?}");
+        }
+    }
 
     #[test]
     fn forwarded_headers_preserve_inbound_accept_encoding() {
