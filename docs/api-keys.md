@@ -29,14 +29,22 @@ Keys can also be scoped to specific accounts, so a key draws quota only from the
 
 ## Reasoning effort policies
 
-A key can either enforce one reasoning effort or allow a selected non-empty set of client-requested efforts.
+A key can either enforce one reasoning effort, subject to the catalog floor below, or allow a selected
+non-empty set of client-requested efforts.
 Leave the allowed-efforts selection empty to keep the existing unrestricted behavior. A request that explicitly
-sets an effort outside its key's allowlist receives a `403 reasoning_effort_not_allowed` response. Requests that
-omit a reasoning effort continue to use the model or upstream default.
+sets an effort outside its key's allowlist receives a `403 reasoning_effort_not_allowed` response. For models
+without the catalog floor, requests that omit effort retain the key's enforced effort when configured, or
+the model or upstream default otherwise.
 
 The policy evaluates the effort selected by the client, including supported model aliases such as `-xhigh`.
 Each configured effort is distinct: allowing `high` does not allow `xhigh`, and allowing `max` does not allow
 `ultra`. The proxy still rewrites an allowed `ultra` request to the upstream wire value `max`.
+
+For Responses and compact requests whose resolved model advertises `ultra` in the catalog snapshot, the
+catalog floor takes precedence after alias resolution, allowlist authorization, and key enforcement. Omitted
+effort and accepted lower efforts, including a lower effort enforced by the key, become `ultra` and are sent
+upstream as `max`. Models that do not advertise `ultra`, or requests without a catalog snapshot, keep their
+existing effort handling.
 
 ![API key reasoning-effort policy](screenshots/apis-reasoning-efforts.jpg)
 
@@ -44,4 +52,4 @@ For wiring keys into each client, see [Client Setup](client-setup.md).
 
 ---
 
-*Spec: [api-keys](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/api-keys)*
+*Specs: [api-keys](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/api-keys), [responses-api-compat](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/responses-api-compat)*

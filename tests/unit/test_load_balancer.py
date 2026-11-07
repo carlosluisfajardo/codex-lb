@@ -2494,7 +2494,7 @@ def test_state_from_account_preserves_persisted_quota_exceeded_with_bare_has_cre
     assert selection.account is None
 
 
-def test_state_from_account_reactivates_persisted_quota_exceeded_with_spendable_credits():
+def test_state_from_account_credit_override_keeps_status_active_but_reserve_unselectable():
     now = 1_788_706_800.0
     secondary_reset = 1_789_131_968
 
@@ -2530,8 +2530,7 @@ def test_state_from_account_reactivates_persisted_quota_exceeded_with_spendable_
     assert state.reset_at is None
     assert state.secondary_used_percent == 100.0
     selection = select_account([state], now=now, routing_strategy="single_account")
-    assert selection.account is not None
-    assert selection.account.account_id == state.account_id
+    assert selection.account is None
 
 
 def test_state_from_account_zeroes_stale_exhausted_primary_usage_after_reset(monkeypatch):

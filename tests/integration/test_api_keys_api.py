@@ -7,7 +7,6 @@ import json
 import re
 from dataclasses import replace
 from datetime import timedelta
-from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -22,7 +21,7 @@ import app.modules.proxy.load_balancer as load_balancer_module
 import app.modules.proxy.service as proxy_module
 from app.core.auth import generate_unique_account_id
 from app.core.clients.proxy import ProxyResponseError
-from app.core.openai.model_registry import ReasoningLevel, UpstreamModel, get_model_registry
+from app.core.openai.model_registry import ModelRegistry, ReasoningLevel, UpstreamModel, get_model_registry
 from app.core.openai.models import OpenAIResponsePayload
 from app.core.utils.time import utcnow
 from app.db.models import (
@@ -934,13 +933,21 @@ async def test_enforced_unadvertised_tier_uses_effective_tier_for_accounting_and
     )
     assert created.status_code == 200
     key = created.json()["key"]
-    await _import_account(async_client, "acc_fallback_service_tier", "fallback-service-tier@example.com")
+    account_id = await _import_account(async_client, "acc_fallback_service_tier", "fallback-service-tier@example.com")
 
     # Isolate the authoritative catalog answer that drives this regression.
     # Account selection still uses the populated registry above.
+    policy_registry = ModelRegistry()
+    catalog_model = _make_upstream_model(model)
+    await policy_registry.update(
+        {"plus": [catalog_model]},
+        per_account_results={account_id: ("plus", [catalog_model])},
+        active_account_plans={account_id: "plus"},
+    )
+    assert policy_registry.model_advertises_service_tier(model, "priority") is False
     monkeypatch.setattr(
         "app.modules.proxy.request_policy.get_model_registry",
-        lambda: SimpleNamespace(model_advertises_service_tier=lambda _model, _tier: False),
+        lambda: policy_registry,
     )
     seen: dict[str, object] = {}
 
@@ -1376,9 +1383,17 @@ async def test_source_routed_chat_completion_applies_api_key_enforcement(async_c
     # A source route is outside the subscription-account catalog boundary.
     # Even an authoritative "tier absent" answer for account models must not
     # strip the key's tier from the selected source request.
+    policy_registry = ModelRegistry()
+    catalog_model = _make_upstream_model(model)
+    await policy_registry.update(
+        {"plus": [catalog_model]},
+        per_account_results={"subscription-account": ("plus", [catalog_model])},
+        active_account_plans={"subscription-account": "plus"},
+    )
+    assert policy_registry.model_advertises_service_tier(model, "priority") is False
     monkeypatch.setattr(
         "app.modules.proxy.request_policy.get_model_registry",
-        lambda: SimpleNamespace(model_advertises_service_tier=lambda _model, _tier: False),
+        lambda: policy_registry,
     )
     response = await async_client.post(
         "/v1/chat/completions",
@@ -1391,7 +1406,7 @@ async def test_source_routed_chat_completion_applies_api_key_enforcement(async_c
     )
     assert response.status_code == 200
     source_fallback_control = cast("dict[str, object]", observed["payload"])
-    assert source_fallback_control["service_tier"] == "priority"
+    assert source_fallback_control.get("service_tier") == "priority"
 
 
 @pytest.mark.asyncio

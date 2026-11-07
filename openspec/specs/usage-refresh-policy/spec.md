@@ -565,7 +565,7 @@ The dashboard MUST expose an admin-only endpoint that sends a single minimal `re
 - **AND** no account with that id exists
 - **THEN** the endpoint responds `404` with code `account_not_found`
 
-### Requirement: Credit-backed usage remains selectable after quota windows fill
+### Requirement: Credit-backed quota status remains independent of reserve eligibility
 
 When deriving effective account status from upstream usage samples, the system MUST treat the latest credit metadata as an override for secondary quota-derived blocking state. If the latest usage sample with credit metadata reports `credits_has = true`, `credits_unlimited = true`, or `credits_balance > 0`, then secondary quota windows at `100%` MUST NOT by themselves make the account `quota_exceeded`. Primary-window exhaustion MUST keep `rate_limited` precedence even when credits are available.
 
@@ -573,7 +573,12 @@ This override MUST NOT reactivate accounts that are explicitly `paused` or
 `deactivated`. When multiple usage samples carry credit metadata, the newest
 sample by `recorded_at` MUST be used.
 
-#### Scenario: Credit-backed weekly account remains selectable
+The quota-status override MUST NOT bypass the stored-credit reserve gate
+defined in [account-routing](../account-routing/spec.md#requirement-stored-credit-reserve-gate).
+An `active` account MUST remain excluded from selection whenever that gate
+blocks it.
+
+#### Scenario: Credit-backed weekly account remains active while reserve gate excludes it
 
 - **GIVEN** an account is otherwise routable
 - **AND** its weekly usage window reports `used_percent = 100`
@@ -581,7 +586,7 @@ sample by `recorded_at` MUST be used.
 - **AND** the newest usage sample with credit metadata reports a positive credit balance
 - **WHEN** the load balancer derives account state
 - **THEN** the derived status remains `active`
-- **AND** the account remains eligible for selection
+- **AND** the stored-credit reserve gate excludes the account from selection
 
 #### Scenario: Credit-backed account remains rate-limited when primary window is exhausted
 

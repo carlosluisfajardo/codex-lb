@@ -46,9 +46,9 @@ def test_native_egress_lockfile_pins_codex_release_family() -> None:
 
     for name, version in (
         ("reqwest", "0.12.28"),
-        ("hyper", "1.8.1"),
+        ("hyper", "1.9.0"),
         ("hyper-util", "0.1.20"),
-        ("rustls", "0.23.45"),
+        ("rustls", "0.23.46"),
         ("tokio-rustls", "0.26.4"),
         ("hyper-rustls", "0.27.7"),
         ("aws-lc-rs", "1.18.1"),

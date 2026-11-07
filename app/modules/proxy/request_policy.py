@@ -107,6 +107,27 @@ _MODEL_ALIAS_TOKENS: frozenset[str] = frozenset(
 _UPSTREAM_OMIT_SERVICE_TIERS: frozenset[str] = frozenset({"auto", "default"})
 
 
+def apply_ultra_effort_floor(
+    payload: ResponsesRequest | ResponsesCompactRequest,
+    *,
+    registry: ModelRegistry | None = None,
+) -> bool:
+    """Raise catalog-advertised ultra models before the existing ultra-to-max wire alias."""
+    snapshot = (registry or get_model_registry()).get_snapshot()
+    if snapshot is None:
+        return False
+    model = snapshot.models.get(payload.model) or snapshot.models.get(payload.model.strip().lower())
+    if model is None or not any(level.effort.strip().lower() == "ultra" for level in model.supported_reasoning_levels):
+        return False
+    current = payload.reasoning.effort if payload.reasoning is not None else None
+    floor = "max" if isinstance(current, str) and current.strip().lower() == "max" else "ultra"
+    if payload.reasoning is None:
+        payload.reasoning = ResponsesReasoning(effort=floor)
+    else:
+        payload.reasoning.effort = floor
+    return current != floor
+
+
 def resolve_wire_reasoning_effort(effort: str) -> str:
     """Return the wire-safe value for a client-plane reasoning effort.
 
@@ -286,6 +307,7 @@ def apply_api_key_enforcement(
 
     if api_key is None:
         _materialize_provider_reasoning_effort(payload, provider_reasoning_effort)
+        apply_ultra_effort_floor(payload, registry=registry)
         pre_normalization_effort = normalize_unsupported_reasoning_effort(payload, registry=registry)
         apply_prohibit_fast_mode(payload, prohibit_fast_mode=prohibit_fast_mode)
         return ApiKeyEnforcementResult(False, pre_normalization_effort)
@@ -343,6 +365,7 @@ def apply_api_key_enforcement(
             and payload.reasoning.effort.strip().lower() == client_reasoning_effort
         ):
             payload.reasoning.effort = client_reasoning_effort
+    apply_ultra_effort_floor(payload, registry=registry)
     pre_normalization_effort = normalize_unsupported_reasoning_effort(payload, registry=registry)
 
     service_tier_was_enforced = False
