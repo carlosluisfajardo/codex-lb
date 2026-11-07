@@ -10385,7 +10385,12 @@ The policy MUST apply to Responses, compact Responses, and WebSocket Responses
 requests. Its WebSocket error event MUST preserve the same error code and
 parameter. It MUST evaluate the client-plane effort before existing
 unsupported-effort fallback and `ultra` to `max` upstream-wire aliasing. A
-request that omits an effort MUST retain current default behavior.
+request that omits an effort MUST retain existing default or API-key-enforced
+behavior unless the catalog-scoped `ultra` floor applies. Where that floor
+applies, it MUST take precedence after allowlist authorization and API-key
+enforcement, including for omitted or lower enforced efforts, and use at least
+`ultra`, serialized upstream as `max`. Models that do not advertise `ultra`, or
+requests without a catalog snapshot, MUST retain existing effort handling.
 Applying the policy more than once to the same request, including across a
 signed internal HTTP bridge hop, MUST be idempotent and MUST NOT re-authorize
 an already-normalized wire value as though it were the original client choice.
@@ -10418,12 +10423,22 @@ their unrelated fields do not participate in effort authorization.
 - **THEN** the proxy rejects the request with code `reasoning_effort_not_allowed`
 - **AND** does not forward a request upstream
 
-#### Scenario: Omitted effort remains compatible
+#### Scenario: Omitted effort remains compatible without a catalog floor
 
 - **GIVEN** an API key with `allowedReasoningEfforts: ["low", "medium"]`
+- **AND** the resolved model does not advertise `ultra` in the catalog snapshot
 - **WHEN** a Responses request omits `reasoning.effort` and uses no effort alias
 - **THEN** the proxy does not add or replace a reasoning effort
 - **AND** the request continues through the existing route
+
+#### Scenario: Catalog floor applies after an allowlist accepts omitted effort
+
+- **GIVEN** an API key with `allowedReasoningEfforts: ["low", "medium"]`
+- **AND** the resolved model advertises `ultra` in the catalog snapshot
+- **WHEN** a Responses request omits `reasoning.effort` and uses no effort alias
+- **THEN** the allowlist accepts the omitted client effort
+- **AND** the catalog floor sets `ultra` after API-key policy handling
+- **AND** the upstream wire effort is `max`
 
 #### Scenario: Effort-less provider controls remain compatible
 

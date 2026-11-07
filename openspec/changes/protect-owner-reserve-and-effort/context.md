@@ -2,6 +2,10 @@ This source-only port adapts the retained LB21/LB21.1/LB22 source diffs and test
 
 For example, an account holding credits at 95% weekly usage is excluded even if the caller bypasses ordinary quota status. At 10% usage it may serve standard traffic, but never additional-quota traffic.
 
+Quota-derived status and reserve eligibility are separate: credit metadata can leave an exhausted weekly account `active` while the reserve gate excludes it. The [usage-refresh-policy contract](../../specs/usage-refresh-policy/spec.md) describes that status distinction; [account-routing](../../specs/account-routing/spec.md) owns the reserve decision.
+
+Reasoning allowlists authorize the client's effort before the catalog floor runs. For a catalog model advertising `ultra`, even an omitted effort or an accepted lower key-enforced effort is raised and serialized as wire `max`. Other models and missing catalog snapshots keep existing defaults and enforcement. The [Responses contract](../../specs/responses-api-compat/spec.md) defines this precedence, which the API-key guide also explains.
+
 The session fence learns reserve state during standard builds; it does not itself refresh upstream usage. The separate reserve guard pauses at 6% remaining to fence idle retained sessions before the 95% selector margin. In-flight requests and stale upstream readings remain limits of this design.
 
 The fork at `b8512db1` differs from the retained installed runtime: it does not contain the Luna-to-Sol rewrite or the reserve guard's forced-usage-refresh/expected-state API contract. This port preserves the fork's existing model handling and does not imply runtime parity, installation, or a checked swap. The operator owns a future replacement and compatibility assessment.
